@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Low-latency streaming: Apple grants this per bundle id, on request. It is
+     granted for the project's own bundle id only, so gen_xcodeproj.py signs
+     with this file for that id and with no entitlements for any other. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.developer.low-latency-streaming</key>
+	<true/>
+</dict>
+</plist>

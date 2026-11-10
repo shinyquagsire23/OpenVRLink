@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.DS_Store
+# captures and traces contain live credentials
+*.log
+*.pcap
+*.h265
+captures/
+.build/
+
+# Robots and automata, no need to version track
+CLAUDE.md
+.claude/
+.pi/
+.codex/

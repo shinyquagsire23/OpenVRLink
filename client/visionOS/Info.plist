@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Without the immersive-space entry below, the space opens and every
+	     frame is presented into nothing. -->
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationPreferredDefaultSceneSessionRole</key>
+		<string>UIWindowSceneSessionRoleApplication</string>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<true/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UISceneSessionRoleImmersiveSpaceApplication</key>
+			<array>
+				<dict>
+					<key>UISceneInitialImmersionStyle</key>
+					<string>UIImmersionStyleMixed</string>
+				</dict>
+			</array>
+		</dict>
+	</dict>
+	<!-- Without this, traffic to the Steam host is silently discarded. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>OpenVRLink connects to Steam on a computer on your local network.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>OpenVRLink sends your voice to SteamVR when you turn the microphone on.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>OpenVRLink reads your expressions off your Spatial Persona to send face tracking to SteamVR, when you turn that experiment on.</string>
+	<key>NSAccessoryTrackingUsageDescription</key>
+	<string>OpenVRLink sends the position of your controllers to SteamVR.</string>
+	<key>NSHandsTrackingUsageDescription</key>
+	<string>OpenVRLink sends the position of your hands to SteamVR.</string>
+	<key>GCSupportsControllerUserInteraction</key>
+	<true/>
+	<key>GCSupportedGameControllers</key>
+	<array>
+		<dict>
+			<key>ProfileName</key>
+			<string>SpatialGamepad</string>
+		</dict>
+		<dict>
+			<key>ProfileName</key>
+			<string>ExtendedGamepad</string>
+		</dict>
+	</array>
+</dict>
+</plist>
