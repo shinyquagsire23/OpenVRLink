@@ -7,6 +7,8 @@ __pycache__/
 *.h265
 captures/
 .build/
+.swiftpm/
+design/
 
 # Robots and automata, no need to version track
 CLAUDE.md

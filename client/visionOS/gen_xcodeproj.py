@@ -93,6 +93,8 @@ def main():
         for name in resources)
     package = object_id("package")
     plist = object_id("plist")
+    # The asset catalog holds the app icon (three layers; design/icon-drafts/export_visionos.py writes them).
+    assets, assets_build = object_id("assets"), object_id("assets-build")
 
     file_refs = "".join(
         f"\t\t{object_id('ref' + name)} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.swift; "
@@ -118,8 +120,9 @@ def main():
         "SDKROOT": "xros", "SUPPORTED_PLATFORMS": "xros xrsimulator", "TARGETED_DEVICE_FAMILY": "7",
         "XROS_DEPLOYMENT_TARGET": DEPLOYMENT_TARGET, "SWIFT_VERSION": "5.0",
         "CODE_SIGN_STYLE": "Automatic", "DEVELOPMENT_TEAM": team,
-        "MARKETING_VERSION": "0.1", "CURRENT_PROJECT_VERSION": "1",
+        "MARKETING_VERSION": "0.1.0", "CURRENT_PROJECT_VERSION": "1",
         "LD_RUNPATH_SEARCH_PATHS": "$(inherited) @executable_path/Frameworks",
+        "ASSETCATALOG_COMPILER_APPICON_NAME": "AppIcon",
     }
     if bundle_id == OWN_BUNDLE_ID:
         target_settings["CODE_SIGN_ENTITLEMENTS"] = "OpenVRLink.entitlements"
@@ -134,10 +137,12 @@ def main():
 	objectVersion = 60;
 	objects = {{
 {build_files}{product_build_files}{file_refs}{resource_refs}{resource_build_files}		{resource_group} = {{isa = PBXGroup; children = ({"".join(object_id('resref' + name) + ", " for name in resources)}); path = Resources; sourceTree = "<group>"; }};
-		{resources_phase} = {{isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = ({"".join(object_id('resbuild' + name) + ", " for name in resources)}); runOnlyForDeploymentPostprocessing = 0; }};
+		{resources_phase} = {{isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = ({"".join(object_id('resbuild' + name) + ", " for name in resources)}{assets_build}, ); runOnlyForDeploymentPostprocessing = 0; }};
+		{assets} = {{isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; }};
+		{assets_build} = {{isa = PBXBuildFile; fileRef = {assets}; }};
 		{plist} = {{isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; }};
 		{product} = {{isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = {NAME}.app; sourceTree = BUILT_PRODUCTS_DIR; }};
-		{main_group} = {{isa = PBXGroup; children = ({source_group}, {resource_group}, {plist}, {products_group}, ); sourceTree = "<group>"; }};
+		{main_group} = {{isa = PBXGroup; children = ({source_group}, {resource_group}, {assets}, {plist}, {products_group}, ); sourceTree = "<group>"; }};
 		{source_group} = {{isa = PBXGroup; children = ({", ".join(object_id('ref' + name) for name in sources)}, ); path = Sources; sourceTree = "<group>"; }};
 		{products_group} = {{isa = PBXGroup; children = ({product}, ); name = Products; sourceTree = "<group>"; }};
 		{sources_phase} = {{isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = ({", ".join(object_id('build' + name) for name in sources)}, ); runOnlyForDeploymentPostprocessing = 0; }};

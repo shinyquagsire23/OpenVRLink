@@ -184,40 +184,58 @@ public final class RealityKitDisplay {
                          onHaptic: { [controllers] in controllers.vibrate($0) })
     }
 
-    /// Three textures of the size a frame needs, and their planes.
-    private func makeSets(for metadata: FrameMetadata) {
+    /// Three textures and their planes, for a frame like this one shown through `frusta`.
+    private func makeSets(for metadata: FrameMetadata, frusta: [Frustum]) {
         guard materials.count == 2 else { return }
+        // Foveated when the device can (`FoveatedFlatten`); otherwise a
+        // plain texture of a size that keeps most of the foveal tile's detail.
         var scale = RealityKitDisplay.flattenScale
         scale = min(scale, Double(RealityKitDisplay.largestSide) / Double(max(metadata.atlasWidth, metadata.tileHeight, 1)))
-        let width = max(16, Int(Double(metadata.atlasWidth) * scale)), height = max(16, Int(Double(metadata.tileHeight) * scale))
-        guard width != eyeSize.width || height != eyeSize.height else { return }
+        var size = (width: max(16, Int(Double(metadata.atlasWidth) * scale)), height: max(16, Int(Double(metadata.tileHeight) * scale)))
+        let sameFrusta = zip(frusta, madeForFrusta).allSatisfy {
+            $0.left == $1.left && $0.right == $1.right && $0.down == $1.down && $0.up == $1.up
+        } && frusta.count == madeForFrusta.count
+        if !sameFrusta || (foveated == nil && !foveationFailed) {
+            foveated = FoveatedFlatten(device: device, frusta: frusta)
+            foveationFailed = foveated == nil
+            madeForFrusta = frusta
+            eyeSize = (0, 0)
+        }
+        if let foveated { size = foveated.target.screen }
+        guard size.width != eyeSize.width || size.height != eyeSize.height else { return }
         for set in sets { set.planes.forEach { $0.removeFromParent() } }
         sets = []
-        eyeSize = (width, height)
+        eyeSize = size
+        let stored = foveated?.target.texture ?? (width: size.width, height: size.height * 2)
         let sheet = MeshResource.generatePlane(width: 1, depth: 1)
         for _ in 0..<3 {
             // One eye above the other.
             let descriptor = LowLevelTexture.Descriptor(textureType: .type2D, pixelFormat: .bgra8Unorm_srgb,
-                                                        width: width, height: height * 2, depth: 1, mipmapLevelCount: 1,
+                                                        width: stored.width, height: stored.height, depth: 1, mipmapLevelCount: 1,
                                                         textureUsage: [.renderTarget, .shaderRead])
             guard let texture = try? LowLevelTexture(descriptor: descriptor),
                   let resource = try? TextureResource(from: texture)
             else {
-                Log.note("realitykit: no texture of \(width)x\(height * 2)")
+                Log.note("realitykit: no texture of \(stored.width)x\(stored.height)")
                 return
             }
-            let planes = (0..<2).map { eye -> ModelEntity in
-                var material = materials[eye]
+            let planes = Eye.allCases.map { eye -> ModelEntity in
+                var material = materials[eye.rawValue]
                 try? material.setParameter(name: "texture", value: .textureResource(resource))
-                let plane = ModelEntity(mesh: sheet, materials: [material])
+                material.faceCulling = .none
+                let plane = ModelEntity(mesh: foveated?.meshes[eye.rawValue] ?? sheet, materials: [material])
                 plane.isEnabled = false
                 root.addChild(plane)
                 return plane
             }
             sets.append(PlaneSet(texture: texture, planes: planes))
         }
-        Log.note("realitykit: flattening each eye to \(width)x\(height)")
+        Log.note("realitykit: flattening each eye to \(size.width)x\(size.height)"
+                 + (foveated == nil ? "" : ", foveated: both eyes stored in \(stored.width)x\(stored.height)"))
     }
+    private var foveated: FoveatedFlatten?
+    private var foveationFailed = false
+    private var madeForFrusta: [Frustum] = []
 
     private func update() {
         guard !stopped else { return }
@@ -251,32 +269,36 @@ public final class RealityKitDisplay {
             return
         }
         let frame = picked.frame
-        makeSets(for: frame.metadata)
+        makeSets(for: frame.metadata, frusta: profile.eyeFrusta)
         guard sets.count == 3, let commands = queue.makeCommandBuffer() else { return }
         framesDrawn += 1
         let set = sets[framesDrawn % 3]
 
-        // Flatten: each eye's quads, seen from exactly where the host's eye was.
+        // Flatten: each eye's quads, seen from exactly where the host's eye
+        // was. A pass for each eye, since each has a rate map of its own
+        // (`FoveatedFlatten`); the second keeps what the first drew.
         let target = set.texture.replace(using: commands)
-        let pass = MTLRenderPassDescriptor()
-        pass.colorAttachments[0].texture = target
-        pass.colorAttachments[0].loadAction = .clear
-        pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
-        pass.colorAttachments[0].storeAction = .store
-        guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { return }
         var hostEyes: [Pose] = []
         for eye in Eye.allCases {
+            let pass = MTLRenderPassDescriptor()
+            pass.colorAttachments[0].texture = target
+            pass.colorAttachments[0].loadAction = eye == Eye.allCases.first ? .clear : .load
+            pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+            pass.colorAttachments[0].storeAction = .store
+            pass.rasterizationRateMap = foveated?.target.maps[eye.rawValue]
+            guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { return }
             let hostEye = frame.metadata.renderPose.placing(profile.eyesInHead[eye.rawValue])
             hostEyes.append(hostEye)
             // The left eye goes in the lower half of the texture, which is
             // the half the left material reads.
-            encoder.setViewport(MTLViewport(originX: 0, originY: eye == .left ? Double(eyeSize.height) : 0,
-                                            width: Double(eyeSize.width), height: Double(eyeSize.height), znear: 0, zfar: 1))
+            encoder.setViewport(foveated?.target.viewport(eye)
+                                ?? MTLViewport(originX: 0, originY: eye == .left ? Double(eyeSize.height) : 0,
+                                               width: Double(eyeSize.width), height: Double(eyeSize.height), znear: 0, zfar: 1))
             renderer.draw(Composition.quads(for: eye, metadata: frame.metadata, profile: profile), of: frame,
                           from: EyeView(eye: hostEye, frustum: profile.eyeFrusta[eye.rawValue]),
                           with: encoder, commands: commands)
+            encoder.endEncoding()
         }
-        encoder.endEncoding()
         commands.commit()
         // The texture changes hands when the drawing is done; waiting here
         // keeps it in step with the planes moved below.

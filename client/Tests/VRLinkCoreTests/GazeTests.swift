@@ -349,3 +349,35 @@ final class FaceCalibrationTests: XCTestCase {
         XCTAssertLessThan(next[1], 0.03 * 0.25)
     }
 }
+
+final class FoveationTests: XCTestCase {
+    func testRatesAreSharpAroundStraightAheadAndFallAwayToTheEdges() {
+        let rates = Foveation.rates(zones: 59, center: 0.63, unseenAtStart: 2)
+        XCTAssertEqual(rates.count, 59)
+        // (The fall begins at full rate, as ALVR's does: one zone more.)
+        XCTAssertEqual(rates.filter { $0 == 1 }.count, Foveation.sharpZones + 1)
+        // The sharp block is around 0.63 of the way across.
+        let firstSharp = rates.firstIndex(of: 1)!
+        XCTAssertEqual(Float(firstSharp) + Float(Foveation.sharpZones) / 2, 0.63 * 59, accuracy: 1)
+        // Rising up to it, falling after it, never nothing.
+        XCTAssertEqual(rates[0], Foveation.lowest)
+        XCTAssertEqual(rates[1], Foveation.lowest)
+        // (The first few zones of the rise are all at the lowest rate there is.)
+        for zone in 3..<firstSharp { XCTAssertGreaterThanOrEqual(rates[zone], rates[zone - 1]) }
+        XCTAssertGreaterThan(rates[firstSharp - 1], rates[firstSharp - 8])
+        for zone in (firstSharp + Foveation.sharpZones + 2)..<59 { XCTAssertLessThan(rates[zone], rates[zone - 1]) }
+        XCTAssertTrue(rates.allSatisfy { $0 >= Foveation.lowest && $0 <= 1 })
+    }
+
+    func testEachEyeIsSharpTowardsTheNose() {
+        // A Vision Pro's frusta: much wider outwards than towards the nose.
+        let left = Foveation.rates(for: .left, frustum: Frustum(left: -1.74, right: 1.01, down: -1.20, up: 1.01))
+        let right = Foveation.rates(for: .right, frustum: Frustum(left: -1.01, right: 1.74, down: -1.20, up: 1.01))
+        XCTAssertGreaterThan(left.across.firstIndex(of: 1)!, 59 / 2 - Foveation.sharpZones / 2)
+        XCTAssertLessThan(right.across.firstIndex(of: 1)!, 59 / 2 - Foveation.sharpZones / 2)
+        XCTAssertEqual(left.down, right.down)
+        // An axis off the edge of the picture still gives a whole sharp block.
+        let off = Foveation.rates(zones: 20, center: 1.4)
+        XCTAssertGreaterThanOrEqual(off.filter { $0 == 1 }.count, Foveation.sharpZones)
+    }
+}
