@@ -41,6 +41,7 @@ public final class StreamInputs {
     public func profileForHost() -> DeviceProfile? {
         guard var profile = measured.value?.profile else { return nil }
         let chosen = settings.current
+        profile.senseControllerModels = chosen.senseControllerModels
         profile.eyeFrusta = profile.eyeFrusta.map {
             $0.scaled(horizontal: chosen.fovScaleHorizontal, vertical: chosen.fovScaleVertical)
         }

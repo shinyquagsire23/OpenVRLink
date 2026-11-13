@@ -33,7 +33,7 @@ DEPLOYMENT_TARGET = "26.0"
 # other id with that entitlement fails, so other ids are signed without it.
 OWN_BUNDLE_ID = "dev.maxthomas.rel.OpenVRLink"
 MARKETING_VERSION = "0.1.0"
-BUILD_NUMBER = "4"
+BUILD_NUMBER = "5"
 
 
 def object_id(tag):

@@ -279,7 +279,7 @@ public final class StreamSession {
             switch hands[side.rawValue] {
             case .controller(let controller):
                 inputBlocks.append(contentsOf: controller.inputBlock())
-                poses.append(contentsOf: packedPose(controller.gripForHost, offset: ControllerState.gripOffset(side)))
+                poses.append(contentsOf: packedPose(controller.gripForHost, offset: ControllerState.gripOffset(side, senseModel: profile.senseControllerModels)))
             case .hand(let hand):
                 let now = HandGestures(hand, previous: gestures[side.rawValue])
                 if now.description != (gestures[side.rawValue]?.description ?? "nothing") {
@@ -533,7 +533,7 @@ public final class StreamSession {
                         handIsController[side] = isController
                         powerPublished[DeviceProfile.ValueID.powerController(side)] = nil
                         onLog?("\(side) hand is now a \(isController ? "controller" : "tracked hand")")
-                        for (id, value) in DeviceProfile.handValues(side, isController: isController) {
+                        for (id, value) in profile.handValues(side, isController: isController) {
                             values.publish(id, value, force: true)
                         }
                     }

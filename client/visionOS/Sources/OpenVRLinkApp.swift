@@ -459,6 +459,14 @@ struct ExperimentsView: View {
             }
 
             Section {
+                Toggle("Show PS VR2 Sense controller models", isOn: $store.settings.senseControllerModels)
+            } header: {
+                Text("Controllers")
+            } footer: {
+                Text("Requires the OpenVRLink controller models installed in SteamVR on your PC, otherwise Touch controllers are shown")
+            }
+
+            Section {
                 Toggle("Enable face and eye tracking", isOn: $store.settings.faceFromCamera)
             } header: {
                 Text("Tracking")

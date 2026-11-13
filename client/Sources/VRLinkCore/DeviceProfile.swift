@@ -57,6 +57,15 @@ public struct DeviceProfile {
     /// fills them in. (The Steam Link client sends "qvlclient;hollywood;2.0.20.1812".)
     public var systemName = "unknown", clientVersion = DataDirectory.name
 
+    /// Experiment: name the controllers as PlayStation VR2 Sense
+    /// controllers with a model of their own, so that SteamVR draws what is
+    /// really in the hand. The model has to be on the host already, as a
+    /// driver's resources called `openvrlink_sense`; nothing installs it yet.
+    /// Otherwise the controllers are a Quest 2's Touch pair in every string,
+    /// and SteamVR draws its own Touch models
+    /// (docs/svl-values/static-and-power-props.md).
+    public var senseControllerModels = false
+
     /// Whether this headset sends eye or face tracking. 
     /// vrlink determines this per headset, so we have to swap
     /// between Quest Pro and Quest 2 for now.
@@ -74,19 +83,26 @@ public struct DeviceProfile {
     /// What is published when a hand starts holding a controller, or starts
     /// being tracked bare: the device's identity and battery state (value id
     /// -> bytes).
-    static func handValues(_ side: Side, isController: Bool) -> [UInt8: Bytes] {
+    func handValues(_ side: Side, isController: Bool) -> [UInt8: Bytes] {
         let name = side == .left ? "Left" : "Right"
-        let power = powerProps(nil, reportsBattery: false)
+        let power = DeviceProfile.powerProps(nil, reportsBattery: false)
+        let staticProps = DeviceProfile.staticProps
 
         // TODO: make this OpenXR-suitable, PSVR2 is visionOS only
-        let identity = isController
+        let controller = senseControllerModels
             ? staticProps(["oculus", "OpenVRLink_Sense_\(name)", "Sony", "PlayStation VR2 Sense (\(name))",
                            "{openvrlink_sense}playstation_vr2_sense_\(name.lowercased())", "openvrlink_sense",
-                           "{oculus}/input/touch_profile.json", "oculus_touch", "oculus/OpenVRLink_Sense_\(name)"])
+                           "{oculus}/input/touch_profile.json", "oculus_touch", "oculus/OpenVRLink_Sense_\(name)"], 0)
+            // What the Steam Link client sends for a Quest 2's Touch controller.
+            : staticProps(["oculus", "VRLINKQ2_Controller_\(name)", "Oculus", "Oculus Quest2 (\(name) Controller)",
+                           "oculus_quest2_controller_\(name.lowercased())", "vrlink",
+                           "{oculus}/input/touch_profile.json", "oculus_touch", "oculus/VRLINKQ2_Controller_\(name)"], 0)
+        let identity = isController
+            ? controller
             : staticProps(["vrlink", "VRLINKQ_Hand_\(name)", "VRLink", "VRLink Hand Tracker (\(name) Hand)",
                            "shuttlecock", "vrlink",
                            "{vrlink}/input/svl_hand_interaction_augmented_input_profile.json",
-                           "svl_hand_interaction_augmented", "vrlink/VRLINKQ_HandTracker_\(name)"], driverType: 1)
+                           "svl_hand_interaction_augmented", "vrlink/VRLINKQ_HandTracker_\(name)"], 1)
         return [ValueID.staticController(side): identity, ValueID.powerController(side): power]
     }
 

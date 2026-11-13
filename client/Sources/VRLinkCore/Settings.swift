@@ -22,6 +22,9 @@ public struct Settings: Codable, Equatable {
     public var gazePinchRays = false
     /// Send the microphone to the host.
     public var microphone = false
+    /// Experiment: have SteamVR draw PlayStation VR2 Sense controllers
+    /// (`DeviceProfile.senseControllerModels`), which needs their model on the host.
+    public var senseControllerModels = false
     /// Put the app's window away when streaming starts. (It comes back
     /// when the app is opened again.)
     public var closeWindowOnEntry = true
@@ -84,6 +87,7 @@ public struct Settings: Codable, Equatable {
         read(.clackSwitchesToHands, into: &clackSwitchesToHands)
         read(.gazePinchRays, into: &gazePinchRays)
         read(.microphone, into: &microphone)
+        read(.senseControllerModels, into: &senseControllerModels)
         read(.chromaKey, into: &chromaKey)
         read(.chromaKeyColor, into: &chromaKeyColor)
         read(.chromaKeyNear, into: &chromaKeyNear)

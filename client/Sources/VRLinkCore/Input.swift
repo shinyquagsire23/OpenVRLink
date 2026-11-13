@@ -10,7 +10,8 @@ import Foundation
 /// The host is told each controller is of the Quest/Touch type, with the Touch
 /// input profile; vrlink currently refuses controller types it has no table for.
 /// It is free in what the controller is called and drawn as, so SteamVR
-/// shows its PlayStation VR2 Sense model on visionOS.
+/// can show a PlayStation VR2 Sense model on visionOS
+/// (`DeviceProfile.senseControllerModels`).
 ///
 /// Platforms map their own controller onto the Touch names below.
 
@@ -114,7 +115,14 @@ public struct ControllerState {
     /// SteamVR's own description of the model) and nudges it 2 mm across and
     /// 10 mm forward; then its PC side moves every controller 11 cm further
     /// forward along the controller's own (now pitched) axis.
-    static func gripOffset(_ side: Side) -> [Float] {
+    ///
+    /// Without that model (`DeviceProfile.senseControllerModels` off)
+    /// SteamVR draws a Touch controller, and the offset is the one the
+    /// Steam Link client sends for Touch (docs/svl-tracking-input/controllers.md).
+    static func gripOffset(_ side: Side, senseModel: Bool) -> [Float] {
+        guard senseModel else {
+            return [side == .left ? -0.007 : 0.007, -0.0342, -0.0961, 0.9839, -0.1788, 0, 0]
+        }
         let pitch = 5.037 * Float.pi / 180
         let forward: Float = 0.11
         // 11 cm along the pitched -z axis, seen from the unpitched grip: mostly forward, slightly up.
