@@ -15,6 +15,7 @@ OPENVRLINK_TEAM and OPENVRLINK_BUNDLE_ID override the signing team (default:
 the one on this Mac's Apple Development certificate) and the bundle id
 (default: one made from the signing team, see bundle_identifier).
 """
+import shutil
 import getpass
 import hashlib
 import os
@@ -74,6 +75,11 @@ def main():
     sources = sorted(path.name for path in (HERE / "Sources").glob("*.swift"))
     # Files copied into the app as they are (RealityKit material definitions).
     (HERE / "Resources").mkdir(exist_ok=True)
+    # The app icon's layers, so the entry window can draw the icon: an app
+    # cannot load its own icon from the asset catalog.
+    for layer in ("Back", "Middle", "Front"):
+        shutil.copyfile(HERE / f"Assets.xcassets/AppIcon.solidimagestack/{layer}.solidimagestacklayer"
+                        f"/Content.imageset/{layer}.png", HERE / f"Resources/Icon{layer}.png")
     resources = sorted(path.name for path in (HERE / "Resources").glob("*") if path.is_file())
     team = signing_team()
     bundle_id = bundle_identifier(team)

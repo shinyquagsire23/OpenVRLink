@@ -41,6 +41,9 @@ struct OpenVRLinkApp: App {
     @StateObject private var faceCalibration = FaceCalibrationRun()
     @StateObject private var keptFaceCalibration = Kept<FaceCalibrationSpace>()
     private static var trackingStarted = false
+    /// The version this app was when it last ran here, to notice an update.
+    @AppStorage("lastUsedAppVersion") private var lastUsedAppVersion = "never launched"
+    @State private var showChanges = false
 
     init() {
         // A log line written after the console that launched the app has
@@ -61,6 +64,19 @@ struct OpenVRLinkApp: App {
                                 faceCalibration: faceCalibration, persona: persona)
                     .tabItem { Label("Experiments", systemImage: "flask") }
             }
+                // With the scene's `.contentSize` below, a window of one size.
+                .frame(width: EntryView.windowSize.width, height: EntryView.windowSize.height)
+                .onAppear {
+                    // Once for each version of the app: say what is new in it.
+                    guard lastUsedAppVersion != AppVersion.current else { return }
+                    lastUsedAppVersion = AppVersion.current
+                    showChanges = true
+                }
+                .alert("OpenVRLink v" + AppVersion.current, isPresented: $showChanges) {
+                    Button("Dismiss") {}
+                } message: {
+                    Text(AppVersion.changes)
+                }
                 .task {
                     // Once, however often the window is closed and opened again.
                     guard !OpenVRLinkApp.trackingStarted else { return }
@@ -70,7 +86,7 @@ struct OpenVRLinkApp: App {
                     hands.start()
                 }
         }
-        .defaultSize(width: 560, height: 640)
+        .windowResizability(.contentSize)
 
         ImmersiveSpace(id: "stream") {
             CompositorLayer(configuration: StreamLayerConfiguration()) { layerRenderer in
@@ -134,6 +150,46 @@ struct OpenVRLinkApp: App {
     }
 }
 
+/// Which version of the app this is, and what is new in it.
+enum AppVersion {
+    /// As in "0.1.0 build 1".
+    static let current: String = {
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        return version + " build " + build
+    }()
+
+    /// Shown once after each update. Rewrite for each release.
+    static let changes = """
+    What's changed?
+
+    • First test builds of OpenVRLink: streaming from Steam Link for VR on your PC, with controllers, hand \
+    tracking, microphone and chroma-keyed passthrough.
+
+    ___________________________
+
+    Known issues:
+
+    • With the RealityKit renderer, taking the headset off and putting it back on does not resume the stream.
+    """
+}
+
+/// The app's icon, flat: its three layers one over the other, cut round as
+/// visionOS shows it.
+struct AppIconView: View {
+    var body: some View {
+        ZStack {
+            ForEach(["IconBack", "IconMiddle", "IconFront"], id: \.self) { layer in
+                if let image = UIImage(named: layer) {
+                    Image(uiImage: image).resizable()
+                }
+            }
+        }
+        .clipShape(Circle())
+    }
+}
+
 /// Holds on to one object across the many times SwiftUI asks a scene for
 /// its content, and makes a new one only when the old one is finished with.
 @MainActor
@@ -156,7 +212,10 @@ struct EntryView: View {
     @Environment(\.dismissWindow) private var dismissWindow
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
     @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
-    @State private var typedAddress = ""
+    /// The window is this size and cannot be made another.
+    static let windowSize = CGSize(width: 640, height: 480) // God's intended resolution
+    @AppStorage("typedAddress") private var typedAddress = ""
+    @State private var askingForAddress = false
 
     /// Open the immersive space, which connects to `address` once it is running.
     private func stream(from address: String) {
@@ -185,9 +244,29 @@ struct EntryView: View {
         }
     }
 
+    /// What one button of the gallery of computers shows.
+    private func hostTile(_ name: String, glyph: String) -> some View {
+        VStack(spacing: 12) {
+            Image(systemName: glyph).font(.system(size: 56))
+            Text(name).lineLimit(1).fixedSize()
+        }
+        .padding(.horizontal, 12)
+        // Wide, and wider still for a long name, so the name is never cut short.
+        .frame(minWidth: 240, minHeight: 135)
+    }
+
     var body: some View {
-        VStack(spacing: 20) {
-            Text("OpenVRLink").font(.largeTitle)
+        VStack(spacing: 10) {
+            // Name and version in the top left corner, the icon in the top right.
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("OpenVRLink").font(.largeTitle)
+                    Text("v" + AppVersion.current).font(.callout).foregroundStyle(.secondary)
+                }
+                Spacer()
+                AppIconView().frame(width: 64, height: 64)
+            }
+            Spacer()
             if connection.immersed {
                 Text(connection.status).font(.title3)
                 Button("Stop") {
@@ -197,19 +276,31 @@ struct EntryView: View {
                     }
                 }
             } else {
-                if connection.hosts.isEmpty {
-                    Text("Looking for computers running Steam").foregroundStyle(.secondary)
+                // Blank until there is one, and keeping its place meanwhile.
+                Text(connection.hosts.isEmpty ? " " : "Found On Your Network:").font(.headline)
+                ScrollView(.horizontal) {
+                    HStack(spacing: 16) {
+                        ForEach(connection.hosts, id: \.clientID) { host in
+                            Button { stream(from: host.address) } label: {
+                                hostTile(host.hostname, glyph: "desktopcomputer")
+                            }
+                            .buttonBorderShape(.roundedRectangle(radius: 24))
+                        }
+                        if connection.hosts.isEmpty {
+                            // Stands where the first computer will, so nothing moves when it is found.
+                            Button {} label: { hostTile("Searching...", glyph: "magnifyingglass") }
+                                .buttonBorderShape(.roundedRectangle(radius: 24))
+                                .disabled(true)
+                        }
+                    }
+                    .padding(.horizontal, 32)
+                    // In the middle while they fit; scrolling once they do not.
+                    .frame(minWidth: EntryView.windowSize.width)
                 }
-                ForEach(connection.hosts, id: \.clientID) { host in
-                    Button(host.hostname) { stream(from: host.address) }
-                }
-                HStack {
-                    TextField("Or type an address", text: $typedAddress)
-                        .textFieldStyle(.roundedBorder)
-                        .autocorrectionDisabled()
-                        .frame(maxWidth: 280)
-                    Button("Connect") { stream(from: typedAddress) }
-                        .disabled(typedAddress.trimmingCharacters(in: .whitespaces).isEmpty)
+                .scrollIndicators(.hidden)
+                .padding(.horizontal, -32)
+                Button { askingForAddress = true } label: {
+                    Label("Connect by IP Address", systemImage: "network")
                 }
                 if homeButton.delivery == .systemKeepsIt {
                     // The controller's Home button only reaches the app if the person allows it.
@@ -218,9 +309,30 @@ struct EntryView: View {
                 }
                 Text(connection.status).font(.callout).foregroundStyle(.secondary)
             }
+            Spacer()
         }
         .padding(32)
         .task { connection.searchForHosts() }
+        .sheet(isPresented: $askingForAddress) {
+            VStack(spacing: 20) {
+                Text("Connect by IP Address").font(.title2)
+                TextField("192.168.1.2", text: $typedAddress)
+                    .textFieldStyle(.roundedBorder)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .keyboardType(.numbersAndPunctuation)
+                    .frame(width: 280)
+                HStack(spacing: 16) {
+                    Button("Cancel") { askingForAddress = false }
+                    Button("Connect") {
+                        askingForAddress = false
+                        stream(from: typedAddress.trimmingCharacters(in: .whitespaces))
+                    }
+                    .disabled(typedAddress.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            }
+            .padding(32)
+        }
     }
 }
 

@@ -14,4 +14,5 @@ design/
 CLAUDE.md
 .claude/
 .pi/
-.codex/
+.codex/# copied from the app icon by gen_xcodeproj.py
+client/visionOS/Resources/Icon*.png
