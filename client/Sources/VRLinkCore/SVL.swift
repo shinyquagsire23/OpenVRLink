@@ -2,9 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-import Crypto
 import Foundation
-import _CryptoExtras
 
 /// SVL datagram framing (docs/svl-transport/packet-format.md). The session
 /// token's first letters say which of two forms the host wants: `MID`, in
@@ -150,7 +148,7 @@ public struct SVLLink {
         /// The whole datagram, padded with zeros to a multiple of 16 bytes,
         /// is AES-128-CBC encrypted, starting from the same IV every time.
         /// The header's second word counts sequence wraps, tagged 0x02 on top.
-        case encrypted(key: SymmetricKey, iv: AES._CBC.IV)
+        case encrypted(key: Bytes, iv: Bytes)
     }
     private let form: Form
     private var wraps: UInt32 = 0
@@ -170,8 +168,8 @@ public struct SVLLink {
             name = "unencrypted"
         case "AES":
             // 16 bytes of IV, then 16 of key (measured; in that order).
-            guard bytes.count >= 32, let iv = try? AES._CBC.IV(ivBytes: bytes[0..<16]) else { return nil }
-            form = .encrypted(key: SymmetricKey(data: bytes[16..<32]), iv: iv)
+            guard bytes.count >= 32 else { return nil }
+            form = .encrypted(key: Bytes(bytes[16..<32]), iv: Bytes(bytes[0..<16]))
             name = "AES-128 encrypted"
         default:
             return nil
@@ -193,7 +191,7 @@ public struct SVLLink {
             var datagram = SVL.assemble(sequence: sequence, word: counter | 0x0200_0000, elements: elements)
             // The reference client's padding: at least four zeros, up to a multiple of 16.
             datagram.append(zeros: ((datagram.count + 0x13) & ~0xF) - datagram.count)
-            return (try? AES._CBC.encrypt(datagram, using: key, iv: iv, noPadding: true)).map { Bytes($0) } ?? []
+            return Primitives.aesCBC(datagram, key: key, iv: iv, encrypting: true, padded: false) ?? []
         }
     }
 
@@ -205,7 +203,7 @@ public struct SVLLink {
             return SVL.elements(of: datagram)
         case .encrypted(let key, let iv):
             guard datagram.count >= 16, datagram.count % 16 == 0,
-                  let clear = (try? AES._CBC.decrypt(datagram, using: key, iv: iv, noPadding: true)).map({ Bytes($0) }),
+                  let clear = Primitives.aesCBC(datagram, key: key, iv: iv, encrypting: false, padded: false),
                   clear.count >= SVL.headerLength, clear[7] == 0x02, clear[2] == 0, clear[3] == 0
             else { return nil }
             return SVL.elements(of: clear)

@@ -30,7 +30,7 @@ struct EyeView {                 // produced by the XR runtime (or a window), pe
 
 | library | handles | imports | current target |
 |---|---|---|---|
-| core | protocol, pairing, session, FEC, timing, geometry, frame composition (`[Quad]`), settings, calibration math | Foundation, POSIX sockets, swift-crypto | `VRLinkCore` |
+| core | protocol, pairing, session, FEC, timing, geometry, frame composition (`[Quad]`), settings, calibration math | Foundation, POSIX sockets, the system's cryptography on Apple platforms and swift-crypto elsewhere | `VRLinkCore` |
 | XR runtime | where the eyes are and when the next frame will be displayed; the surfaces to draw into | CompositorServices *or* OpenXR | `VRLinkVisionCompositor` |
 | tracking and input | head pose, controller and hand poses, buttons and axes, haptics out | ARKit + GameController *or* OpenXR | `VRLinkVisionTracking` |
 | graphics | draw quads through eye views, from a decoded frame | Metal *or* Vulkan | `VRLinkMetal` |
@@ -352,7 +352,11 @@ calibrated gaze when there is one. Weights are smoothed with a 50 ms time consta
 
 ## Dependencies
 
-- **Crypto: swift-crypto**, which builds for Windows and Android. Pairing uses its X25519, SHA-256, 
+- **Crypto: the operating system's on Apple platforms** (CryptoKit, CommonCrypto, Security), so
+  the app carries no cryptography of its own; **swift-crypto elsewhere**, and none of it is built
+  into an Apple build. The choice is made by `#if` in one file of the core (`Primitives`), the one
+  exception to backends being handed in; known-answer tests hold both halves to the same results.
+  swift-crypto builds for Windows and Android. Pairing uses its X25519, SHA-256, 
   AES-CBC, single-block AES (for the wrapped IV) and RSA-OAEP with SHA-1 (`_RSA.Encryption.Padding.PKCS1_OAEP`);
   all are present in 3.x
 - **Protobuf: No thanks.** It's only four messages, so we serialize by hand (`VRLinkCore/Protobuf.swift`)

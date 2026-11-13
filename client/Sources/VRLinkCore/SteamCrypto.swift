@@ -2,41 +2,33 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-import Crypto
 import Foundation
-import _CryptoExtras
 
-/// The cryptography of Steam's pairing protocol (docs/remoteplay/crypto.md).
+/// The cryptography of Steam's pairing protocol (docs/remoteplay/crypto.md),
+/// built from standard operations that the system provides (`Primitives`).
 public enum SteamCrypto {
-    static let block = 16
+    static let block = Primitives.block
 
     /// AES-CBC with PKCS#7 padding under a random IV; the IV itself is
     /// AES-encrypted as a single block and put in front.
     public static func encrypt(_ plaintext: Bytes, key: Bytes) -> Bytes? {
         var generator = SystemRandomNumberGenerator()
         let iv = (0..<block).map { _ in UInt8.random(in: 0...255, using: &generator) }
-        let symmetricKey = SymmetricKey(data: key)
-        var wrappedIV = iv
-        guard (try? AES.permute(&wrappedIV, key: symmetricKey)) != nil,
-              let cbcIV = try? AES._CBC.IV(ivBytes: iv),
-              let body = try? AES._CBC.encrypt(plaintext, using: symmetricKey, iv: cbcIV)
+        guard let wrappedIV = Primitives.aesBlock(iv, key: key, encrypting: true),
+              let body = Primitives.aesCBC(plaintext, key: key, iv: iv, encrypting: true, padded: true)
         else { return nil }
-        return wrappedIV + Bytes(body)
+        return wrappedIV + body
     }
 
     /// Nil on a wrong key (bad padding) or malformed input.
     public static func decrypt(_ ciphertext: Bytes, key: Bytes) -> Bytes? {
-        guard ciphertext.count >= 2 * block, ciphertext.count % block == 0 else { return nil }
-        let symmetricKey = SymmetricKey(data: key)
-        var iv = Bytes(ciphertext.prefix(block))
-        guard (try? AES.inversePermute(&iv, key: symmetricKey)) != nil,
-              let cbcIV = try? AES._CBC.IV(ivBytes: iv),
-              let plaintext = try? AES._CBC.decrypt(Bytes(ciphertext.dropFirst(block)), using: symmetricKey, iv: cbcIV)
+        guard ciphertext.count >= 2 * block, ciphertext.count % block == 0,
+              let iv = Primitives.aesBlock(Bytes(ciphertext.prefix(block)), key: key, encrypting: false)
         else { return nil }
-        return Bytes(plaintext)
+        return Primitives.aesCBC(Bytes(ciphertext.dropFirst(block)), key: key, iv: iv, encrypting: false, padded: true)
     }
 
-    public static func sha256(_ bytes: Bytes) -> Bytes { Bytes(SHA256.hash(data: bytes)) }
+    public static func sha256(_ bytes: Bytes) -> Bytes { Primitives.sha256(bytes) }
 
     static func xor(_ a: Bytes, _ b: Bytes) -> Bytes { zip(a, b).map { $0 ^ $1 } }
 
@@ -52,13 +44,13 @@ public enum SteamCrypto {
 
     /// RSA-OAEP (SHA-1) in chunks of modulus - 42 bytes.
     static func encryptTicket(_ ticket: Bytes) -> Bytes? {
-        guard let key = try? _RSA.Encryption.PublicKey(derRepresentation: universePublicKey) else { return nil }
+        let key = Bytes(universePublicKey)
         let chunk = 256 - 42
         var out = Bytes()
         var offset = 0
         while offset < ticket.count {
             let piece = ticket[offset..<min(offset + chunk, ticket.count)]
-            guard let encrypted = try? key.encrypt(Bytes(piece), padding: .PKCS1_OAEP) else { return nil }
+            guard let encrypted = Primitives.rsaOAEPSHA1(Bytes(piece), publicKey: key) else { return nil }
             out.append(contentsOf: encrypted)
             offset += chunk
         }
@@ -69,19 +61,17 @@ public enum SteamCrypto {
     /// public key travels XORed with SHA-256 of the PIN, and the shared secret
     /// is SHA-256 of the curve output.
     struct KeyExchange {
-        private let privateKey = Curve25519.KeyAgreement.PrivateKey()
+        private let agreement = Primitives.KeyAgreement()
 
         func maskedPublicKey(pin: String) -> Bytes {
-            xor(Bytes(privateKey.publicKey.rawRepresentation), sha256(Bytes(pin.utf8)))
+            xor(agreement.publicKey, sha256(Bytes(pin.utf8)))
         }
 
         func sharedSecret(maskedPeerKey: Bytes, pin: String) -> Bytes? {
             guard maskedPeerKey.count == 32,
-                  let peer = try? Curve25519.KeyAgreement.PublicKey(
-                      rawRepresentation: xor(maskedPeerKey, sha256(Bytes(pin.utf8)))),
-                  let shared = try? privateKey.sharedSecretFromKeyAgreement(with: peer)
+                  let shared = agreement.shared(with: xor(maskedPeerKey, sha256(Bytes(pin.utf8))))
             else { return nil }
-            return sha256(shared.withUnsafeBytes { Bytes($0) })
+            return sha256(shared)
         }
     }
 }

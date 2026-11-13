@@ -5,6 +5,9 @@
 
 import PackageDescription
 
+/// Where the system has no cryptography of its own to use.
+let otherThanApple: [Platform] = [.linux, .android, .windows]
+
 let package = Package(
     name: "OpenVRLink",
     platforms: [.macOS(.v14), .visionOS("26.0")],
@@ -20,10 +23,13 @@ let package = Package(
     ],
     targets: [
         // Protocol, session and frame composition. No UI, graphics, audio or
-        // decoder frameworks; it needs only Foundation, POSIX sockets and swift-crypto.
+        // decoder frameworks; it needs only Foundation, POSIX sockets and
+        // cryptography: the system's own on Apple's platforms, where nothing
+        // of swift-crypto is built in, and swift-crypto elsewhere
+        // (`Primitives`).
         .target(name: "VRLinkCore", dependencies: [
-            .product(name: "Crypto", package: "swift-crypto"),
-            .product(name: "_CryptoExtras", package: "swift-crypto"),
+            .product(name: "Crypto", package: "swift-crypto", condition: .when(platforms: otherThanApple)),
+            .product(name: "_CryptoExtras", package: "swift-crypto", condition: .when(platforms: otherThanApple)),
         ]),
         // Platform backends, one per seam (docs/client-architecture.md).
         .target(name: "VRLinkVideoToolbox", dependencies: ["VRLinkCore"]),            // decoder
