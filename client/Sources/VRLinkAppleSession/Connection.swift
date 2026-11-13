@@ -8,6 +8,9 @@ import VRLinkAppleAudio
 import VRLinkAppleNetwork
 import VRLinkCore
 import VRLinkVideoToolbox
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// A connection and its lifecycle, including finding, pairing,
 /// and the streaming session itself.
@@ -74,7 +77,19 @@ public final class Connection: ObservableObject {
         return pictureArrived
     }
 
+    /// What the host calls this device from pairing on, as in "Max's Apple
+    /// Vision Pro (OpenVRLink)". The system gives an app the name its owner
+    /// chose only with an entitlement Apple grants on request
+    /// (com.apple.developer.device-information.user-assigned-device-name);
+    /// without it the name is the model's, "Apple Vision Pro".
+    private let deviceName: String
+
     public init() {
+        #if canImport(UIKit)
+        deviceName = UIDevice.current.name + " (" + DataDirectory.name + ")"
+        #else
+        deviceName = (Host.current().localizedName ?? "Mac") + " (" + DataDirectory.name + ")"
+        #endif
         decoder.onImage = { [weak self] frame in
             guard let self else { return }
             session?.frameDecoded(frame.frameID)
@@ -165,13 +180,15 @@ public final class Connection: ObservableObject {
                 let args: SessionArgs
                 do {
                     show("Asking \(host.hostname) for a session")
-                    args = try Broadcast.requestSession(socket, host: host, identity: identity)
+                    args = try Broadcast.requestSession(socket, host: host, identity: identity,
+                                                        deviceVersion: DataDirectory.name + " " + SystemVersion.named)
                 } catch BroadcastError.notPaired {
-                    try Broadcast.pair(socket, host: host, identity: identity, deviceName: "OpenVRLink") { pin in
+                    try Broadcast.pair(socket, host: host, identity: identity, deviceName: deviceName) { pin in
                         show("Enter PIN \(pin) in Steam on \(host.hostname)")
                     }
                     show("Paired; asking \(host.hostname) for a session")
-                    args = try Broadcast.requestSession(socket, host: host, identity: identity)
+                    args = try Broadcast.requestSession(socket, host: host, identity: identity,
+                                                        deviceVersion: DataDirectory.name + " " + SystemVersion.named)
                 }
                 guard let session = StreamSession(args, profile: profile, interface: interface) else {
                     throw BroadcastError.badResponse("the host offered a transport this client does not have implemented yet (token kind \(args.token.prefix(4)))")

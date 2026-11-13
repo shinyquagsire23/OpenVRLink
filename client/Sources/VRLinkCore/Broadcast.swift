@@ -226,7 +226,10 @@ public enum Broadcast {
     /// and decrypts the session string from the final response
     ///
     /// We roll our own protobuf here because I hate having protobuf as a dependency.
-    public static func requestSession(_ socket: UDPSocket, host: SteamHost, identity: Identity) throws -> SessionArgs {
+    ///
+    /// `deviceVersion` is free text the host is given about this client.
+    public static func requestSession(_ socket: UDPSocket, host: SteamHost, identity: Identity,
+                                      deviceVersion: String) throws -> SessionArgs {
         let secret = identity.secret(forHost: host.clientID)
         let requestID = UInt64(UInt32.random(in: 1...UInt32.max))
         var deviceIDBytes = Bytes()
@@ -245,7 +248,7 @@ public enum Broadcast {
             request.varint(2, 1280)                      // maximum_resolution; ignored for VR
             request.varint(3, 800)
             request.varint(4, 2)                         // audio_channel_count
-            request.string(5, "Android 10")              // device_version
+            request.string(5, deviceVersion)             // device_version
             request.bytes(7, SteamCrypto.encrypt(deviceIDBytes, key: secret) ?? [])   // device_token
             request.bytes(8, [])                         // pin
             request.bool(9, true)                        // enable video, audio, input

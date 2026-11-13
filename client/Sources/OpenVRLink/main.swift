@@ -204,13 +204,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let args: SessionArgs
             do {
                 setTitle("asking \(host.hostname) for a session")
-                args = try Broadcast.requestSession(socket, host: host, identity: identity)
+                args = try Broadcast.requestSession(socket, host: host, identity: identity,
+                                                        deviceVersion: "OpenVRLink " + SystemVersion.named)
             } catch BroadcastError.notPaired {
-                try Broadcast.pair(socket, host: host, identity: identity, deviceName: "OpenVRLink") { pin in
+                try Broadcast.pair(socket, host: host, identity: identity,
+                                   deviceName: (Host.current().localizedName ?? "Mac") + " (OpenVRLink)") { pin in
                     setTitle("enter PIN \(pin) in Steam on \(host.hostname)")
                 }
                 setTitle("paired; asking \(host.hostname) for a session")
-                args = try Broadcast.requestSession(socket, host: host, identity: identity)
+                args = try Broadcast.requestSession(socket, host: host, identity: identity,
+                                                        deviceVersion: "OpenVRLink " + SystemVersion.named)
             }
 
             guard let session = StreamSession(args, profile: profile, interface: interface) else {
