@@ -131,6 +131,25 @@ def main():
         "MARKETING_VERSION": MARKETING_VERSION, "CURRENT_PROJECT_VERSION": BUILD_NUMBER,
         "LD_RUNPATH_SEARCH_PATHS": "$(inherited) @executable_path/Frameworks",
         "ASSETCATALOG_COMPILER_APPICON_NAME": "AppIcon",
+        # Info.plist entries that have a build setting live here and not in
+        # Info.plist: Xcode moves any it finds there into the project when it
+        # opens it, and this project file is generated, so they would be lost.
+        # Info.plist keeps only what has no build setting (the scene manifest,
+        # without whose immersive-space entry the space opens and every frame
+        # is presented into nothing; and the list of game controllers).
+        # Without the local network entry, traffic to the Steam host is silently discarded.
+        "INFOPLIST_KEY_NSLocalNetworkUsageDescription":
+            "OpenVRLink connects to Steam on a computer on your local network.",
+        "INFOPLIST_KEY_NSMicrophoneUsageDescription":
+            "OpenVRLink sends your voice to SteamVR when you turn the microphone on.",
+        "INFOPLIST_KEY_NSCameraUsageDescription":
+            "OpenVRLink reads your expressions off your Spatial Persona to send face tracking to SteamVR, "
+            "when you turn that experiment on.",
+        "INFOPLIST_KEY_NSAccessoryTrackingUsageDescription":
+            "OpenVRLink sends the position of your controllers to SteamVR.",
+        "INFOPLIST_KEY_NSHandsTrackingUsageDescription":
+            "OpenVRLink sends the position of your hands to SteamVR.",
+        "INFOPLIST_KEY_GCSupportsControllerUserInteraction": "YES",
     }
     if bundle_id == OWN_BUNDLE_ID:
         target_settings["CODE_SIGN_ENTITLEMENTS"] = "OpenVRLink.entitlements"
