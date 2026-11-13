@@ -1,5 +1,7 @@
 # OpenVRLink
 
+[Join the Testflight!](https://testflight.apple.com/join/VpfAxE6A)
+
 An open-source client compatible with Valve's Steam VR Link pairing and streaming protocol, written in Swift for visionOS (and eventually other platforms).
 
 ## Added features
