@@ -51,6 +51,12 @@ public struct DeviceProfile {
         return out
     }
 
+    /// The second and third parts of the version string the host is
+    /// given, as in "qvlclient;visionOS;OpenVRLink 0.1.0-2": the system
+    /// this runs on, and the client and its version. The platform's shell
+    /// fills them in. (The Steam Link client sends "qvlclient;hollywood;2.0.20.1812".)
+    public var systemName = "unknown", clientVersion = DataDirectory.name
+
     /// Whether this headset sends eye or face tracking. 
     /// vrlink determines this per headset, so we have to swap
     /// between Quest Pro and Quest 2 for now.
@@ -170,7 +176,7 @@ public struct DeviceProfile {
             ValueID.projection: projection(),
             ValueID.eyeToHead: eyeToHead(),
             ValueID.availableRates: availableRates(refreshHz),
-            ValueID.versionString: Bytes("qvlclient;hollywood;2.0.20.1812".utf8),
+            ValueID.versionString: Bytes("qvlclient;\(systemName);\(clientVersion)".utf8),
             ValueID.chaperone: chaperone(universe: UInt32(truncatingIfNeeded: instance) & 0x7FFF_FFFF),
             ValueID.hostDefaults: [3, 0, 0, 0, 1, 0, 0, 0],
             ValueID.staticHMD: staticHMDProps(),

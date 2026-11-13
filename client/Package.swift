@@ -43,6 +43,7 @@ let package = Package(
         // visionOS: the stream drawn into a compositor layer. Empty elsewhere.
         .target(name: "VRLinkVisionCompositor", dependencies: [
             "VRLinkCore", "VRLinkVideoToolbox", "VRLinkMetal", "VRLinkVisionTracking", "VRLinkAppleSession",
+            "VRLinkAppleNetwork",
         ]),
         // visionOS experiments: the stream drawn with RealityKit, face and gaze
         // from the Spatial Persona, and their calibrations. Empty elsewhere.

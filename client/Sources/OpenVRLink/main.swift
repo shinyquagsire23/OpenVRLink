@@ -122,6 +122,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Stream at the display's own refresh rate, so frames and refreshes pair up.
         let refreshHz = NSScreen.main?.maximumFramesPerSecond ?? 60
         var profile = DeviceProfile()
+        profile.systemName = SystemVersion.name
+        profile.clientVersion = SystemVersion.client
         profile.refreshHz = Float(refreshHz)
         // The settings this viewer has a use for: the field of view asked of the host, and the chroma key.
         let settings = Settings.load()

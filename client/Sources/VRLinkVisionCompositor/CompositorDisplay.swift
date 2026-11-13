@@ -9,6 +9,7 @@ import Metal
 import QuartzCore
 import SwiftUI
 import VRLinkAppleSession
+import VRLinkAppleNetwork
 import VRLinkCore
 import VRLinkVisionTracking
 import VRLinkMetal
@@ -184,6 +185,8 @@ public final class CompositorDisplay {
         let left = drawable.views[0].transform.columns.3, right = drawable.views[1].transform.columns.3
         let midpoint = (left + right) * 0.5
         var profile = DeviceProfile()
+        profile.systemName = SystemVersion.name
+        profile.clientVersion = SystemVersion.client
         profile.refreshHz = Float((1 / period).rounded())
         let turnedEyes = (0..<2).map { index -> Pose in
             var deviceFromEye = drawable.views[index].transform
