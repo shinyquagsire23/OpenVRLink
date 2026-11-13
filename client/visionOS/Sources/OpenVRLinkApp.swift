@@ -229,7 +229,7 @@ struct SettingsView: View {
     @ObservedObject var store: SettingsStore
 
     /// The chroma key color as a color picker wants it. Kept as sRGB values, the way the picker shows them.
-    private var keyColour: Binding<Color> {
+    private var keyColor: Binding<Color> {
         Binding(
             get: {
                 let c = store.settings.chromaKeyColor
@@ -252,37 +252,42 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            Section("Audio") {
+                Toggle("Send my microphone", isOn: $store.settings.microphone)
+            }
+
             Section("Hands and controllers") {
                 Toggle("Show my hands over the picture", isOn: $store.settings.showHandsOverlaid)
-                Toggle("Hide system overlays (the palm gesture)", isOn: $store.settings.hideSystemOverlays)
-                Toggle("Knock the controllers together twice, in front of your face, to switch between controllers and hands",
+                Toggle("Hide system overlays (palm gesture)", isOn: $store.settings.hideSystemOverlays)
+                Toggle("Switch between controllers and hands by looking at and clacking them together twice",
                        isOn: $store.settings.clackSwitchesToHands)
-                Toggle("Point by looking and pinching, instead of with the arm", isOn: $store.settings.gazePinchRays)
-                Toggle("Send my microphone", isOn: $store.settings.microphone)
-                Toggle("Close this window when streaming starts", isOn: $store.settings.closeWindowOnEntry)
+                Toggle("Enable Gaze-Pinch interactions", isOn: $store.settings.gazePinchRays)
             }
-            Section {
-                Toggle("See the room through one colour of the picture", isOn: $store.settings.chromaKey)
-                ColorPicker("Colour", selection: keyColour, supportsOpacity: false)
+
+            Section("Chroma key") {
+                Toggle("Enable Chroma-keyed passthrough", isOn: $store.settings.chromaKey)
+                ColorPicker("Color", selection: keyColor, supportsOpacity: false)
                 // Below the first distance a color is all room; above the second, all picture.
-                slider("All room within", $store.settings.chromaKeyNear,
+                slider("Min Color Distance", $store.settings.chromaKeyNear,
                        in: 0...max(0.01, store.settings.chromaKeyFar - 0.01), step: 0.01)
-                slider("All picture beyond", $store.settings.chromaKeyFar, in: 0.01...1, step: 0.01)
-                Toggle("Turn it off while a game is running", isOn: $store.settings.chromaKeyOffInGames)
-            } header: {
-                Text("Chroma key")
-            } footer: {
-                Text("SteamVR says when a game is running but not which one, so this cannot be set per game.")
+                slider("Max Color Distance", $store.settings.chromaKeyFar, in: 0.01...1, step: 0.01)
+                Toggle("Disable passthrough during games", isOn: $store.settings.chromaKeyOffInGames)
             }
+
             Section {
                 slider("Across", $store.settings.fovScaleHorizontal, in: VRLinkCore.Settings.fovScaleRange, step: 0.05)
                 slider("Up and down", $store.settings.fovScaleVertical, in: VRLinkCore.Settings.fovScaleRange, step: 0.05)
             } header: {
                 Text("Field of view")
             } footer: {
-                Text("More than 1 leaves a margin for fast head turns; less gives a smaller, sharper picture. Used from the next connection. The microphone setting is too.")
+                Text("Increase FoV for timewarp comfort, or sacrifice FoV for sharpness")
+            }
+
+            Section("Other") {
+                Toggle("Close this window when streaming starts", isOn: $store.settings.closeWindowOnEntry)
             }
         }
+        .contentMargins(.top, 30, for: .scrollContent)
     }
 }
 
@@ -300,24 +305,30 @@ struct ExperimentsView: View {
     var body: some View {
         Form {
             Section {
-                Toggle("Face and eye tracking from my Spatial Persona", isOn: $store.settings.faceFromCamera)
+                Toggle("Render stream with RealityKit", isOn: $store.settings.realityKitRenderer)
+                Toggle("Display Persona camera (debug)", isOn: $store.settings.showFaceCameraPicture)
+            } header: {
+                Text("Renderer")
             } footer: {
-                Text("Reads your expressions off your Persona and sends them to SteamVR as face tracking. Needs the RealityKit renderer below, which keeps the Persona's camera in front of your face.")
+                Text("Not recommended; may break in future updates")
             }
+
             Section {
-                Toggle("Draw the stream with RealityKit", isOn: $store.settings.realityKitRenderer)
-                Toggle("Show the Persona camera's picture", isOn: $store.settings.showFaceCameraPicture)
+                Toggle("Enable face and eye tracking", isOn: $store.settings.faceFromCamera)
+            } header: {
+                Text("Tracking")
             } footer: {
-                Text("Slower and less sharp at the edges than the ordinary renderer. Used from the next time streaming starts.")
+                Text("Face and eye tracking eequires the RealityKit renderer")
             }
-            Section {
+
+            Section("Eye Tracking") {
                 if let fit = store.settings.gazeCalibration, fit.usable {
-                    Text(String(format: "Calibrated from %d pinches, typically %.1f degrees off", fit.sampleCount, fit.typicalErrorDegrees))
-                    Button("Forget the calibration", role: .destructive) { store.settings.gazeCalibration = nil }
-                    Toggle("Keep calibrating from pinches while streaming", isOn: $store.settings.continuousGazeCalibration)
+                    //Text(String(format: "Current calibration: %d pinches, ~%.1f degrees off", fit.sampleCount, fit.typicalErrorDegrees))
+                    Button("Discard calibration", role: .destructive) { store.settings.gazeCalibration = nil }
+                    Toggle("Enable Continuous Calibration", isOn: $store.settings.continuousGazeCalibration)
                         .disabled(fit.samples.isEmpty)
                     if fit.samples.isEmpty {
-                        Text("This calibration was saved without its samples. Calibrate once more to keep calibrating while streaming.")
+                        Text("This calibration was saved without its samples. Calibrate again to enable continuous calibration.")
                             .foregroundStyle(.secondary)
                     }
                 } else {
@@ -336,17 +347,11 @@ struct ExperimentsView: View {
                     .disabled(!store.settings.faceFromCamera || connection.immersed || faceCalibration.open)
                     if !calibration.status.isEmpty { Text(calibration.status).foregroundStyle(.secondary) }
                 }
-            } header: {
-                Text("Eye tracking")
-            } footer: {
-                Text("Dots appear in front of you and follow your head. Look at the bright one and pinch, for each of the nineteen. With a calibration, SteamVR's sharp area follows your eyes.")
             }
-            Section {
+
+            Section("Face Tracking") {
                 if let fit = store.settings.faceCalibration, fit.usable {
-                    Text("Calibrated to your face")
-                    Button("Forget the calibration", role: .destructive) { store.settings.faceCalibration = nil }
-                } else {
-                    Text("Not calibrated: expressions are guessed with fixed rules").foregroundStyle(.secondary)
+                    Button("Discard calibration", role: .destructive) { store.settings.faceCalibration = nil }
                 }
                 if faceCalibration.open {
                     Text(faceCalibration.status)
@@ -360,12 +365,9 @@ struct ExperimentsView: View {
                     .disabled(!store.settings.faceFromCamera || connection.immersed || calibration.open)
                     if !faceCalibration.status.isEmpty { Text(faceCalibration.status).foregroundStyle(.secondary) }
                 }
-            } header: {
-                Text("Face tracking")
-            } footer: {
-                Text("A panel shows your Persona and asks for nine expressions, about five seconds each. Each expression sent to SteamVR is then measured against your own resting face and your own fullest version of it.")
             }
         }
+        .contentMargins(.top, 30, for: .scrollContent)
     }
 
     private func close() {
