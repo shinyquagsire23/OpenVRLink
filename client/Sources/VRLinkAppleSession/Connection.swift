@@ -21,6 +21,9 @@ public final class Connection: ObservableObject {
     @Published public var hosts: [SteamHost] = []
     /// Whether the immersive space is open
     @Published public var immersed = false
+    /// Connecting, with the immersive space still to be opened: it is
+    /// opened when there is a picture to show in it.
+    @Published public var waitingForPicture = false
     /// The host the user chose.
     /// When the headset is doffed and re-donned, it will resume from this
     /// host instead of re-asking the user.
@@ -35,6 +38,8 @@ public final class Connection: ObservableObject {
     private let battery = HeadsetBattery()
     private var current: StreamSession?
     private var starting = false
+    private var startedWith: DeviceProfile?
+    private var pictureArrived = false
     /// False once stopping, so a connection attempt in progress gives up
     private var wanted = false
     private var audio: AudioOutput?
@@ -47,10 +52,36 @@ public final class Connection: ObservableObject {
         return current
     }
 
+    /// How the display was described to the host when the stream now
+    /// running, or being started, was asked for. Thread-safe.
+    public var profile: DeviceProfile? {
+        lock.lock()
+        defer { lock.unlock() }
+        return startedWith
+    }
+
+    /// Whether a stream is running or being started. Thread-safe.
+    public var active: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return starting || current != nil
+    }
+
+    /// Whether this stream has had a frame decoded yet. Thread-safe.
+    public var hasPicture: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return pictureArrived
+    }
+
     public init() {
         decoder.onImage = { [weak self] frame in
-            self?.session?.frameDecoded(frame.frameID)
-            self?.frames.push(frame)
+            guard let self else { return }
+            session?.frameDecoded(frame.frameID)
+            frames.push(frame)
+            lock.lock()
+            pictureArrived = current != nil
+            lock.unlock()
         }
     }
 
@@ -99,6 +130,10 @@ public final class Connection: ObservableObject {
         let busy = starting || current != nil
         starting = !busy
         wanted = true
+        if !busy {
+            startedWith = profile
+            pictureArrived = false
+        }
         lock.unlock()
         if busy { return }
         let address = hostAddress.trimmingCharacters(in: .whitespaces)
@@ -187,6 +222,8 @@ public final class Connection: ObservableObject {
         let session = current
         current = nil
         wanted = false
+        startedWith = nil
+        pictureArrived = false
         lock.unlock()
         frames.clear()
         guard let session else { return }

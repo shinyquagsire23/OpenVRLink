@@ -40,12 +40,10 @@ import simd
 public final class RealityKitDisplay {
     private let connection: Connection
     private let head: HeadTracking
-    private let controllers: ControllerTracking
-    private let hands: HandJoints
     private let settings: SettingsStore
     private let persona: PersonaTracking
-    private let measured: MeasuredDisplay
-    let pinches = PinchRays()
+    private let inputs: StreamInputs
+    var pinches: PinchRays { inputs.pinches }
 
     private let device = MTLCreateSystemDefaultDevice()!
     private let queue: MTLCommandQueue
@@ -64,30 +62,31 @@ public final class RealityKitDisplay {
     private var vsync: VsyncPrediction?
     private var eyeSize = (width: 0, height: 0)
     private var framesDrawn = 0, updatesSeen = 0
-    private var profile: DeviceProfile?
+    /// Black, behind the planes, for a picture that is not keyed (`showBackdrop`).
+    private var backdrop: ModelEntity?
     public private(set) var stopped = false
 
     /// How far away the planes stand, in meters, left then right. Far, so
     /// that everything else RealityKit draws is in front; not the same, so
     /// that the two do not fight over which is in front.
     private static let planeDistance: [Float] = [80, 70]
+    /// The black behind the planes stands this far from the head, in
+    /// meters, and is twenty times as wide: far more than the eyes see.
+    private static let backdropDistance: Float = 90
     /// The flattened picture has this many pixels for each one of a tile,
     /// each way, so that the sharper foveal tile keeps most of its detail.
     private static let flattenScale = 1.6
     private static let largestSide = 3072
 
-    public init?(connection: Connection, head: HeadTracking, controllers: ControllerTracking, hands: HandJoints,
-          settings: SettingsStore, persona: PersonaTracking, measured: MeasuredDisplay) {
+    public init?(inputs: StreamInputs, persona: PersonaTracking) {
         guard let queue = device.makeCommandQueue(),
               let renderer = QuadRenderer(device: device, colorFormat: .bgra8Unorm_srgb, linearOutput: true)
         else { return nil }
-        self.connection = connection
-        self.head = head
-        self.controllers = controllers
-        self.hands = hands
-        self.settings = settings
+        self.inputs = inputs
+        self.connection = inputs.connection
+        self.head = inputs.head
+        self.settings = inputs.settings
         self.persona = persona
-        self.measured = measured
         self.queue = queue
         self.renderer = renderer
     }
@@ -115,6 +114,16 @@ public final class RealityKitDisplay {
         catcher.orientation = simd_quatf(angle: .pi / 2, axis: [1, 0, 0])
         catcher.scale = [6, 6, 6]
         headAnchor.addChild(catcher)
+
+        // Opaque, so it is drawn before the planes, which do not look at
+        // depth and so are drawn over it though they are nearer.
+        let black = ModelEntity(mesh: sheet, materials: [UnlitMaterial(color: .black)])
+        black.position = [0, 0, -RealityKitDisplay.backdropDistance]
+        black.orientation = simd_quatf(angle: .pi / 2, axis: [1, 0, 0])
+        black.scale = SIMD3(repeating: RealityKitDisplay.backdropDistance * 20)
+        black.isEnabled = false
+        headAnchor.addChild(black)
+        backdrop = black
         content.add(headAnchor)
 
         do {
@@ -152,36 +161,33 @@ public final class RealityKitDisplay {
         }
     }
 
-    private func connectIfReady() {
-        guard profile == nil, let measured = measured.value else { return }
-        let chosen = settings.current
-        var profile = measured.profile
-        profile.eyeFrusta = profile.eyeFrusta.map {
-            $0.scaled(horizontal: chosen.fovScaleHorizontal, vertical: chosen.fovScaleVertical)
-        }
+    /// Describe the display to the host as it was last measured, and ask
+    /// for a stream to show with RealityKit. The space need not be open
+    /// yet. False if the display has not been measured.
+    @discardableResult
+    public static func connect(_ inputs: StreamInputs, persona: PersonaTracking) -> Bool {
+        guard let measured = inputs.measured.value, var profile = inputs.profileForHost() else { return false }
+        let chosen = inputs.settings.current
         profile.tracksEyesOrFace = chosen.faceFromCamera
-        self.profile = profile
-        head.setEyeMidpoint(measured.eyeMidpoint, atConnect: true)
-        controllers.gripsAsRendered = false
+        inputs.head.setEyeMidpoint(measured.eyeMidpoint, atConnect: true)
+        inputs.controllers.gripsAsRendered = false
         persona.camera.setIPD(profile.eyesInHead[1].position.x - profile.eyesInHead[0].position.x)
         Log.note("realitykit: connecting at \(profile.refreshHz) Hz")
-        connection.start(profile: profile, microphone: chosen.microphone,
-                         headProvider: { [head] in head.trackedHead() },
-                         handsProvider: { [controllers, hands, head, settings, pinches] in
-                             let chosen = settings.current
-                             let held = controllers.states(clackSwitching: chosen.clackSwitchesToHands, head: head.latestHead())
-                             let bare = hands.hands()
-                             return Side.allCases.map { side in
-                                 if let controller = held[side.rawValue] { return .controller(controller) }
-                                 guard var hand = bare[side.rawValue] else { return nil }
-                                 if chosen.gazePinchRays { hand.systemPinch = pinches.pinch(side) }
-                                 return .hand(hand)
-                             }
-                         },
-                         // There is no rate map to read the gaze from here: the Persona's eyes or nothing.
-                         gazeProvider: { [persona, settings] in persona.gaze(settings.current) },
-                         faceProvider: { [persona, settings] in persona.face(settings.current) },
-                         onHaptic: { [controllers] in controllers.vibrate($0) })
+        inputs.connection.start(profile: profile, microphone: chosen.microphone,
+                                headProvider: { [head = inputs.head] in head.trackedHead() },
+                                handsProvider: { [inputs] in inputs.handsNow() },
+                                // There is no rate map to read the gaze from here: the Persona's eyes or nothing.
+                                gazeProvider: { [persona, settings = inputs.settings] in persona.gaze(settings.current) },
+                                faceProvider: { [persona, settings = inputs.settings] in persona.face(settings.current) },
+                                onHaptic: { [controllers = inputs.controllers] in controllers.vibrate($0) })
+        return true
+    }
+
+    /// Black behind a picture that is not keyed, so that one narrower
+    /// than the display (the field-of-view setting) has a black margin and
+    /// not the room. With keying, or with no picture, the room shows.
+    private func showBackdrop(_ pictureShown: Bool) {
+        backdrop?.isEnabled = pictureShown && renderer.chromaKey == nil
     }
 
     /// Three textures and their planes, for a frame like this one shown through `frusta`.
@@ -243,7 +249,8 @@ public final class RealityKitDisplay {
         defer { vsync?.updateTook(CACurrentMediaTime() - began) }
         updatesSeen += 1
         placePersonaCamera()
-        connectIfReady()
+        // The stream being shown was asked for with this, before this space opened.
+        let profile = connection.profile
         renderer.chromaKey = settings.current.chromaKeying(inGame: connection.session?.sceneApplicationRunning ?? false)
 
         let picked = connection.frames.next()
@@ -265,7 +272,13 @@ public final class RealityKitDisplay {
         }
         guard let picked, picked.isNew, let profile else {
             // No stream: show nothing stale.
-            if connection.session == nil { for set in sets { set.planes.forEach { $0.isEnabled = false } } }
+            if connection.session == nil {
+                for set in sets { set.planes.forEach { $0.isEnabled = false } }
+                showBackdrop(false)
+            } else {
+                // The keying setting may have changed with the picture standing still.
+                showBackdrop(sets.contains { $0.planes.contains(where: \.isEnabled) })
+            }
             return
         }
         let frame = picked.frame
@@ -283,7 +296,9 @@ public final class RealityKitDisplay {
             let pass = MTLRenderPassDescriptor()
             pass.colorAttachments[0].texture = target
             pass.colorAttachments[0].loadAction = eye == Eye.allCases.first ? .clear : .load
-            pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+            // Where the picture fades out at its edge it fades to black, unless it is keyed.
+            pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0,
+                                                                alpha: renderer.chromaKey == nil ? 1 : 0)
             pass.colorAttachments[0].storeAction = .store
             pass.rasterizationRateMap = foveated?.target.maps[eye.rawValue]
             guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { return }
@@ -326,6 +341,7 @@ public final class RealityKitDisplay {
         for other in sets.indices {
             sets[other].planes.forEach { $0.isEnabled = other == framesDrawn % 3 }
         }
+        showBackdrop(true)
     }
 
     /// Keep the Persona's camera one meter in front of the face, facing as

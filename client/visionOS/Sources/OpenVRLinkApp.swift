@@ -41,6 +41,14 @@ struct OpenVRLinkApp: App {
     @StateObject private var faceCalibration = FaceCalibrationRun()
     @StateObject private var keptFaceCalibration = Kept<FaceCalibrationSpace>()
     private static var trackingStarted = false
+    /// What a stream is asked for with: made on first use, since it is made of the above.
+    private let keptInputs = Kept<StreamInputs>()
+    private var streamInputs: StreamInputs {
+        keptInputs.value {
+            StreamInputs(connection: connection, head: head, controllers: controllers, hands: hands,
+                         settings: store, measured: measured)
+        }
+    }
     /// The version this app was when it last ran here, to notice an update.
     @AppStorage("lastUsedAppVersion") private var lastUsedAppVersion = "never launched"
     @State private var showChanges = false
@@ -52,10 +60,11 @@ struct OpenVRLinkApp: App {
     }
 
     var body: some Scene {
+        let inputs = streamInputs
         WindowGroup(id: "entry") {
             // Two tabs, which visionOS shows as an ornament beside the window.
             TabView {
-                EntryView(connection: connection, homeButton: controllers.homeButton, store: store, measured: measured,
+                EntryView(connection: connection, homeButton: controllers.homeButton, store: store, inputs: inputs,
                           persona: persona)
                     .tabItem { Label("Stream", systemImage: "play.tv") }
                 SettingsView(store: store)
@@ -90,8 +99,7 @@ struct OpenVRLinkApp: App {
 
         ImmersiveSpace(id: "stream") {
             CompositorLayer(configuration: StreamLayerConfiguration()) { layerRenderer in
-                CompositorDisplay(layerRenderer, connection: connection, head: head, controllers: controllers,
-                                  hands: hands, settings: store, measured: measured)?.start()
+                CompositorDisplay(layerRenderer, inputs: inputs)?.start()
             }
         }
         // Mixed, so the system does not fence the wearer into the small area a
@@ -106,8 +114,7 @@ struct OpenVRLinkApp: App {
         ImmersiveSpace(id: "stream-realitykit") {
             // The same display for as long as the space is open, however often this is asked.
             if let display = keptDisplay.value(unless: \.stopped, make: {
-                RealityKitDisplay(connection: connection, head: head, controllers: controllers, hands: hands,
-                                  settings: store, persona: persona, measured: measured)
+                RealityKitDisplay(inputs: inputs, persona: persona)
             }) {
                 RealityKitStreamView(display: display, persona: persona, settings: store.settings)
             }
@@ -117,11 +124,10 @@ struct OpenVRLinkApp: App {
         .persistentSystemOverlays(store.settings.hideSystemOverlays ? .hidden : .automatic)
 
         // A compositor layer opened only to learn what the displays are
-        // like, which RealityKit cannot say (`MeasuredDisplay`).
+        // like, before the first connection (`MeasuredDisplay`).
         ImmersiveSpace(id: "measure") {
             CompositorLayer(configuration: StreamLayerConfiguration()) { layerRenderer in
-                CompositorDisplay(layerRenderer, connection: connection, head: head, controllers: controllers,
-                                  hands: hands, settings: store, measured: measured, measureOnly: true)?.start()
+                CompositorDisplay(layerRenderer, inputs: inputs, measureOnly: true)?.start()
             }
         }
         .immersionStyle(selection: .constant(.mixed), in: .mixed)
@@ -201,13 +207,21 @@ final class Kept<Value: AnyObject>: ObservableObject {
         kept = make()
         return kept
     }
+
+    /// The one object, made the first time it is asked for.
+    func value(make: () -> Value) -> Value {
+        if let kept { return kept }
+        let made = make()
+        kept = made
+        return made
+    }
 }
 
 struct EntryView: View {
     @ObservedObject var connection: Connection
     @ObservedObject var homeButton: HomeButton
     @ObservedObject var store: SettingsStore
-    let measured: MeasuredDisplay
+    let inputs: StreamInputs
     let persona: PersonaTracking
     @Environment(\.dismissWindow) private var dismissWindow
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
@@ -217,27 +231,44 @@ struct EntryView: View {
     @AppStorage("typedAddress") private var typedAddress = ""
     @State private var askingForAddress = false
 
-    /// Open the immersive space, which connects to `address` once it is running.
+    /// Connect to `address`, and open the immersive space when there is
+    /// a picture to show in it: until then the wearer stays where they
+    /// were, in an environment for one.
     private func stream(from address: String) {
         Task {
             connection.hostAddress = address
-            var space = "stream"
-            if store.settings.realityKitRenderer {
-                space = "stream-realitykit"
-                // RealityKit cannot say what the displays are like: open a
-                // compositor layer for a moment to find out, once.
-                if measured.value == nil, case .opened = await openImmersiveSpace(id: "measure") {
+            connection.waitingForPicture = true
+            defer { connection.waitingForPicture = false }
+            // Only a compositor layer is told what the displays are like:
+            // one is opened for a moment to find out, once.
+            let measured = inputs.measured
+            if measured.value == nil {
+                connection.status = "Measuring the displays"
+                if case .opened = await openImmersiveSpace(id: "measure") {
                     // It waits for the views to settle, which takes a few seconds (`CompositorDisplay.settledWithin`).
-                    for _ in 0..<200 where measured.value == nil { try? await Task.sleep(for: .milliseconds(50)) }
+                    for _ in 0..<200 where measured.value == nil && connection.waitingForPicture {
+                        try? await Task.sleep(for: .milliseconds(50))
+                    }
                     await dismissImmersiveSpace()
                     try? await Task.sleep(for: .milliseconds(300))
                 }
-                guard measured.value != nil else {
-                    connection.status = "Could not measure the displays"
-                    return
-                }
             }
-            guard case .opened = await openImmersiveSpace(id: space) else { return }
+            // Stopped meanwhile.
+            guard connection.waitingForPicture else { return }
+            let realityKit = store.settings.realityKitRenderer
+            guard realityKit ? RealityKitDisplay.connect(inputs, persona: persona) : CompositorDisplay.connect(inputs) else {
+                connection.status = "Could not measure the displays"
+                return
+            }
+            // Its progress, a pairing PIN and its failure are all shown in the window meanwhile.
+            while !connection.hasPicture {
+                guard connection.active, connection.waitingForPicture else { return }
+                try? await Task.sleep(for: .milliseconds(20))
+            }
+            guard case .opened = await openImmersiveSpace(id: realityKit ? "stream-realitykit" : "stream") else {
+                connection.stop()
+                return
+            }
             connection.immersed = true
             // Opening the app again brings the window back.
             if store.settings.closeWindowOnEntry { dismissWindow(id: "entry") }
@@ -267,11 +298,14 @@ struct EntryView: View {
                 AppIconView().frame(width: 64, height: 64)
             }
             Spacer()
-            if connection.immersed {
+            if connection.immersed || connection.waitingForPicture {
                 Text(connection.status).font(.title3)
                 Button("Stop") {
                     Task {
-                        await dismissImmersiveSpace()
+                        // Before the space is open there is only the connection to end.
+                        connection.waitingForPicture = false
+                        if connection.immersed { await dismissImmersiveSpace() }
+                        connection.stop()
                         connection.immersed = false
                     }
                 }

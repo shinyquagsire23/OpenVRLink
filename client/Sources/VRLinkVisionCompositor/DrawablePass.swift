@@ -18,13 +18,13 @@ import simd
 /// the two eye views used (world space), or none if nothing could be drawn.
 @discardableResult
 func drawQuads(into drawable: LayerRenderer.Drawable, commands: MTLCommandBuffer, renderer: QuadRenderer,
-               frame: DecodedFrame?, originFromDevice: simd_float4x4,
+               frame: DecodedFrame?, originFromDevice: simd_float4x4, behind: MTLClearColor,
                quads: (Eye, EyeView) -> [Quad]) -> [EyeView] {
     let views = drawable.views
     let pass = MTLRenderPassDescriptor()
     pass.colorAttachments[0].texture = drawable.colorTextures[0]
     pass.colorAttachments[0].loadAction = .clear
-    pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+    pass.colorAttachments[0].clearColor = behind
     pass.colorAttachments[0].storeAction = .store
     // Depth is kept: the compositor reprojects with it. Reversed, so 0 is far.
     pass.depthAttachment.texture = drawable.depthTextures[0]

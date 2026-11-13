@@ -26,15 +26,17 @@ public final class CompositorDisplay {
     private let controllers: ControllerTracking
     private let hands: HandJoints
     private let settings: SettingsStore
-    private let pinches = PinchRays()
+    private let inputs: StreamInputs
     private let measured: MeasuredDisplay
     /// When true this display only measures (see `MeasuredDisplay`): it never connects.
     private let measureOnly: Bool
-    private let gaze = GazeFromFoveation()
     private let queue: MTLCommandQueue
     private let renderer: QuadRenderer
 
-    private var profile: DeviceProfile?
+    /// Whether the layer has been running at all.
+    private var hasRun = false
+    /// Whether this display, opened only to measure, has done so.
+    private var hasMeasured = false
     /// Recent display times, to measure the refresh period, which visionOS
     /// changes on its own (45 to 120 Hz).
     private var presentationTimes: [TimeInterval] = []
@@ -43,13 +45,12 @@ public final class CompositorDisplay {
     private var lastOriginFromDevice = matrix_identity_float4x4
 
     private var describedFirstFrame = false
-    private var eyeMidpoint = Vec3(0, 0, 0)
     private var framesShown = 0
     /// The gaze last written to the log, so that it is only written when it moves.
     private var gazeNoted: (Float, Float) = (9, 9)
-    /// Frames of display timing collected before connecting, so the host is
+    /// Frames of display timing collected before measuring, so the host is
     /// told the display's real refresh rate from the start.
-    private static let framesBeforeConnecting = 8
+    private static let framesBeforeMeasuring = 8
     /// For the first seconds of a space visionOS is still working out where
     /// the eyes are behind the lenses, and moves the views by millimeters
     /// (3.7 mm was seen). A stream follows that (`followEyes`); a measurement
@@ -59,9 +60,9 @@ public final class CompositorDisplay {
     private static let settledWithin: Float = 0.0002, settledFrames = 45, longestSettling = 600
     private var settling: (midpoint: SIMD4<Float>, frames: Int, total: Int)?
 
-    public init?(_ layerRenderer: LayerRenderer, connection: Connection, head: HeadTracking,
-          controllers: ControllerTracking, hands: HandJoints, settings: SettingsStore,
-          measured: MeasuredDisplay, measureOnly: Bool = false) {
+    public init?(_ layerRenderer: LayerRenderer, inputs: StreamInputs, measureOnly: Bool = false) {
+        let (connection, head, controllers, hands) = (inputs.connection, inputs.head, inputs.controllers, inputs.hands)
+        let (settings, measured) = (inputs.settings, inputs.measured)
         guard let queue = layerRenderer.device.makeCommandQueue(),
               let renderer = QuadRenderer(device: layerRenderer.device,
                                           colorFormat: layerRenderer.configuration.colorFormat,
@@ -70,6 +71,7 @@ public final class CompositorDisplay {
                                           linearOutput: true)
         else { return nil }
         self.layerRenderer = layerRenderer
+        self.inputs = inputs
         self.connection = connection
         self.head = head
         self.controllers = controllers
@@ -79,7 +81,7 @@ public final class CompositorDisplay {
         self.measureOnly = measureOnly
         renderer.chromaKey = settings.current.chromaKeying(inGame: false)
         // Pinches made at a distance arrive here, with where the eyes looked.
-        layerRenderer.onSpatialEvent = { [pinches] in pinches.handle($0) }
+        layerRenderer.onSpatialEvent = { [pinches = inputs.pinches] in pinches.handle($0) }
         self.queue = queue
         self.renderer = renderer
     }
@@ -105,12 +107,16 @@ public final class CompositorDisplay {
             case .paused:
                 // Crown pressed or headset taken off: let go of the stream,
                 // and ask for a new one when the space is running again.
-                if !measureOnly { connection.stop() }
-                pinches.forgetAll()
-                profile = nil
+                // (Not a layer that has yet to run: its stream was only just asked for.)
+                let interrupted = hasRun && !measureOnly
+                if interrupted { connection.stop() }
+                inputs.pinches.forgetAll()
                 presentationTimes = []
                 layerRenderer.waitUntilRunning()
+                // The space is still open, so the stream is asked for from within it.
+                if interrupted, layerRenderer.state == .running { CompositorDisplay.connect(inputs) }
             default:
+                hasRun = true
                 autoreleasepool { renderFrame() }
             }
         }
@@ -135,23 +141,18 @@ public final class CompositorDisplay {
         return gaps.isEmpty ? nil : gaps[gaps.count / 2]
     }
 
-    /// Describe this display to the host from what the compositor reports,
-    /// and connect.
-    private func connectIfReady(_ drawable: LayerRenderer.Drawable) {
-        guard profile == nil, presentationTimes.count >= CompositorDisplay.framesBeforeConnecting,
+    /// A display opened only to measure: keep what the compositor reports, once it has settled.
+    private func measureIfReady(_ drawable: LayerRenderer.Drawable) {
+        guard measureOnly, !hasMeasured, presentationTimes.count >= CompositorDisplay.framesBeforeMeasuring,
               drawable.views.count == 2, let period = refreshPeriod()
         else { return }
-        let (profile, midpoint, turnedEyes) = measure(drawable, period: period)
-        if measureOnly {
-            guard hasSettled(midpoint) else { return }
-            measured.set(profile: profile, eyeMidpoint: simd_make_float3(midpoint))
-            Log.note(String(format: "display: measured for RealityKit after %d frames: eye midpoint (%.1f, %.1f, %.1f) mm from the device anchor, eyes %.1f mm apart",
-                            settling?.total ?? 0, midpoint.x * 1000, midpoint.y * 1000, midpoint.z * 1000,
-                            (profile.eyesInHead[1].position.x - profile.eyesInHead[0].position.x) * 1000))
-            self.profile = profile
-            return
-        }
-        connect(profile, midpoint: midpoint, turnedEyes: turnedEyes)
+        let (profile, midpoint, _) = measure(drawable, period: period)
+        guard hasSettled(midpoint) else { return }
+        measured.set(profile: profile, eyeMidpoint: simd_make_float3(midpoint))
+        Log.note(String(format: "display: measured after %d frames: eye midpoint (%.1f, %.1f, %.1f) mm from the device anchor, eyes %.1f mm apart",
+                        settling?.total ?? 0, midpoint.x * 1000, midpoint.y * 1000, midpoint.z * 1000,
+                        (profile.eyesInHead[1].position.x - profile.eyesInHead[0].position.x) * 1000))
+        hasMeasured = true
     }
 
     /// Whether the middle of the eyes has stopped moving (see `settledWithin`).
@@ -192,56 +193,34 @@ public final class CompositorDisplay {
         profile.eyesInHead = turnedEyes.map {
             Pose(position: $0.position, right: Vec3(1, 0, 0), up: Vec3(0, 1, 0), forward: Vec3(0, 0, -1))
         }
-        // The person may ask for more or less than the display shows
-        // (the field-of-view setting). The picture is still drawn where the
-        // host rendered it: a wider one runs off the edge of the display, a
-        // narrower one leaves the room showing around it.
         profile.eyeFrusta = (0..<2).map {
             CompositorDisplay.frustum(drawable.computeProjection(viewIndex: $0)).enclosing(turnedAs: turnedEyes[$0])
         }
         return (profile, midpoint, turnedEyes)
     }
 
-    private func connect(_ measuredProfile: DeviceProfile, midpoint: SIMD4<Float>, turnedEyes: [Pose]) {
-        var profile = measuredProfile
-        let chosen = settings.current
-        profile.eyeFrusta = profile.eyeFrusta.map {
-            $0.scaled(horizontal: chosen.fovScaleHorizontal, vertical: chosen.fovScaleVertical)
-        }
-        head.setEyeMidpoint(simd_make_float3(midpoint), atConnect: true)
-        controllers.gripsAsRendered = true
-        eyeMidpoint = Vec3(midpoint.x, midpoint.y, midpoint.z)
-        self.profile = profile
-        for (name, eye) in zip(["left", "right"], turnedEyes) {
-            // How far the eye's display is turned outwards and tilted, in degrees.
-            let outwards = atan2(eye.forward.x, -eye.forward.z) * 180 / .pi
-            let upwards = asin(eye.forward.y) * 180 / .pi
-            Log.note(String(format: "display: %@ eye at (%.1f, %.1f, %.1f) mm from the middle, its display turned %.2f deg to the right, %.2f deg up (the host is told straight ahead)",
-                         name, eye.position.x * 1000, eye.position.y * 1000, eye.position.z * 1000, outwards, upwards))
-        }
+    /// Describe the display to the host as it was last measured, and ask
+    /// for a stream to show in a compositor layer. The layer need not be
+    /// open yet. False if the display has not been measured.
+    @discardableResult
+    public static func connect(_ inputs: StreamInputs) -> Bool {
+        guard let measured = inputs.measured.value, let profile = inputs.profileForHost() else { return false }
+        let chosen = inputs.settings.current
+        let midpoint = measured.eyeMidpoint
+        inputs.head.setEyeMidpoint(midpoint, atConnect: true)
+        inputs.controllers.gripsAsRendered = true
         Log.note(String(format: "display: %.0f Hz, eye midpoint (%.1f, %.1f, %.1f) mm from the device anchor, field of view scaled %.2f across, %.2f up-down",
                      profile.refreshHz, midpoint.x * 1000, midpoint.y * 1000, midpoint.z * 1000,
                      chosen.fovScaleHorizontal, chosen.fovScaleVertical))
-        connection.start(profile: profile, microphone: chosen.microphone,
-                         headProvider: { [head] in head.trackedHead() },
-                         handsProvider: { [controllers, hands, head, settings, pinches] in
-                             // A hand holding a tracked controller is that controller; otherwise it is itself.
-                             let chosen = settings.current
-                             let held = controllers.states(clackSwitching: chosen.clackSwitchesToHands, head: head.latestHead())
-                             let bare = hands.hands()
-                             return Side.allCases.map { side in
-                                 if let controller = held[side.rawValue] { return .controller(controller) }
-                                 guard var hand = bare[side.rawValue] else { return nil }
-                                 // The system's pinches, aimed by the eyes, in place of ours aimed by the arm.
-                                 if chosen.gazePinchRays { hand.systemPinch = pinches.pinch(side) }
-                                 return .hand(hand)
-                             }
-                         },
-                         // The gaze from where the display is sharpest. (Face and
-                         // calibrated gaze need the RealityKit renderer, an experiment.)
-                         gazeProvider: { [gaze] in gaze.current() },
-                         faceProvider: { nil },
-                         onHaptic: { [controllers] in controllers.vibrate($0) })
+        inputs.connection.start(profile: profile, microphone: chosen.microphone,
+                                headProvider: { [head = inputs.head] in head.trackedHead() },
+                                handsProvider: { [inputs] in inputs.handsNow() },
+                                // The gaze from where the display is sharpest. (Face and
+                                // calibrated gaze need the RealityKit renderer, an experiment.)
+                                gazeProvider: { [gaze = inputs.gaze] in gaze.current() },
+                                faceProvider: { nil },
+                                onHaptic: { [controllers = inputs.controllers] in controllers.vibrate($0) })
+        return true
     }
 
     private func renderFrame() {
@@ -259,18 +238,21 @@ public final class CompositorDisplay {
         let displayTime = CompositorDisplay.seconds(first.frameTiming.presentationTime)
         presentationTimes.append(displayTime)
         if presentationTimes.count > 16 { presentationTimes.removeFirst() }
-        followEyes(first)
-        // Kept for the RealityKit renderer, which cannot ask for any of
-        // this: once a second, so it has the display as it is after settling.
-        if !measureOnly, profile != nil, framesShown % 90 == 0, first.views.count == 2, let period = refreshPeriod() {
+        // The stream being shown was asked for with this, before or after this layer opened.
+        let profile = measureOnly ? nil : connection.profile
+        if profile != nil { followEyes(first) }
+        // Kept for the next connection, and for the RealityKit renderer,
+        // which cannot ask for any of this: once a second, so both have the
+        // display as it is after settling.
+        if !measureOnly, framesShown % 90 == 0, first.views.count == 2, let period = refreshPeriod() {
             let now = measure(first, period: period)
             measured.set(profile: now.profile, eyeMidpoint: simd_make_float3(now.midpoint))
         }
         // Reading the rate map costs a few hundred calls; eyes do not need it every frame.
         framesShown += 1
         if framesShown % 6 == 0 {
-            gaze.update(from: first) { CompositorDisplay.frustum(first.computeProjection(viewIndex: $0)) }
-            if let look = gaze.current() {
+            inputs.gaze.update(from: first) { CompositorDisplay.frustum(first.computeProjection(viewIndex: $0)) }
+            if let look = inputs.gaze.current() {
                 let tangents = (look.x / -look.z, look.y / -look.z)
                 if abs(tangents.0 - gazeNoted.0) > 0.1 || abs(tangents.1 - gazeNoted.1) > 0.1 {
                     gazeNoted = tangents
@@ -279,7 +261,7 @@ public final class CompositorDisplay {
                 }
             }
         }
-        connectIfReady(first)
+        measureIfReady(first)
         // The chroma key as it is set right now, so a slider shows its effect as it moves.
         renderer.chromaKey = settings.current.chromaKeying(inGame: connection.session?.sceneApplicationRunning ?? false)
 
@@ -308,7 +290,7 @@ public final class CompositorDisplay {
             // The compositor corrects for head movement between now and
             // display using this anchor; nil is an answer it understands.
             drawable.deviceAnchor = anchor
-            draw(picked?.frame, into: drawable, commands: commands)
+            draw(picked?.frame, profile: profile, into: drawable, commands: commands)
             drawable.encodePresent(commandBuffer: commands)
         }
         commands.commit()
@@ -323,17 +305,22 @@ public final class CompositorDisplay {
     /// together is then rendered correctly; only what they do differently
     /// (converging on something near) is left out.
     private func followEyes(_ drawable: LayerRenderer.Drawable) {
-        guard profile != nil, drawable.views.count == 2 else { return }
+        guard drawable.views.count == 2 else { return }
         let midpoint = (drawable.views[0].transform.columns.3 + drawable.views[1].transform.columns.3) * 0.5
         head.setEyeMidpoint(simd_make_float3(midpoint), atConnect: false)
-        eyeMidpoint = Vec3(midpoint.x, midpoint.y, midpoint.z)
     }
 
-    private func draw(_ frame: DecodedFrame?, into drawable: LayerRenderer.Drawable, commands: MTLCommandBuffer) {
+    private func draw(_ frame: DecodedFrame?, profile: DeviceProfile?, into drawable: LayerRenderer.Drawable,
+                      commands: MTLCommandBuffer) {
         let views = drawable.views
-        // Nothing is drawn behind the picture: where it is not, the room shows.
+        // Behind a picture that is not keyed there is black, not the room:
+        // a picture narrower than the display (the field-of-view setting)
+        // then has a black margin. With keying, or with no picture, nothing
+        // is drawn behind and the room shows.
+        let roomBehind = frame == nil || profile == nil || renderer.chromaKey != nil
         let eyes = drawQuads(into: drawable, commands: commands, renderer: renderer, frame: frame,
-                             originFromDevice: lastOriginFromDevice) { eye, _ in
+                             originFromDevice: lastOriginFromDevice,
+                             behind: MTLClearColor(red: 0, green: 0, blue: 0, alpha: roomBehind ? 0 : 1)) { eye, _ in
             guard let frame, let profile else { return [] }
             return Composition.quads(for: eye, metadata: frame.metadata, profile: profile)
         }

@@ -171,6 +171,10 @@ Choosing a host is also part of this lifecycle:
 - Launching the app from its icon always shows the window, and does not
   connect by itself, even if a host was chosen last time.
 
+On visionOS, there are no APIs to fetch display measurements outside of an immersive space.
+The host has to be told about the displays before starting the stream, so once per run of the 
+app a compositor layer is opened for a moment only to measure eye positions, frusta and refresh rate.
+
 On visionOS, taking the headset off and putting it back on pauses and resumes 
 the immersive space, and the stream comes back by itself; backgrounding the app 
 does not disturb it.
@@ -269,8 +273,8 @@ any new updates rapidly if the entity is enabled/disabled.
   from wherever the eyes are when the frame is shown.
 - Three textures and plane pairs are used in turn and only the newest is enabled, so that a texture 
   and the place of its planes always change in the same RealityKit frame.
-- RealityKit says nothing about the displays, so before the first such session a compositor layer 
-  is opened for a moment only to measure eye positions, frusta and refresh rate (`MeasuredDisplay`).
+- RealityKit says nothing about the displays: it relies on the measurement taken before the
+  first connection (`MeasuredDisplay`, see the lifecycle above).
 - RealityKit does not say when a change will be seen. A display link gives the time of each refresh, 
   and what RealityKit is handed is shown a whole number of refreshes later, enough to cover its drawing 
   time (a running average, about 14 ms): that is the display time the session is told, and so the 
