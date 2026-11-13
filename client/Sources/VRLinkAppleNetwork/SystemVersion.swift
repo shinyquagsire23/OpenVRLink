@@ -22,6 +22,20 @@ public enum SystemVersion {
 
     private static let product = "OpenVRLink"
 
+    /// What kind of device this is, as a host is told when pairing.
+    /// TODO: an Android shell has the real model to give (Build.MODEL).
+    public static var model: String {
+        #if os(visionOS)
+        return "Apple Vision Pro"
+        #elseif os(macOS)
+        return "Mac"
+        #elseif os(tvOS)
+        return "Apple TV"
+        #else
+        return "iPhone"
+        #endif
+    }
+
     /// The client and its bundle's version and build, as in "OpenVRLink
     /// 0.1.0-2"; only "OpenVRLink" where it is not run from an app bundle
     /// (the Mac viewer).

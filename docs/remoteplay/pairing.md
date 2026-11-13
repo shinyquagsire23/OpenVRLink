@@ -138,6 +138,9 @@ All **captured by probe**:
   all confirmed.
 - The host raised its PIN dialog on an `AuthorizationRequest` sent from an
   ephemeral UDP port, with an RSA ticket whose model and serial were empty.
+  (The client now fills them in: the model as "Apple Vision Pro", the serial
+  as 16 hex digits made up once per installation. What the host does with
+  either is not known.)
 - Still open: whether the host reads `encrypted_request` at all, and the
   count and spacing of `InProgress` responses (the probe did not log them).
 

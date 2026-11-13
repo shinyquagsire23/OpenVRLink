@@ -183,7 +183,8 @@ public final class Connection: ObservableObject {
                     args = try Broadcast.requestSession(socket, host: host, identity: identity,
                                                         deviceVersion: DataDirectory.name + " " + SystemVersion.named)
                 } catch BroadcastError.notPaired {
-                    try Broadcast.pair(socket, host: host, identity: identity, deviceName: deviceName) { pin in
+                    try Broadcast.pair(socket, host: host, identity: identity, deviceName: deviceName,
+                                       deviceModel: SystemVersion.model) { pin in
                         show("Enter PIN \(pin) in Steam on \(host.hostname)")
                     }
                     show("Paired; asking \(host.hostname) for a session")

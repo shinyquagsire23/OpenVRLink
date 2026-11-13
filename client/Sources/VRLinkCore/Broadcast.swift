@@ -154,8 +154,10 @@ public enum Broadcast {
     /// Pair with a host (docs/remoteplay/pairing.md). `showPIN` is called once
     /// with a four-digit PIN that the user must type into Steam on the host.
     /// On success, the shared secret is stored in `identity`.
+    /// `deviceName` and `deviceModel` are what the host is told this device
+    /// is called and what kind of device it is, at most 64 characters each.
     public static func pair(_ socket: UDPSocket, host: SteamHost, identity: Identity, deviceName: String,
-                            showPIN: (String) -> Void) throws {
+                            deviceModel: String, showPIN: (String) -> Void) throws {
         let pin = String(format: "%04d", Int.random(in: 1...9999))
         let exchange = SteamCrypto.KeyExchange()
         let requestID = UInt64(UInt32.random(in: 1...UInt32.max))
@@ -171,8 +173,8 @@ public enum Broadcast {
         ticket.bytes(3, unpairedSecret)              // payload
         ticket.varint(5, 0)                          // usage: streaming device
         ticket.string(6, deviceName)
-        ticket.string(7, "")                         // model
-        ticket.string(8, "")                         // serial
+        ticket.string(7, deviceModel)                // model
+        ticket.string(8, identity.serial)            // serial, at most 32 characters
         ticket.varint(9, 0)                          // provisioning id
         guard let encryptedTicket = SteamCrypto.encryptTicket(ticket.bytes),
               let deviceToken = SteamCrypto.encrypt(deviceIDBytes, key: unpairedSecret)

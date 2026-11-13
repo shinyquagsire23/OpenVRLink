@@ -210,7 +210,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                                         deviceVersion: "OpenVRLink " + SystemVersion.named)
             } catch BroadcastError.notPaired {
                 try Broadcast.pair(socket, host: host, identity: identity,
-                                   deviceName: (Host.current().localizedName ?? "Mac") + " (OpenVRLink)") { pin in
+                                   deviceName: (Host.current().localizedName ?? "Mac") + " (OpenVRLink)",
+                                   deviceModel: SystemVersion.model) { pin in
                     setTitle("enter PIN \(pin) in Steam on \(host.hostname)")
                 }
                 setTitle("paired; asking \(host.hostname) for a session")
