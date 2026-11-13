@@ -3,7 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import Foundation
-import VRLinkCore
 
 /// Which system this is running on and which build of the client this
 /// is, for the host to be told.
@@ -21,6 +20,8 @@ public enum SystemVersion {
         #endif
     }
 
+    private static let product = "OpenVRLink"
+
     /// The client and its bundle's version and build, as in "OpenVRLink
     /// 0.1.0-2"; only "OpenVRLink" where it is not run from an app bundle
     /// (the Mac viewer).
@@ -28,8 +29,8 @@ public enum SystemVersion {
         let info = Bundle.main.infoDictionary
         guard let version = info?["CFBundleShortVersionString"] as? String,
               let build = info?["CFBundleVersion"] as? String
-        else { return DataDirectory.name }
-        return DataDirectory.name + " " + version + "-" + build
+        else { return product }
+        return product + " " + version + "-" + build
     }
 
     /// As in "visionOS 27.0.1".
