@@ -73,27 +73,27 @@ struct OpenVRLinkApp: App {
                                 faceCalibration: faceCalibration, persona: persona)
                     .tabItem { Label("Experiments", systemImage: "flask") }
             }
-                // With the scene's `.contentSize` below, a window of one size.
-                .frame(width: EntryView.windowSize.width, height: EntryView.windowSize.height)
-                .onAppear {
-                    // Once for each version of the app: say what is new in it.
-                    guard lastUsedAppVersion != AppVersion.current else { return }
-                    lastUsedAppVersion = AppVersion.current
-                    showChanges = true
-                }
-                .alert("OpenVRLink v" + AppVersion.current, isPresented: $showChanges) {
-                    Button("Dismiss") {}
-                } message: {
-                    Text(AppVersion.changes)
-                }
-                .task {
-                    // Once, however often the window is closed and opened again.
-                    guard !OpenVRLinkApp.trackingStarted else { return }
-                    OpenVRLinkApp.trackingStarted = true
-                    head.start()
-                    controllers.start()
-                    hands.start()
-                }
+            // With the scene's `.contentSize` below, a window of one size.
+            .frame(width: EntryView.windowSize.width, height: EntryView.windowSize.height)
+            .onAppear {
+                // Once for each version of the app: say what is new in it.
+                guard lastUsedAppVersion != AppVersion.current else { return }
+                lastUsedAppVersion = AppVersion.current
+                showChanges = true
+            }
+            .alert("OpenVRLink v" + AppVersion.current, isPresented: $showChanges) {
+                Button("Dismiss") {}
+            } message: {
+                Text(AppVersion.changes)
+            }
+            .task {
+                // Once, however often the window is closed and opened again.
+                guard !OpenVRLinkApp.trackingStarted else { return }
+                OpenVRLinkApp.trackingStarted = true
+                head.start()
+                controllers.start()
+                hands.start()
+            }
         }
         .windowResizability(.contentSize)
 
@@ -170,8 +170,7 @@ enum AppVersion {
     static let changes = """
     What's changed?
 
-    • First test builds of OpenVRLink: streaming from Steam Link for VR on your PC, with controllers, hand \
-    tracking, microphone and chroma-keyed passthrough.
+    • First test build of OpenVRLink!
 
     ___________________________
 

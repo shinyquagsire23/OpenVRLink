@@ -32,6 +32,8 @@ DEPLOYMENT_TARGET = "26.0"
 # low-latency streaming entitlement (OpenVRLink.entitlements). Signing any
 # other id with that entitlement fails, so other ids are signed without it.
 OWN_BUNDLE_ID = "dev.maxthomas.rel.OpenVRLink"
+MARKETING_VERSION = "0.1.0"
+BUILD_NUMBER = "2"
 
 
 def object_id(tag):
@@ -126,7 +128,7 @@ def main():
         "SDKROOT": "xros", "SUPPORTED_PLATFORMS": "xros xrsimulator", "TARGETED_DEVICE_FAMILY": "7",
         "XROS_DEPLOYMENT_TARGET": DEPLOYMENT_TARGET, "SWIFT_VERSION": "5.0",
         "CODE_SIGN_STYLE": "Automatic", "DEVELOPMENT_TEAM": team,
-        "MARKETING_VERSION": "0.1.0", "CURRENT_PROJECT_VERSION": "1",
+        "MARKETING_VERSION": MARKETING_VERSION, "CURRENT_PROJECT_VERSION": BUILD_NUMBER,
         "LD_RUNPATH_SEARCH_PATHS": "$(inherited) @executable_path/Frameworks",
         "ASSETCATALOG_COMPILER_APPICON_NAME": "AppIcon",
     }
