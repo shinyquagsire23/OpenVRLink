@@ -53,6 +53,7 @@ public struct FrameMetadata {
 struct FrameDescriptor {
     let frameID: UInt16
     let txTime: UInt32          // host clock when the frame started sending
+    let hostClockOffset: Int32  // the host's estimate of (its clock - ours), plus the delay to it
     let frameSize: Int
     let hostVersion: UInt32
     /// Which error correction the packets carry; 0x20 is the only one known.
@@ -65,6 +66,7 @@ struct FrameDescriptor {
         let value = element.value
         frameID = element.id
         txTime = value.integer(at: 0x00)
+        hostClockOffset = value.integer(at: 0x04)
         frameSize = Int(value.integer(at: 0x08) as UInt32)
         let declared = Int(value.integer(at: 0x16) as UInt16)
         let metadataSize = declared == 0 ? 0xF0 : declared

@@ -64,19 +64,21 @@ public final class StreamSession {
     /// Microphone audio for the host; a platform's capture feeds it.
     public let microphone = MicrophoneUplink()
     private var clock = ClockOffset()
+    private var statisticsSent = 0
     private let started = Uptime.nanoseconds
     private var sequence: UInt16 = 0
     private var frameCounter: Int32 = 0
     private var frameDisplayTime: Int32 = 0
     private var framePeriod: Double
     private var hostInstance: Bytes?
-    private var applicationRunning = false
+    /// Nil until the host has said; it says again to a client that returns.
+    private var applicationRunning: Bool?
     /// Whether the host says an application has the scene (a game, as
     /// against SteamVR's own grid). It does not say which.
     public var sceneApplicationRunning: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return applicationRunning
+        return applicationRunning ?? false
     }
     /// The last frame to arrive whole: when, on the session clock and on
     /// the wall clock (microseconds since 1970).
@@ -87,6 +89,7 @@ public final class StreamSession {
     /// Each side tells the other, this often, where it can be reached. Seconds.
     static let addressListInterval: TimeInterval = 2
     private var running = true
+    private var sayGoodbye = false
 
     private let lock = NSLock()
     private var head = HeadPose(position: Vec3(0, 1.6, 0)).tracked
@@ -214,10 +217,16 @@ public final class StreamSession {
         thread.start()
     }
 
-    /// Ends the loop; it says goodbye to the host on its way out.
-    public func stop() {
+    /// Ends the loop. `leaving` says the wearer is done: the host is told
+    /// goodbye, and quits SteamVR and whatever runs in it at once. It is
+    /// told the same when it has said that nothing runs in SteamVR, there
+    /// being nothing to lose. Otherwise the host only sees the stream go
+    /// quiet, keeps the application up for a while, and takes this client
+    /// back if it returns (docs/svl-transport/connection-lifecycle.md).
+    public func stop(leaving: Bool = false) {
         lock.lock()
         running = false
+        sayGoodbye = leaving
         lock.unlock()
     }
 
@@ -385,10 +394,17 @@ public final class StreamSession {
         return SVLElement(.frameReport, id: decoded.id, index: lastFrame.id, value: out)
     }
 
-    /// Three of the string->double statistics the host reads; "no loss".
+    /// Three of the string->double statistics the host reads
+    /// (docs/svl-values/svlroot-key-value-channel.md), three to a message
+    /// as the reference client sends them: the round trip to the host and
+    /// back, the recent worst of each packet's delay (the host's graph
+    /// draws its network line from these), and in turn one of "no loss".
     private func statistics() -> SVLElement {
         var out = Bytes()
-        for (key, value) in [("cRXpass", 100.0), ("cRXerr", 0.0), ("cFramePhase", 0.3)] {
+        let steady = [("cRXpass", 100.0), ("cRXerr", 0.0), ("cFramePhase", 0.3)]
+        statisticsSent &+= 1
+        for (key, value) in [("cPingMS", Double(clock.roundTrip) / 1000), ("cPingAMS", Double(clock.peakDelay) / 1000),
+                             steady[statisticsSent % steady.count]] {
             out.append(text: key, fieldSize: 20)
             out.append(double: value)
             out.append(integer: now())
@@ -499,7 +515,7 @@ public final class StreamSession {
                         onLog?(String(format: "the host says its video uses error correction 0x%02x; this client only knows 0x%02x, so lost packets may not be repaired",
                                       descriptor.fecMode, StreamSession.knownFECMode))
                     }
-                    clock.update(peerTime: descriptor.txTime, localTime: now())
+                    clock.update(peerTime: descriptor.txTime, peerOffset: descriptor.hostClockOffset, localTime: now())
                     valuesCompleted(values.receive(descriptor.valueTransportBytes))
                     assembler.accept(descriptor: descriptor, group: Int(element.index), now: now())
                 } else {
@@ -664,7 +680,10 @@ public final class StreamSession {
                 nextReport = nextReport.addingTimeInterval(1)
             }
         }
-        // Send a goodbye message
+        lock.lock()
+        let leaving = sayGoodbye || applicationRunning == false
+        lock.unlock()
+        guard leaving else { return }
         let goodbye = link.pack(sequence: StreamSession.goodbyeSequence, elements: [SVLElement(.goodbye, value: [])])
         for _ in 0..<5 {
             socket.send(goodbye)
@@ -681,7 +700,28 @@ struct ClockOffset {
     private var confidence: Int32 = 0
     var confident: Bool { confidence > 0 }
 
-    mutating func update(peerTime: UInt32, localTime: Int32) {
+    /// The host's own estimate the other way, (peer - local) as it last
+    /// reported it. Each estimate is the clock difference plus one
+    /// direction's delay, so the two add up to the round trip.
+    private var peerOffset: Int32 = 0
+    /// Microseconds to the host and back.
+    var roundTrip: Int32 { confident ? offset &+ peerOffset : 0 }
+    /// How late the worst recent packet was against the best case, plus
+    /// half the round trip, in microseconds; it sinks by `peakDecay` with
+    /// every packet and is never more than `peakLimit`.
+    private(set) var peakDelay: Int32 = 0
+    /// The host sets the decay in a value of its own (0x1c); 1000 is what
+    /// it has sent in every capture.
+    static let peakDecay: Int32 = 1000, peakLimit: Int32 = 100_000
+
+    mutating func update(peerTime: UInt32, peerOffset: Int32, localTime: Int32) {
+        self.peerOffset = peerOffset
+        follow(peerTime: peerTime, localTime: localTime)
+        let delay = (localTime &- (offset &+ Int32(bitPattern: peerTime))) &+ roundTrip / 2
+        peakDelay = min(ClockOffset.peakLimit, max(delay, peakDelay - ClockOffset.peakDecay))
+    }
+
+    private mutating func follow(peerTime: UInt32, localTime: Int32) {
         let difference = localTime &- Int32(bitPattern: peerTime)
         if confidence == 0 {
             offset = difference

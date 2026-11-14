@@ -168,7 +168,8 @@ public final class RealityKitDisplay {
     public static func connect(_ inputs: StreamInputs, persona: PersonaTracking) -> Bool {
         guard let measured = inputs.measured.value, var profile = inputs.profileForHost() else { return false }
         let chosen = inputs.settings.current
-        profile.tracksEyesOrFace = chosen.faceFromCamera
+        // This renderer can send the eyes and the face (`PersonaTracking`).
+        profile.tracksEyesOrFace = true
         inputs.head.setEyeMidpoint(measured.eyeMidpoint, atConnect: true)
         inputs.controllers.gripsAsRendered = false
         persona.camera.setIPD(profile.eyesInHead[1].position.x - profile.eyesInHead[0].position.x)

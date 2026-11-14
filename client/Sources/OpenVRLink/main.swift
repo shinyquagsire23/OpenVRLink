@@ -258,7 +258,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         // Give the session loop time to send its goodbye to the host.
-        session?.stop()
+        session?.stop(leaving: true)
         Thread.sleep(forTimeInterval: 0.6)
     }
 }

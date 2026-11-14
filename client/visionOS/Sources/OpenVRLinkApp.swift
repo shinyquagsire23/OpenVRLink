@@ -20,6 +20,12 @@ struct StreamLayerConfiguration: CompositorLayerConfiguration {
         configuration.depthFormat = .depth32Float
         let foveated = capabilities.supportsFoveation
         configuration.isFoveationEnabled = foveated
+        // Room for drawing at the full quality the displays can show: this
+        // sets how large the drawable's textures may be, not the quality
+        // drawn at (the ALVR visionOS client does the same).
+        if foveated, #available(visionOS 26.0, *) {
+            configuration.maxRenderQuality = .init(1.0)
+        }
         // Both eyes as layers of one texture, which the renderer draws in one pass.
         let layouts = capabilities.supportedLayouts(options: foveated ? [.foveationEnabled] : [])
         configuration.layout = layouts.contains(.layered) ? .layered : .dedicated
@@ -301,10 +307,11 @@ struct EntryView: View {
                 Text(connection.status).font(.title3)
                 Button("Stop") {
                     Task {
-                        // Before the space is open there is only the connection to end.
+                        // The connection first: the space going away also
+                        // stops it, and that way the host is not told goodbye.
                         connection.waitingForPicture = false
+                        connection.stop(leaving: true)
                         if connection.immersed { await dismissImmersiveSpace() }
-                        connection.stop()
                         connection.immersed = false
                     }
                 }

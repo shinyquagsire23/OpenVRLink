@@ -228,9 +228,25 @@ sessions of 12 to 14 s each:
   this teardown datagram. There is no "quit SteamVR now" message for a client
   to send.
 
-The half minute SteamVR stays up after a client leaves is the host's own
-timer, and the client has no message that would shorten it. The same timer
-lets a client that returns within that time rejoin the running session.
+**Captured** again on 2026-11-13, from the host's `vrserver.txt` with a
+host that speaks version 14, and it no longer matches the second point
+above:
+
+- The teardown datagram is acted on at once. The host logs `Client sent
+  SYST_CLIENT_SHUTDOWN`, then `Sending quit event because SteamVR launched
+  for streaming and client has quit.`, and SteamVR and the application
+  running in it are closed within two seconds.
+- A client that only goes quiet gets the timer: `Connection inactive at
+  <seconds>`, then after 30 s (`driver_vrlink.wirelessShutdownTimeout`)
+  either `Sending quit event.` or, while an application has the scene,
+  `Waiting to quit for scene app steam.app.<id>.` In that state the host
+  waited 80 s and 59 s in two sessions before it did send the quit event,
+  and in a third the client came back after 64 s (`Connection active at
+  …`) and carried on in the same SteamVR session.
+
+So the teardown datagram is the "quit SteamVR now" message, and a client
+that may come back (a headset taken off, an app put away) should not send
+it. The OpenVRLink client sends it only when the wearer ends the session.
 
 The host calls its own `PrepareForPossibleShutdown` when it shuts down
 (**captured**, same log): the teardown datagram exists in both directions.

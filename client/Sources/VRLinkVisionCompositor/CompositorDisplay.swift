@@ -188,6 +188,21 @@ public final class CompositorDisplay {
         profile.systemName = SystemVersion.name
         profile.clientVersion = SystemVersion.client
         profile.refreshHz = Float((1 / period).rounded())
+        // How many pixels the host should have applications draw per eye
+        // (`DeviceProfile.eyePixels`): the display's own size. visionOS
+        // has no plain answer: what it gives is the size the picture would
+        // be with the variable-rate map (foveation) undone, which at full
+        // render quality is about 2.25 times the panel each way on the M5
+        // headset (6886 x 5522) and a little over twice on the M2 (6262 x
+        // 5020). Half of that is near the panel on both, and gives SteamVR
+        // a sensible size to call 100%. With no map, the drawable's own size.
+        if let map = drawable.rasterizationRateMaps.first {
+            profile.eyePixels = (map.screenSize.width / 2, map.screenSize.height / 2)
+        } else {
+            let viewport = drawable.views[0].textureMap.viewport
+            profile.eyePixels = (Int(viewport.width), Int(viewport.height))
+        }
+        if let pixels = profile.eyePixels { Log.note("display: asking the host for a render target of \(pixels.width) x \(pixels.height) per eye") }
         let turnedEyes = (0..<2).map { index -> Pose in
             var deviceFromEye = drawable.views[index].transform
             deviceFromEye.columns.3 -= SIMD4(midpoint.x, midpoint.y, midpoint.z, 0)

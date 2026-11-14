@@ -238,8 +238,13 @@ public final class Connection: ObservableObject {
         }
     }
 
-    /// Say goodbye to the host and drop everything that belonged to the stream.
-    public func stop() {
+    /// Drop everything that belonged to the stream. `leaving` is for the
+    /// wearer saying they are done: the host then quits SteamVR and the
+    /// application in it at once; so it does when nothing
+    /// runs in SteamVR. Otherwise (the headset taken off or the app put
+    /// away in the middle of a game) the host keeps the game for a while,
+    /// and a stream asked for again in that time carries on in it.
+    public func stop(leaving: Bool = false) {
         lock.lock()
         let session = current
         current = nil
@@ -249,12 +254,14 @@ public final class Connection: ObservableObject {
         lock.unlock()
         frames.clear()
         guard let session else { return }
-        session.stop()
+        session.stop(leaving: leaving)
         // The session says goodbye to the host over the next half second.
         // If the app is being closed, ask the system for that long.
         #if !os(macOS)
-        ProcessInfo.processInfo.performExpiringActivity(withReason: "telling the host the session is over") { expired in
-            if !expired { Thread.sleep(forTimeInterval: 0.8) }
+        if leaving || !session.sceneApplicationRunning {
+            ProcessInfo.processInfo.performExpiringActivity(withReason: "telling the host the session is over") { expired in
+                if !expired { Thread.sleep(forTimeInterval: 0.8) }
+            }
         }
         #endif
         DispatchQueue.main.async {
