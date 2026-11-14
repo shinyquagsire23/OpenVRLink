@@ -52,6 +52,9 @@ public struct ControllerState {
     /// for the left hand. Includes velocity.
     public var grip: TrackedPose
 
+    /// OpenXR's aim pose in world space, where the platform gives one: where a ray from the controller starts and points.
+    public var aim: Pose?
+
     /// Its battery, where the platform says; nil tells the host nothing about it.
     public var power: PowerState?
 

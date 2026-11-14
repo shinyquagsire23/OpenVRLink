@@ -35,10 +35,31 @@ public enum WiVRn {
         case h264, h265, av1, raw
     }
 
-    /// The devices this client reports; the full list is far longer.
+    /// The devices this client reports and the inputs it sends, by their
+    /// place in WiVRn's list; the full list is far longer. Where a name
+    /// takes a side, the right hand's follows the left's.
     enum Device {
         static let head: UInt8 = 0
+        /// What the host asks to vibrate: a controller, its trigger, its thumb rest.
+        static let haptics: [UInt8: Side] = [1: .left, 2: .right, 3: .left, 4: .right, 5: .left, 6: .right]
+        static func grip(_ side: Side) -> UInt8 { side == .left ? 11 : 14 }
+        static func aim(_ side: Side) -> UInt8 { side == .left ? 12 : 15 }
+        /// A bare hand: between thumb and index tip, and the index tip.
+        static func pinchPose(_ side: Side) -> UInt8 { side == .left ? 45 : 81 }
+        static func poke(_ side: Side) -> UInt8 { side == .left ? 48 : 84 }
+        /// In the host's list of what to locate, a hand's joints.
+        static func hand(_ side: Side) -> UInt8 { side == .left ? 90 : 91 }
     }
+
+    /// What a hand holds, as the host is told with every pose
+    /// (`interaction_profile`): nothing, the hand itself
+    /// (XR_EXT_hand_interaction), or a Touch controller.
+    enum InteractionProfile {
+        static let none: UInt8 = 0, hand: UInt8 = 2, touch: UInt8 = 17
+    }
+
+    /// Pose flags: orientation and position valid and tracked, with no velocities.
+    static let poseTrackedStill: UInt8 = 0x33
 
     /// Pose flags: orientation and position valid, both velocities valid, both tracked.
     static let poseFullyTracked: UInt8 = 0x3F
@@ -50,6 +71,7 @@ public enum WiVRn {
     /// Which packet, from the headset.
     enum FromHeadset: UInt8 {
         case cryptoHandshake = 0, headsetInfo = 3, feedback = 5, audio = 6, handshake = 7, tracking = 8
+        case handTracking = 10, inputs = 15, battery = 17
         case timesyncResponse = 16, refreshRateChanged = 19, sessionStateChanged = 20
     }
 
@@ -65,6 +87,29 @@ public enum WiVRn {
 struct WiVRnView {
     var pose: Pose
     var frustum: Frustum
+}
+
+/// One tracked thing in a tracking packet. Velocities are along the world's axes.
+struct WiVRnDevicePose {
+    var device: UInt8
+    var pose: Pose
+    var linearVelocity = Vec3(0, 0, 0), angularVelocity = Vec3(0, 0, 0)
+    var flags = WiVRn.poseTrackedStill
+
+    /// Something whose velocities are known.
+    init(_ device: UInt8, _ tracked: TrackedPose) {
+        self.device = device
+        pose = tracked.pose
+        linearVelocity = tracked.linearVelocity
+        angularVelocity = tracked.worldAngularVelocity
+        flags = WiVRn.poseFullyTracked
+    }
+
+    /// Something only located.
+    init(_ device: UInt8, _ pose: Pose) {
+        self.device = device
+        self.pose = pose
+    }
 }
 
 /// How the host squeezed one eye's picture along each axis: how many
@@ -204,6 +249,8 @@ struct WiVRnHeadsetInfo {
     /// One eye: what applications render, and what is encoded and sent.
     var renderPixels, streamPixels: (width: Int, height: Int)
     var refreshRates: [Float]
+    /// The rate the stream should run at; one of `refreshRates`.
+    var preferredRate: Float
     var bitsPerSecond: UInt32
     var frusta: [Frustum]
     var codecs: [WiVRn.Codec]
@@ -222,7 +269,7 @@ struct WiVRnHeadsetInfo {
         // Settings that can be changed while streaming: the rate wanted,
         // the least rate accepted, frames per refresh (as a divider), the
         // bitrate, a gamepad mirrored to the host (no), body trackers (none).
-        out.append(float: refreshRates.first ?? 0)
+        out.append(float: preferredRate)
         out.append(float: refreshRates.min() ?? 0)
         out.append(integer: UInt32(1))
         out.append(integer: bitsPerSecond)
@@ -234,8 +281,9 @@ struct WiVRnHeadsetInfo {
         out.append(integer: WiVRnHeadsetInfo.speakerRate)
         out.append(0)
         for frustum in frusta { out.append(frustum: frustum) }
-        // Hand tracking, eye gaze, palm pose, user presence, passthrough: none.
-        out.append(zeros: 5)
+        // Hand tracking: yes. Eye gaze, palm pose, user presence, passthrough: none.
+        out.append(1)
+        out.append(zeros: 4)
         // Face and body tracking: none; no other trackers.
         out.append(zeros: 2)
         out.append(integer: UInt32(0))
@@ -317,12 +365,14 @@ enum WiVRnPacket {
         return out
     }
 
-    /// Where the head is expected to be at `time`, worked out at `produced`;
-    /// with it, each eye's place on the head and its frustum. Positions are
-    /// in world space, velocities along the world's axes.
-    static func tracking(produced: Int64, time: Int64, head: TrackedPose, views: [WiVRnView]) -> Bytes {
+    /// Where the head and whatever the hands hold are expected to be at
+    /// `time`, worked out at `produced`; with it, each eye's place on the
+    /// head and its frustum. `holding` is an `InteractionProfile` for each hand.
+    static func tracking(produced: Int64, time: Int64, views: [WiVRnView], holding: [UInt8],
+                         poses: [WiVRnDevicePose]) -> Bytes {
         var out: Bytes = [WiVRn.FromHeadset.tracking.rawValue]
-        out.append(zeros: 3)                        // what the hands and a gamepad hold: nothing
+        out.append(contentsOf: holding)
+        out.append(WiVRn.InteractionProfile.none)   // no gamepad
         out.append(integer: produced)
         out.append(integer: time)
         out.append(integer: WiVRn.viewFullyTracked)
@@ -331,13 +381,80 @@ enum WiVRnPacket {
             out.append(pose: view.pose)
             out.append(frustum: view.frustum)
         }
-        out.append(size: 1)
-        out.append(pose: head.pose)
-        out.append(vector: head.linearVelocity)
-        out.append(vector: head.worldAngularVelocity)
-        out.append(WiVRn.Device.head)
-        out.append(WiVRn.poseFullyTracked)
+        out.append(size: poses.count)
+        for pose in poses {
+            out.append(pose: pose.pose)
+            out.append(vector: pose.linearVelocity)
+            out.append(vector: pose.angularVelocity)
+            out.append(pose.device)
+            out.append(pose.flags)
+        }
         out.append(0)                               // face tracking: none
+        return out
+    }
+
+    /// One hand's 26 joints in OpenXR's order, in world space, or nil for
+    /// a hand that is not tracked. A joint is its position, its rotation
+    /// packed into 32 bits, velocities (not given), its radius in tenths
+    /// of a millimeter, and pose flags.
+    static func handTracking(produced: Int64, time: Int64, side: Side, joints: [Pose]?) -> Bytes {
+        var out: Bytes = [WiVRn.FromHeadset.handTracking.rawValue]
+        out.append(integer: produced)
+        out.append(integer: time)
+        out.append(UInt8(side.rawValue))
+        guard let joints else {
+            out.append(0)
+            return out
+        }
+        out.append(1)
+        for joint in joints {
+            out.append(vector: joint.position)
+            out.append(integer: packedRotation(joint.quaternion))
+            out.append(zeros: 24)
+            out.append(integer: jointRadius)
+            out.append(WiVRn.poseTrackedStill)
+        }
+        return out
+    }
+
+    /// No platform here says how thick a finger is: 8 mm, in tenths of a millimeter.
+    static let jointRadius: UInt16 = 80
+
+    /// A unit quaternion (w, x, y, z) in 32 bits: two bits say which of
+    /// x, y, z, w is largest, and the other three follow in that order at
+    /// ten bits each, signed so that the largest is positive.
+    static func packedRotation(_ q: [Float]) -> UInt32 {
+        let parts = [q[1], q[2], q[3], q[0]]                    // x, y, z, w
+        var largest = 3
+        for index in 0..<3 where abs(parts[index]) > abs(parts[largest]) { largest = index }
+        let scale = 511 * Float(2).squareRoot() * (parts[largest] < 0 ? -1 : 1)
+        var out = UInt32(largest) << 30
+        var shift: UInt32 = 20
+        for index in 0..<4 where index != largest {
+            out |= UInt32(max(0, min(1023, parts[index] * scale + 512.5))) << shift
+            shift = shift &- 10
+        }
+        return out
+    }
+
+    /// Buttons, triggers and sticks: each value with the time it last changed.
+    static func inputs(_ values: [(id: UInt8, value: Float, changed: Int64)]) -> Bytes {
+        var out: Bytes = [WiVRn.FromHeadset.inputs.rawValue]
+        out.append(size: values.count)
+        for input in values {
+            out.append(input.id)
+            out.append(float: input.value)
+            out.append(integer: input.changed)
+        }
+        return out
+    }
+
+    /// The headset's battery: 0 empty ... 1 full.
+    static func battery(_ power: PowerState) -> Bytes {
+        var out: Bytes = [WiVRn.FromHeadset.battery.rawValue]
+        out.append(float: power.level)
+        out.append(1)                               // there is a battery
+        out.append(power.charging ? 1 : 0)
         return out
     }
 

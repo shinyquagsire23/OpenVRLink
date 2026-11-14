@@ -109,6 +109,13 @@ public final class Connection: ObservableObject {
         #else
         deviceName = (Host.current().localizedName ?? "Mac") + " (" + DataDirectory.name + ")"
         #endif
+        #if canImport(UIKit)
+        // The system ends the search for announced hosts while the app is put away.
+        NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: nil) { [weak self] _ in
+            self?.wivrnBrowser.restart()
+        }
+        #endif
+        decoder.onFailure = { [weak self] frameID, picture in self?.session?.frameNotDecoded(frameID, picture: picture) }
         decoder.onImage = { [weak self] frame in
             guard let self else { return }
             for picture in frame.images.indices { session?.frameDecoded(frame.frameID, picture: picture) }
@@ -216,6 +223,8 @@ public final class Connection: ObservableObject {
                 session.onRefreshRateRequested = { hz in DisplayRate.shared.ask(for: hz) }
                 decoder.onFormat = { DisplayRate.shared.videoFormat($0) }
                 #endif
+                // Nothing of an earlier stream's decoding is carried into this one.
+                decoder.reset()
                 session.onFrame = { [decoder] frame in decoder.decode(frame) }
                 session.start()
                 lock.lock()
@@ -337,5 +346,7 @@ public final class Connection: ObservableObject {
             self.audio = nil
         }
         show("Not connected")
+        // A WiVRn host is not announced while it has a headset: look afresh now that it has none.
+        wivrnBrowser.restart()
     }
 }

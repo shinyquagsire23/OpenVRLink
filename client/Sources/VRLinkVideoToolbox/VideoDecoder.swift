@@ -36,7 +36,22 @@ public final class VideoDecoder {
     /// frame's first picture becomes known and each time it changes.
     public var onFormat: ((CMVideoFormatDescription) -> Void)?
 
+    /// Called when a picture could not be decoded, with its frame and
+    /// which picture: the session can ask the host to start afresh.
+    public var onFailure: ((UInt16, Int) -> Void)?
+
     public init() {}
+
+    /// Forget everything about the stream decoded so far. A new stream
+    /// begins with a keyframe and gets decoders of its own: the system
+    /// may have ended the old ones while the app was put away, and one
+    /// ended that way takes frames and gives nothing back.
+    public func reset() {
+        decoders = []
+        lock.lock()
+        waiting = []
+        lock.unlock()
+    }
 
     private var decoders: [PictureDecoder] = []
     private let lock = NSLock()
@@ -53,6 +68,7 @@ public final class VideoDecoder {
             decoder.onImage = { [weak self] frameID, image, layout in
                 self?.decoded(frameID, picture: picture, image, layout)
             }
+            decoder.onFailure = { [weak self] frameID in self?.onFailure?(frameID, picture) }
             if picture == 0 { decoder.onFormat = { [weak self] in self?.onFormat?($0) } }
             decoders.append(decoder)
         }
@@ -85,6 +101,7 @@ public final class VideoDecoder {
 /// One picture's decoder.
 final class PictureDecoder {
     var onImage: ((UInt16, CVPixelBuffer, FrameLayout) -> Void)?
+    var onFailure: ((UInt16) -> Void)?
     /// Called, on the thread that calls `decode`, when the stream's
     /// format becomes known and each time it changes.
     var onFormat: ((CMVideoFormatDescription) -> Void)?
@@ -292,7 +309,7 @@ final class PictureDecoder {
             sampleSizeArray: &size, sampleBufferOut: &sampleBuffer) == noErr, let sampleBuffer
         else { return }
 
-        VTDecompressionSessionDecodeFrame(
+        let accepted = VTDecompressionSessionDecodeFrame(
             session, sampleBuffer: sampleBuffer, flags: [._EnableAsynchronousDecompression],
             infoFlagsOut: nil
         ) { [weak self] status, _, image, _, _ in
@@ -300,7 +317,18 @@ final class PictureDecoder {
                 self?.onImage?(frame.frameID, image, frame.layout)
             } else {
                 self?.noteFailure(status)
+                self?.onFailure?(frame.frameID)
             }
+        }
+        if accepted != noErr {
+            // The session would not take the frame at all (the system ends
+            // sessions when the app is put away): no answer will come for
+            // it. Drop the session; the next keyframe makes another.
+            Log.note("decoder: the decompression session refused a frame (\(accepted)); starting another at the next keyframe")
+            VTDecompressionSessionInvalidate(session)
+            self.session = nil
+            parameterSets = [:]
+            onFailure?(frame.frameID)
         }
     }
 }

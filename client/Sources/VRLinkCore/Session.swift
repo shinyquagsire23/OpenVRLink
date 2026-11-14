@@ -273,6 +273,10 @@ public final class StreamSession: StreamingSession {
 
     public func frameDecoded(_ frameID: UInt16, picture: Int) { frameDecoded(frameID) }
 
+    /// Nothing is asked of the host here yet: a Steam host sends new
+    /// parameter sets often, and a decoder starts afresh at each.
+    public func frameNotDecoded(_ frameID: UInt16, picture: Int) {}
+
     public func frameShown(_ frameID: UInt16, at uptimeNanoseconds: UInt64) {
         frameDisplayed(frameID, displayTime: sessionTime(uptimeNanoseconds))
     }

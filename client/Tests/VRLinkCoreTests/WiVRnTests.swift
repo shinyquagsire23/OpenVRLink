@@ -55,16 +55,63 @@ final class WiVRnTests: XCTestCase {
     /// Sizes worked out from the fields of WiVRn 26.9's packets, laid end to end.
     func testPacketsAreAsLongAsTheirFields() {
         let view = WiVRnView(pose: Pose(position: Vec3(0, 0, 0), quaternion: [1, 0, 0, 0]), frustum: .symmetric(halfAngleDegrees: 45))
-        let tracking = WiVRnPacket.tracking(produced: 1, time: 2, head: TrackedPose(pose: view.pose), views: [view, view])
+        let tracking = WiVRnPacket.tracking(produced: 1, time: 2, views: [view, view], holding: [0, 0],
+                                            poses: [WiVRnDevicePose(WiVRn.Device.head, TrackedPose(pose: view.pose))])
         // kind, 3 profiles, 2 times, view flags, state flags, 2 views of 44, a count, one pose of 54, no face
         XCTAssertEqual(tracking.count, 1 + 3 + 16 + 8 + 1 + 88 + 2 + 54 + 1)
         // kind, frame, stream, ten times, a count
         XCTAssertEqual(WiVRnFeedback(frame: 1, stream: 0).packet.count, 1 + 8 + 1 + 80 + 1)
-        let info = WiVRnHeadsetInfo(renderPixels: (2048, 2048), streamPixels: (1536, 1536), refreshRates: [90, 120],
+        let info = WiVRnHeadsetInfo(renderPixels: (2048, 2048), streamPixels: (1536, 1536), refreshRates: [90, 120], preferredRate: 90,
                                     bitsPerSecond: 1, frusta: [view.frustum, view.frustum], codecs: [.h265], systemName: "abc")
         // kind, 4 sizes, 2 rates, settings (21), speaker (6), no microphone,
         // 2 frusta, 7 flags, trackers, 1 codec, no depth, name, language, country, variant
         XCTAssertEqual(info.packet.count, 1 + 8 + 10 + 21 + 6 + 1 + 32 + 7 + 4 + 6 + 1 + 5 + 4 + 4 + 2)
+    }
+
+    func testHandAndInputPacketsAreAsLongAsTheirFields() {
+        let joints = TrackedHand.flat(wrist: HeadPose(position: Vec3(0, 1, 0)).pose, side: .left).joints
+        // kind, 2 times, which hand, present, 26 joints of 43
+        XCTAssertEqual(WiVRnPacket.handTracking(produced: 1, time: 2, side: .left, joints: joints).count, 1 + 16 + 1 + 1 + 26 * 43)
+        XCTAssertEqual(WiVRnPacket.handTracking(produced: 1, time: 2, side: .right, joints: nil).count, 1 + 16 + 1 + 1)
+        // kind, a count, 2 inputs of 13
+        XCTAssertEqual(WiVRnPacket.inputs([(17, 1, 5), (26, 0.5, 6)]).count, 1 + 2 + 26)
+        XCTAssertEqual(WiVRnPacket.battery(PowerState(level: 0.5, charging: true)).count, 1 + 4 + 2)
+    }
+
+    /// WiVRn's own unpacking, from its `packed_quaternion.h`, applied to what is packed here.
+    func testAPackedRotationUnpacksToItself() {
+        func unpack(_ value: UInt32) -> [Float] {
+            let scale = 1 / (511 * Float(2).squareRoot())
+            let q = [20, 10, 0].map { Float(Int((value >> UInt32($0)) & 0x3FF) - 512) * scale }
+            let largest = (1 - q[0] * q[0] - q[1] * q[1] - q[2] * q[2]).squareRoot()
+            var xyzw = q
+            xyzw.insert(largest, at: Int(value >> 30))
+            return [xyzw[3], xyzw[0], xyzw[1], xyzw[2]]                 // w first, as this client keeps them
+        }
+        for (yaw, pitch) in [(Float(0), Float(0)), (0.7, -0.3), (2.9, 0.4), (-1.6, 1.2), (3.1, -1.4)] {
+            let q = HeadPose(position: Vec3(0, 0, 0), yaw: yaw, pitch: pitch).pose.quaternion
+            let back = unpack(WiVRnPacket.packedRotation(q))
+            // A rotation and its negative are the same turn.
+            let sign: Float = zip(q, back).reduce(0) { $0 + $1.0 * $1.1 } < 0 ? -1 : 1
+            for (a, b) in zip(q, back) { XCTAssertEqual(a, b * sign, accuracy: 0.003) }
+        }
+    }
+
+    func testAControllerIsATouchControllerOnTheRightInputs() {
+        var state = ControllerState(grip: TrackedPose(pose: HeadPose(position: Vec3(0, 1, 0)).pose))
+        state.trigger = 0.5
+        state.lowerButton = true
+        state.menuButton = true
+        let left = Dictionary(uniqueKeysWithValues: state.wivrnInputs(.left).map { ($0.id, $0.value) })
+        XCTAssertEqual(left[17], 1)             // X click
+        XCTAssertEqual(left[21], 1)             // menu click
+        XCTAssertEqual(left[26], 0.5)           // left trigger value
+        XCTAssertEqual(left[32], 0)             // left thumbstick x
+        let right = Dictionary(uniqueKeysWithValues: state.wivrnInputs(.right).map { ($0.id, $0.value) })
+        XCTAssertEqual(right[53], 1)            // A click
+        XCTAssertEqual(right[62], 0.5)          // right trigger value
+        XCTAssertNil(right[21])
+        XCTAssertEqual(right[72], 0)            // right thumb rest touch
     }
 
     func testLongListsHaveATwoPartLength() {

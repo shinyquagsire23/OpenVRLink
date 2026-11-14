@@ -43,6 +43,9 @@ public protocol StreamingSession: AnyObject {
 
     /// The decoder has produced one picture of this frame.
     func frameDecoded(_ frameID: UInt16, picture: Int)
+    /// The decoder could not decode one picture of this frame, and will
+    /// show nothing until the host sends a frame that depends on no other.
+    func frameNotDecoded(_ frameID: UInt16, picture: Int)
     /// This frame has been handed to the display and is expected on screen at the time given.
     func frameShown(_ frameID: UInt16, at uptimeNanoseconds: UInt64)
     /// When the display's next refresh will be seen, and how far apart refreshes are, in seconds.

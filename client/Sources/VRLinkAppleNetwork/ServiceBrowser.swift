@@ -8,6 +8,11 @@ import dnssd
 /// Finds services announced on the local network by Bonjour (mDNS), and
 /// where each is to be reached. A WiVRn host announces itself this way.
 ///
+/// The system ends a search when it suspends the app (taking the headset
+/// off, say) and says so only if asked again, so a search that reports an
+/// error starts over by itself, and `restart` is there for the moments
+/// the app comes back.
+///
 /// The system's own resolver is asked, so nothing is sent to a service to
 /// find out its address. On Apple's platforms other than macOS the app
 /// must list the service type under `NSBonjourServices` in its Info.plist.
@@ -39,20 +44,62 @@ public final class ServiceBrowser {
     /// known each time one comes or goes.
     public func start(onChange: @escaping ([Service]) -> Void) {
         queue.async { [self] in
-            guard browse == nil else { return }
             self.onChange = onChange
-            let context = Unmanaged.passUnretained(self).toOpaque()
-            let callback: DNSServiceBrowseReply = { _, flags, interface, error, name, type, domain, context in
-                guard error == kDNSServiceErr_NoError, let name, let type, let domain, let context else { return }
-                let browser = Unmanaged<ServiceBrowser>.fromOpaque(context).takeUnretainedValue()
-                let added = flags & DNSServiceFlags(kDNSServiceFlagsAdd) != 0
-                browser.changed(String(cString: name), type: String(cString: type), domain: String(cString: domain),
-                                interface: interface, added: added)
-            }
-            guard DNSServiceBrowse(&browse, 0, 0, type, nil, callback, context) == kDNSServiceErr_NoError, let browse
-            else { return }
-            DNSServiceSetDispatchQueue(browse, queue)
+            if browse == nil { search() }
         }
+    }
+
+    /// Forget what was found and search again.
+    public func restart() {
+        queue.async { [self] in
+            guard onChange != nil else { return }
+            stop()
+            search()
+        }
+    }
+
+    private func stop() {
+        resolving.values.forEach(DNSServiceRefDeallocate)
+        resolving = [:]
+        if let browse { DNSServiceRefDeallocate(browse) }
+        browse = nil
+        if !found.isEmpty {
+            found = [:]
+            publish()
+        }
+    }
+
+    /// The search died: begin another, after a moment in case it dies at once again.
+    private func failed() {
+        guard browse != nil else { return }
+        stop()
+        queue.asyncAfter(deadline: .now() + 1) { [self] in
+            if browse == nil { search() }
+        }
+    }
+
+    private func search() {
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        let callback: DNSServiceBrowseReply = { _, flags, interface, error, name, type, domain, context in
+            guard let context else { return }
+            let browser = Unmanaged<ServiceBrowser>.fromOpaque(context).takeUnretainedValue()
+            guard error == kDNSServiceErr_NoError, let name, let type, let domain else {
+                browser.failed()
+                return
+            }
+            let added = flags & DNSServiceFlags(kDNSServiceFlagsAdd) != 0
+            browser.changed(String(cString: name), type: String(cString: type), domain: String(cString: domain),
+                            interface: interface, added: added)
+        }
+        guard DNSServiceBrowse(&browse, 0, 0, type, nil, callback, context) == kDNSServiceErr_NoError, let browse
+        else {
+            browse = nil
+            queue.asyncAfter(deadline: .now() + 1) { [self] in
+                if self.browse == nil, onChange != nil { search() }
+            }
+            return
+        }
+        DNSServiceSetDispatchQueue(browse, queue)
     }
 
     private func changed(_ name: String, type: String, domain: String, interface: UInt32, added: Bool) {
@@ -64,8 +111,12 @@ public final class ServiceBrowser {
         guard resolving[name] == nil else { return }
         let context = Unmanaged.passUnretained(self).toOpaque()
         let callback: DNSServiceResolveReply = { _, _, _, error, fullName, host, port, _, _, context in
-            guard error == kDNSServiceErr_NoError, let fullName, let host, let context else { return }
+            guard let context else { return }
             let browser = Unmanaged<ServiceBrowser>.fromOpaque(context).takeUnretainedValue()
+            guard error == kDNSServiceErr_NoError, let fullName, let host else {
+                browser.failed()
+                return
+            }
             // The port comes in network byte order.
             browser.resolved(String(cString: fullName), host: String(cString: host), port: UInt16(bigEndian: port))
         }

@@ -212,6 +212,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let session = try WiVRnSession.connect(host: address, profile: profile,
                                                    name: (Host.current().localizedName ?? "Mac") + " (OpenVRLink)")
             session.onLog = { Log.note($0) }
+            session.handsProvider = { [controllers = view.controllers] in controllers.get() }
             session.onFrame = { [decoder] frame in decoder.decode(frame) }
             session.start()
             DispatchQueue.main.async {

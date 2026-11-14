@@ -192,6 +192,9 @@ public final class ControllerTracking {
             grip.linearVelocity = pose.right * v.x + pose.up * v.y + pose.forward * -v.z
             grip.angularVelocity = Vec3(anchor.angularVelocity.x, anchor.angularVelocity.y, anchor.angularVelocity.z)
             var state = ControllerState(grip: grip)
+            // Where a ray from the controller starts and points, for hosts that take OpenXR's aim pose.
+            state.aim = HeadTracking.pose(anchor.coordinateSpace(for: .aim, correction: asRendered ? .rendered : .none)
+                .ancestorFromSpaceTransformFloat().matrix)
             guard let gamepad = gamepads[side] else { return state }
             if let battery = gamepad.battery, battery.batteryState != .unknown {
                 state.power = PowerState(level: battery.batteryLevel,

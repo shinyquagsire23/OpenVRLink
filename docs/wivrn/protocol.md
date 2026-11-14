@@ -10,8 +10,8 @@ description of what goes over the wire and an implementation written from it
 (`client/Sources/VRLinkCore/WiVRn/`).
 
 Not done yet: encryption and pairing (the host must be started with
-`--no-encrypt`), finding hosts, controllers, hands, the microphone, face and eye
-tracking, the transparency stream, the host's list of applications.
+`--no-encrypt`), the microphone, face and eye tracking, the transparency
+stream, the host's list of applications.
 
 ## One release, one protocol
 
@@ -149,6 +149,57 @@ therefore change while streaming.
 This client sends the head's last known pose carried forward by its velocities
 (`TrackedPose.predicted`). A platform that can be asked for the pose at a time
 should be asked instead.
+
+### What the hands hold (**source**; poses **measured**, inputs and haptics not yet seen to act)
+
+Every tracking packet says what each hand holds (`interaction_profile`: 0
+nothing, 2 a bare hand as OpenXR's hand-interaction device, 17 a Touch
+controller, and two dozen other controllers), and carries poses for it by
+device number:
+
+| | left | right |
+|---|---|---|
+| grip | 11 | 14 |
+| aim | 12 | 15 |
+| pinch pose (bare hand) | 45 | 81 |
+| poke pose (bare hand) | 48 | 84 |
+
+With a pretend Touch controller in one hand and a pretend bare hand in the
+other, hello_xr drew its cube at each grip, and the host's list of what to
+locate grew by six poses (**measured**).
+
+Buttons, triggers and sticks go in `inputs`: a list of input number, value
+and the time the value last changed. This client sends every input with every
+tracking packet, so one lost is made good by the next. The numbers used are
+in `WiVRnInput.swift`; the right hand's follow the left's in the same order.
+For a bare hand the inputs are pinch, aim-and-pinch and grasp, each a value
+and a "ready".
+
+A hand's 26 joints go in `hand_tracking`, once a frame, for the hands the
+host's list asks for (devices 90 and 91): position, rotation packed into 32
+bits (two bits name the largest of x, y, z, w; the other three follow at ten
+bits each), velocities, a radius, flags.
+
+The host asks for vibration with `haptics`: a device (1 and 2 the
+controllers, 3 to 6 their triggers and thumb rests), a duration in
+nanoseconds, a frequency, an amplitude. The headset's battery goes in
+`battery`.
+
+### Coming back to a session
+
+The host keeps a session while an application is attached to it, and takes a
+headset back into it only if the headset describes itself exactly as before:
+otherwise it answers "Headset incompatible with session: headset features
+changed" and closes (**measured**, on reconnecting with hand tracking newly
+declared). The application has to be started again.
+
+### The rate asked for
+
+The headset names the rate it wants in `headset_info_packet`, and the host
+streams at it until told the display runs at another (`refresh_rate_changed`).
+A WiVRn host does not ask for rates itself. This client asks for the lowest
+rate the display offers, and asks the display for the same: the encoder's
+budget (above) then buys the most pixels a frame.
 
 ## Clock
 
