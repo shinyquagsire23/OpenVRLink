@@ -22,6 +22,9 @@ public struct DecodedFrame {
 
 public final class VideoDecoder {
     public var onImage: ((DecodedFrame) -> Void)?
+    /// Called, on the thread that calls `decode`, when the stream's
+    /// format becomes known and each time it changes.
+    public var onFormat: ((CMVideoFormatDescription) -> Void)?
 
     public init() {}
 
@@ -85,6 +88,7 @@ public final class VideoDecoder {
     private func parameterSetsChanged() {
         guard let newFormat = makeFormat() else { return }
         format = newFormat
+        onFormat?(newFormat)
         if let session, VTDecompressionSessionCanAcceptFormatDescription(session, formatDescription: newFormat) {
             return
         }

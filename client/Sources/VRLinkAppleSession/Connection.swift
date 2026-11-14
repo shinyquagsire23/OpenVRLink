@@ -202,6 +202,10 @@ public final class Connection: ObservableObject {
                 session.gazeProvider = gazeProvider
                 session.faceProvider = faceProvider
                 session.onHaptic = onHaptic
+                #if os(visionOS)
+                session.onRefreshRateRequested = { hz in DisplayRate.shared.ask(for: hz) }
+                decoder.onFormat = { DisplayRate.shared.videoFormat($0) }
+                #endif
                 session.onFrame = { [decoder] frame in decoder.decode(frame) }
                 session.start()
                 lock.lock()

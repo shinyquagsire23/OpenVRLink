@@ -43,10 +43,13 @@ enum EyesAndFace {
         out.append(gaze == nil ? 0 : 1)                  // gaze valid
         out.append(face == nil ? 0 : UInt8(FaceExpressions.weightCount))
         out.append(zeros: 2)
+        // The two confidences are there, as zeros, even with no face.
+        out.append(float: face?.lowerFaceConfidence ?? 0)
+        out.append(float: face?.upperFaceConfidence ?? 0)
         if let face {
-            out.append(float: face.lowerFaceConfidence)
-            out.append(float: face.upperFaceConfidence)
             for weight in face.weights { out.append(float: weight) }
+            // Steam Link 2.0.25 declares the message eight bytes longer than the weights reach.
+            out.append(zeros: 8)
         }
         return SVLElement(.eyesAndFace, value: out)
     }

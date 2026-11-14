@@ -34,6 +34,12 @@ public final class StreamInputs {
         self.measured = measured
     }
 
+    /// The rates an Apple Vision Pro's displays run at, in Hz (120 only on
+    /// the M5 model). An app cannot find out which its headset has, so the
+    /// host is offered them all; a rate the display will not go to is
+    /// withdrawn by the session when it is tried.
+    static let displayRates: [Float] = [90, 96, 100, 120]
+
     /// The display as last measured, its frusta scaled as the person
     /// chose (the field-of-view setting): more or less than the display
     /// shows. The picture is still drawn where the host rendered it: a wider
@@ -42,6 +48,7 @@ public final class StreamInputs {
         guard var profile = measured.value?.profile else { return nil }
         let chosen = settings.current
         profile.senseControllerModels = chosen.senseControllerModels
+        profile.otherRefreshRates = StreamInputs.displayRates
         profile.eyeFrusta = profile.eyeFrusta.map {
             $0.scaled(horizontal: chosen.fovScaleHorizontal, vertical: chosen.fovScaleVertical)
         }

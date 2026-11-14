@@ -18,6 +18,11 @@ public struct DeviceProfile {
         Pose(position: Vec3(meters, 0, 0), right: Vec3(1, 0, 0), up: Vec3(0, 1, 0), forward: Vec3(0, 0, -1))
     }
     public var refreshHz: Float = 90
+    /// Other rates the display can be asked to refresh at, where a
+    /// platform has a way to ask (`StreamSession.onRefreshRateRequested`).
+    /// The host picks from these and `refreshHz` the rate nearest the one
+    /// it wants. Empty where the display's rate is not the client's to choose.
+    public var otherRefreshRates: [Float] = []
     /// Each eye's frustum, left then right
     public var eyeFrusta = [Frustum.symmetric(halfAngleDegrees: 45), Frustum.symmetric(halfAngleDegrees: 45)]
 
@@ -25,7 +30,7 @@ public struct DeviceProfile {
 
     enum ValueID {
         static let clientInstance: UInt8 = 0x01, hostInstance: UInt8 = 0x02
-        static let projection: UInt8 = 0x04, chaperone: UInt8 = 0x05, eyeToHead: UInt8 = 0x08
+        static let projection: UInt8 = 0x04, chaperone: UInt8 = 0x05, capabilities: UInt8 = 0x06, eyeToHead: UInt8 = 0x08
         static let requestedFrameTime: UInt8 = 0x0C
         static let staticHMD: UInt8 = 0x0D, powerHMD: UInt8 = 0x10
         static func staticController(_ side: Side) -> UInt8 { side == .left ? 0x0E : 0x0F }
@@ -170,14 +175,20 @@ public struct DeviceProfile {
         return Bytes(json.utf8)
     }
 
-    /// Available refresh rates the headset can switch to
-    func availableRates(_ hz: Float) -> Bytes {
-        var rates = Bytes()
-        rates.append(integer: UInt32(1))
-        rates.append(integer: UInt32(1))                       // one rate
-        rates.append(zeros: 8)
-        rates.append(float: hz)
-        return rates
+    /// VTE_CAPABILITIES: 32 bytes of flags for what this client can do.
+    /// The Steam Link client sets only the first bit, whose meaning is
+    /// not known. Bit 45 is "supports chroma key passthrough" as the host
+    /// logs it (probed 2026-11-13); not claimed here.
+    static let capabilities: Bytes = [1] + Bytes(repeating: 0, count: 31)
+
+    /// The refresh rates the host may choose from: a mask of one field, how many, eight zeros, then each in Hz.
+    func availableRates(_ rates: [Float]) -> Bytes {
+        var out = Bytes()
+        out.append(integer: UInt32(1))
+        out.append(integer: UInt32(rates.count))
+        out.append(zeros: 8)
+        for hz in rates { out.append(float: hz) }
+        return out
     }
 
     /// Everything published before video starts. Controllers are published
@@ -189,9 +200,10 @@ public struct DeviceProfile {
         audio.append(integer: UInt32(3))
         return [
             ValueID.clientInstance: instanceBytes,
+            ValueID.capabilities: DeviceProfile.capabilities,
             ValueID.projection: projection(),
             ValueID.eyeToHead: eyeToHead(),
-            ValueID.availableRates: availableRates(refreshHz),
+            ValueID.availableRates: availableRates(([refreshHz] + otherRefreshRates.filter { $0 != refreshHz }).sorted()),
             ValueID.versionString: Bytes("qvlclient;\(systemName);\(clientVersion)".utf8),
             ValueID.chaperone: chaperone(universe: UInt32(truncatingIfNeeded: instance) & 0x7FFF_FFFF),
             ValueID.hostDefaults: [3, 0, 0, 0, 1, 0, 0, 0],

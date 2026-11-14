@@ -11,14 +11,25 @@ import Foundation
 /// complete HEVC access unit and the host's metadata for it.
 /// Fixed values in the pose message (docs/svl-tracking-input/poses.md).
 enum PoseMessage {
-    /// The first byte. Inferred: the layout's version.
-    static let layoutVersion: UInt8 = 0x0A
-    /// The third byte, always this; what it means is not known.
+    /// The first byte: the protocol's version. The host drops every pose
+    /// message that says anything else, logging "svl protocol version
+    /// mismatch. Server expects 10" (probed 2026-11-13).
+    static let protocolVersion: UInt8 = 0x0A
+    /// The third byte, always this; what it means is not known. The host
+    /// streamed just the same with zero here (probed 2026-11-13).
     static let unknownConstant: UInt8 = 0x20
     /// The holdoff byte: non-zero asks the host to hold off. Never asked for here.
     static let noHoldoff: UInt8 = 0
-    /// The headset's own input block: this, eight zero bytes, flags, a closing byte.
-    static let hmdInputHeader: UInt32 = 9
+    /// The headset's own input block: the client's minor version, eight
+    /// zero bytes, flags, a closing byte.
+    ///
+    /// The host logs the first as "Peer Minor Version Number" and behaves
+    /// by it. 14 is what Steam Link 2.0.25 sends, and what this client
+    /// does is what that one was seen to do (docs/svl-transport/): the
+    /// capabilities value, the longer frame report and eye message, and
+    /// the ping. A host given 14 without the capabilities value never
+    /// starts the headset (probed 2026-11-13).
+    static let minorVersion: UInt32 = 14
     static let hmdInputReserved = 8
     static let hmdInputFlagNothingInHands: UInt8 = 0x08
     static let hmdInputTrailer: UInt8 = 0xFF
@@ -67,7 +78,14 @@ public final class StreamSession {
         defer { lock.unlock() }
         return applicationRunning
     }
-    private var lastFrame: (id: UInt16, time: Int32) = (0, 0)
+    /// The last frame to arrive whole: when, on the session clock and on
+    /// the wall clock (microseconds since 1970).
+    private var lastFrame: (id: UInt16, time: Int32, wallClock: UInt64) = (0, 0, 0)
+    /// When each recent frame was handed on for decoding, by frame id modulo this many.
+    private var handedToDecoder = [Int32](repeating: 0, count: StreamSession.framesRemembered)
+    static let framesRemembered = 64
+    /// Each side tells the other, this often, where it can be reached. Seconds.
+    static let addressListInterval: TimeInterval = 2
     private var running = true
 
     private let lock = NSLock()
@@ -89,8 +107,11 @@ public final class StreamSession {
     /// The sequence number of the datagram that ends the session.
     static let goodbyeSequence: UInt16 = 0xFFFF
     /// The focus event value: its first byte says what happened, the rest is zero.
+    /// The host's names for the two the Steam Link client sends are
+    /// EVTYPE_LDASH_PAUSE ("Remote was paused") and EVTYPE_LDASH_CONTINUE.
     static let focusEventSize = 52
-    static let focusEventGained: UInt8 = 5
+    static let focusEventPaused: UInt8 = 4
+    static let focusEventContinued: UInt8 = 5
     /// A wrist not heard of for this long starts afresh, with no velocity. Microseconds.
     static let wristForgottenAfter: Int32 = 200_000
     /// Wrist velocities are not measured over less than this. Microseconds.
@@ -99,7 +120,13 @@ public final class StreamSession {
     /// `interface`: the network interface the stream must use, or nil for
     /// the system's choice.
     public init?(_ args: SessionArgs, profile: DeviceProfile, interface: String? = nil) {
-        guard let link = SVLLink(token: args.token), let socket = UDPSocket(interface: interface),
+        // The Steam Link client sends from the port the host listens on,
+        // and a host given version 14 sends to that port at this address
+        // whatever port it hears from; with nothing there, the refusal
+        // that comes back makes the host remake its socket every two
+        // seconds (probed 2026-11-13). Any port will do if that one is taken.
+        guard let link = SVLLink(token: args.token),
+              let socket = UDPSocket(interface: interface, localPort: args.port) ?? UDPSocket(interface: interface),
               socket.connect(host: args.host, port: args.port)
         else { return nil }
         self.link = link
@@ -108,9 +135,17 @@ public final class StreamSession {
         framePeriod = 1 / Double(profile.refreshHz)
         audioReceiver.onLog = { [weak self] in self?.onLog?($0) }
         for (id, value) in profile.startupValues() { values.publish(id, value) }
-        // "The headset gained focus"
-        values.publish(DeviceProfile.ValueID.focusEvent, [StreamSession.focusEventGained] + Bytes(repeating: 0, count: StreamSession.focusEventSize - 1), force: true)
+        // "The headset has focus": the host logs "Remote was continued".
+        values.publish(DeviceProfile.ValueID.focusEvent, [StreamSession.focusEventContinued] + Bytes(repeating: 0, count: StreamSession.focusEventSize - 1), force: true)
     }
+
+    /// Called on the session thread when the host wants a refresh rate,
+    /// in Hz: one of `DeviceProfile.otherRefreshRates` or `refreshHz`.
+    /// The platform asks its display for it, if it can. Nothing depends on
+    /// the display obliging: the host is always told the rate the display
+    /// really runs at, and streams at that.
+    public var onRefreshRateRequested: ((Float) -> Void)?
+    private var rateHinted: Float?
 
     /// Asked for the head pose each time one is sent (four times a frame, on
     /// the session thread). When nil, the last pose given to `setHead` is sent.
@@ -306,7 +341,7 @@ public final class StreamSession {
             }
         }
         var out = Bytes()
-        out.append(PoseMessage.layoutVersion)
+        out.append(PoseMessage.protocolVersion)
         out.append(UInt8(subIndex))
         out.append(PoseMessage.unknownConstant)
         out.append(PoseMessage.noHoldoff)
@@ -318,7 +353,7 @@ public final class StreamSession {
         out.append(integer: frameDisplayTime)
         out.append(integer: frameCounter)
         out.append(integer: assembler.resetCounter)   // bumped to ask for a keyframe
-        out.append(integer: PoseMessage.hmdInputHeader)      // the headset's input block: no buttons
+        out.append(integer: PoseMessage.minorVersion)        // the headset's input block: no buttons
         out.append(zeros: PoseMessage.hmdInputReserved)
         out.append(hands.contains { $0 != nil } ? 0 : PoseMessage.hmdInputFlagNothingInHands)
         out.append(PoseMessage.hmdInputTrailer)
@@ -345,6 +380,8 @@ public final class StreamSession {
         out.append(integer: displayed.id)
         out.append(integer: UInt16(0))
         out.append(integer: displayed.submitted)     // when it was handed to the display
+        out.append(integer: lastFrame.wallClock)     // accepted, by the wall clock
+        out.append(integer: handedToDecoder[Int(decoded.id) % StreamSession.framesRemembered])
         return SVLElement(.frameReport, id: decoded.id, index: lastFrame.id, value: out)
     }
 
@@ -359,12 +396,38 @@ public final class StreamSession {
         return SVLElement(.statistics, value: out)
     }
 
+    /// Where the host can reach this client
+    /// (docs/svl-transport/host-address-list.md): a leading 1, then one
+    /// record for the address the session runs on. A record is the
+    /// family (0 is IPv4), the length of what follows, the port in
+    /// network order, the prefix length, and sixteen bytes that begin
+    /// with the address. A host given version 14 and no such list
+    /// remakes its socket every two seconds (probed 2026-11-13).
+    private func addressList() -> SVLElement? {
+        guard let local = socket.localEndpoint() else { return nil }
+        var out: Bytes = [1, 0, 19, UInt8(local.port >> 8), UInt8(local.port & 0xFF), local.prefixLength]
+        out.append(contentsOf: local.address)
+        out.append(zeros: 12)
+        return SVLElement(.addressList, value: out)
+    }
+
     private func send(_ elements: [SVLElement]) {
         socket.send(link.pack(sequence: sequence, elements: elements))
         sequence &+= 1
     }
 
     // MARK: Receiving
+
+    /// Tell the host the refresh rate the display is set to, as the
+    /// length of a frame in microseconds.
+    /// `again`: send it even if it is what the host was last told. A host
+    /// that wants another rate asks several times a second, and need not
+    /// be answered each time.
+    private func publishFrameTime(_ hz: Float, again: Bool = true) {
+        var value = Bytes()
+        value.append(integer: UInt32(1_000_000.5 / Double(hz)))
+        values.publish(DeviceProfile.ValueID.requestedFrameTime, value, force: again)
+    }
 
     private func valuesCompleted(_ ids: [UInt8]) {
         for id in ids {
@@ -380,10 +443,16 @@ public final class StreamSession {
             case DeviceProfile.ValueID.displayRateRequest:
                 let hz = data.float(at: 0)
                 guard hz > 1 else { break }
-                onLog?("host asked for \(hz) Hz")
-                var reply = Bytes()
-                reply.append(integer: UInt32(1_000_000.5 / Double(hz)))
-                values.publish(DeviceProfile.ValueID.requestedFrameTime, reply, force: true)
+                // The host is told what the display runs at, not what it
+                // asked for: it streams at the rate it is told, and goes on
+                // asking for the one it wants. The platform is asked for
+                // that rate; if the display follows, the host hears of it.
+                if hz != rateHinted {
+                    rateHinted = hz
+                    onLog?("host asked for \(hz) Hz")
+                    onRefreshRateRequested?(hz)
+                }
+                publishFrameTime(Float((1 / framePeriod).rounded()), again: false)
             case DeviceProfile.ValueID.propRefresh:
                 values.republishAll()
             case DeviceProfile.ValueID.sceneApplicationRunning:
@@ -403,13 +472,20 @@ public final class StreamSession {
         let requests = assembler.takeRequests()
         if !requests.isEmpty { send(requests) }
         for frame in assembler.takeFrames() {
-            lastFrame = (frame.frameID, now())
+            let time = now()
+            lastFrame = (frame.frameID, time, UInt64(Date().timeIntervalSince1970 * 1_000_000))
+            handedToDecoder[Int(frame.frameID) % StreamSession.framesRemembered] = time
             framesReceived += 1
             onFrame?(frame)
         }
     }
 
     private func receive(_ datagram: Bytes) {
+        if let echo = LinkProbe.reply(to: datagram) {
+            socket.send(echo)
+            return
+        }
+        if LinkProbe.isProbe(datagram) { return }
         guard let elements = link.unpack(datagram) else { return }
         for element in elements {
             switch element.kind {
@@ -443,7 +519,7 @@ public final class StreamSession {
             case _ where element.messageClass == SVLClass.serverEvent:
                 onLog?("host: " + String(decoding: element.value.dropFirst(4), as: UTF8.self))
             default:
-                // .hostAddressList and anything unknown
+                // the host's address list, and anything unknown
                 noteForStudy("message class \(element.messageClass) type 0x" + String(element.kind.type, radix: 16),
                              element.value, version: nil)
             }
@@ -479,6 +555,7 @@ public final class StreamSession {
     private func run() {
         var nextTick = Date()
         var nextReport = Date().addingTimeInterval(1)
+        var nextAddressList = Date()
         var subIndex = 0
         while true {
             lock.lock()
@@ -503,12 +580,18 @@ public final class StreamSession {
                     let refresh = nextRefresh, period = refreshPeriod
                     lock.unlock()
                     if let period, abs(period - framePeriod) > framePeriod * 0.02 {
-                        // The display changed its refresh rate: tell the host,
-                        // which switches the stream to match.
                         framePeriod = period
                         let hz = Float((1 / period).rounded())
                         onLog?("display now refreshes at \(hz) Hz")
-                        values.publish(DeviceProfile.ValueID.availableRates, profile.availableRates(hz), force: true)
+                        // Tell the host what the display runs at now; it
+                        // switches the stream to match. What is offered stays
+                        // as it was, so the host can still choose (and
+                        // SteamVR's settings still list the rates); a rate
+                        // with no other on offer is itself what is offered.
+                        if profile.otherRefreshRates.isEmpty {
+                            values.publish(DeviceProfile.ValueID.availableRates, profile.availableRates([hz]), force: true)
+                        }
+                        publishFrameTime(hz)
                     }
                     // The refresh this frame is aimed at: the first one still ahead of us.
                     let step = Int32(framePeriod * 1_000_000)
@@ -552,6 +635,10 @@ public final class StreamSession {
                 subIndex = (subIndex + 1) % StreamSession.posesPerFrame
                 nextTick = max(nextTick.addingTimeInterval(framePeriod / Double(StreamSession.posesPerFrame)),
                                time.addingTimeInterval(-0.05))
+            }
+            if time >= nextAddressList {
+                if hostVersion != 0, let list = addressList() { send([list]) }
+                nextAddressList = time.addingTimeInterval(StreamSession.addressListInterval)
             }
             if time >= nextReport {
                 publishPower(headsetPowerProvider?(), as: DeviceProfile.ValueID.powerHMD)

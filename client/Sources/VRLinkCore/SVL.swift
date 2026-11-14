@@ -40,10 +40,10 @@ public struct SVLKind: Equatable {
     public static let eyesAndFace = SVLKind(SVLClass.unreliable, 0x11)
     public static let goodbye = SVLKind(SVLClass.unreliable, 0x13)            // empty: the session is over
     public static let hand = SVLKind(SVLClass.unreliable, 0x17)               // a bare hand's skeleton and gestures
+    public static let addressList = SVLKind(SVLClass.unreliable, 0x18)        // where this side can be reached; both ways
     // Unreliable stream, host to client.
     public static let valueTransport = SVLKind(SVLClass.unreliable, 0x0D)
     public static let haptics = SVLKind(SVLClass.unreliable, 0x16)
-    public static let hostAddressList = SVLKind(SVLClass.unreliable, 0x18)    // every two seconds; not used
     // Video reply, client to host.
     public static let retransmitRequest = SVLKind(SVLClass.videoReply, 0x05)  // the packet ids wanted again
     public static let frameReport = SVLKind(SVLClass.videoReply, 0x0F)
@@ -138,6 +138,35 @@ public enum SVL {
     }
 }
 
+
+/// The link probe: a datagram outside the SVL framing, three 32-bit
+/// words (a fixed mark, a 2, then 1 for "send this back" or 2 for "here
+/// it is back") and whatever padding the asker added. Each side asks the
+/// other every few seconds; the reference client answers with the same
+/// bytes, the third word changed, and notes the longest answer it has
+/// had (read from Steam Link 2.0.25; seen in capture `vr14`). A host
+/// given version 14 whose probes go unanswered remakes its socket every
+/// two seconds.
+enum LinkProbe {
+    static let mark: UInt32 = 0x459B_4C33
+    static let kind: UInt32 = 2
+    static let request: UInt32 = 1, answer: UInt32 = 2
+
+    /// The datagram to send back, if `datagram` is a probe asking for one.
+    static func reply(to datagram: Bytes) -> Bytes? {
+        guard datagram.count >= 12, datagram.integer(at: 0) as UInt32 == mark,
+              datagram.integer(at: 4) as UInt32 == kind, datagram.integer(at: 8) as UInt32 == request
+        else { return nil }
+        var out = datagram
+        out[8] = UInt8(answer)
+        return out
+    }
+
+    /// Whether `datagram` is any link probe, and so not for the SVL reader.
+    static func isProbe(_ datagram: Bytes) -> Bool {
+        datagram.count >= 12 && datagram.integer(at: 0) as UInt32 == mark
+    }
+}
 
 /// One session's datagram form, read from its token.
 public struct SVLLink {

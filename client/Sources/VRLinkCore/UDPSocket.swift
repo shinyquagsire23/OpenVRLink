@@ -10,8 +10,9 @@ public final class UDPSocket {
 
     /// `interface` names a network interface ("en5") that everything this
     /// socket sends must leave by; nil lets the system's routing choose.
-    /// Fails if the interface does not exist.
-    public init?(interface: String? = nil) {
+    /// Fails if the interface does not exist. `localPort` asks for a
+    /// particular port to send from, and fails if it cannot be had.
+    public init?(interface: String? = nil, localPort: UInt16? = nil) {
         descriptor = socket(AF_INET, SOCK_DGRAM, 0)
         if descriptor < 0 { return nil }
         if let interface {
@@ -27,6 +28,20 @@ public final class UDPSocket {
             close(descriptor)
             return nil      // binding to an interface is not written for this platform yet
             #endif
+        }
+        if let localPort {
+            var address = sockaddr_in()
+            address.sin_family = sa_family_t(AF_INET)
+            address.sin_port = localPort.bigEndian
+            let bound = withUnsafePointer(to: &address) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+                }
+            }
+            guard bound else {
+                close(descriptor)
+                return nil
+            }
         }
         var size: Int32 = 8 << 20   // a keyframe arrives as a burst of several hundred datagrams
         setsockopt(descriptor, SOL_SOCKET, SO_RCVBUF, &size, socklen_t(MemoryLayout<Int32>.size))
@@ -50,6 +65,38 @@ public final class UDPSocket {
                 Foundation.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
             }
         }
+    }
+
+    /// Where this socket sends from, once connected: its IPv4 address
+    /// (four bytes, in network order), its port, and how many leading
+    /// bits of the address name its network.
+    public func localEndpoint() -> (address: Bytes, port: UInt16, prefixLength: UInt8)? {
+        var bound = sockaddr_in()
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let result = withUnsafeMutablePointer(to: &bound) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(descriptor, $0, &length) }
+        }
+        guard result == 0, bound.sin_family == sa_family_t(AF_INET) else { return nil }
+        let own = bound.sin_addr.s_addr
+        // The netmask of the interface that has this address.
+        var prefix: UInt8 = 24
+        var list: UnsafeMutablePointer<ifaddrs>?
+        if getifaddrs(&list) == 0 {
+            var cursor = list
+            while let interface = cursor?.pointee {
+                cursor = interface.ifa_next
+                guard let address = interface.ifa_addr, let mask = interface.ifa_netmask,
+                      address.pointee.sa_family == sa_family_t(AF_INET) else { continue }
+                let theirs = address.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr.s_addr }
+                guard theirs == own else { continue }
+                let netmask = mask.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr.s_addr }
+                prefix = UInt8(netmask.nonzeroBitCount)
+            }
+            freeifaddrs(list)
+        }
+        let host = UInt32(bigEndian: own)
+        return ([UInt8(host >> 24), UInt8(host >> 16 & 0xFF), UInt8(host >> 8 & 0xFF), UInt8(host & 0xFF)],
+                UInt16(bigEndian: bound.sin_port), prefix)
     }
 
     public func send(_ bytes: Bytes) {

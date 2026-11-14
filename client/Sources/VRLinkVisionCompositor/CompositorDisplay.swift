@@ -313,19 +313,28 @@ public final class CompositorDisplay {
         head.setEyeMidpoint(simd_make_float3(midpoint), atConnect: false)
     }
 
+    /// How far away the black behind an unkeyed picture is, in meters:
+    /// beyond the picture, within what the compositor draws.
+    private static let backdropDistance: Float = 90
+
     private func draw(_ frame: DecodedFrame?, profile: DeviceProfile?, into drawable: LayerRenderer.Drawable,
                       commands: MTLCommandBuffer) {
         let views = drawable.views
         // Behind a picture that is not keyed there is black, not the room:
         // a picture narrower than the display (the field-of-view setting)
         // then has a black margin. With keying, or with no picture, nothing
-        // is drawn behind and the room shows.
+        // is drawn behind and the room shows. Clearing to black is not
+        // enough: visionOS shows the room wherever no depth was written,
+        // whatever the color there, so the black is a quad of its own,
+        // far behind the picture.
         let roomBehind = frame == nil || profile == nil || renderer.chromaKey != nil
         let eyes = drawQuads(into: drawable, commands: commands, renderer: renderer, frame: frame,
                              originFromDevice: lastOriginFromDevice,
-                             behind: MTLClearColor(red: 0, green: 0, blue: 0, alpha: roomBehind ? 0 : 1)) { eye, _ in
+                             behind: MTLClearColor(red: 0, green: 0, blue: 0, alpha: roomBehind ? 0 : 1)) { eye, view in
             guard let frame, let profile else { return [] }
-            return Composition.quads(for: eye, metadata: frame.metadata, profile: profile)
+            let picture = Composition.quads(for: eye, metadata: frame.metadata, profile: profile)
+            guard !roomBehind else { return picture }
+            return [Quad.backdrop(for: view, distance: CompositorDisplay.backdropDistance, color: [0, 0, 0, 1])] + picture
         }
         guard eyes.count == 2 else { return }
         if !describedFirstFrame {
