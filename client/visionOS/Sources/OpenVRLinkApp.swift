@@ -83,15 +83,12 @@ struct OpenVRLinkApp: App {
             .frame(width: EntryView.windowSize.width, height: EntryView.windowSize.height)
             .onAppear {
                 // Once for each version of the app: say what is new in it.
-                guard lastUsedAppVersion != AppVersion.current else { return }
+                //guard lastUsedAppVersion != AppVersion.current else { return }
                 lastUsedAppVersion = AppVersion.current
                 showChanges = true
             }
-            .alert("OpenVRLink v" + AppVersion.current, isPresented: $showChanges) {
-                Button("Dismiss") {}
-            } message: {
-                Text(AppVersion.changes)
-            }
+            // A sheet: visionOS shows it as a window of its own in front of this one.
+            .sheet(isPresented: $showChanges) { ChangesView() }
             .task {
                 // Once, however often the window is closed and opened again.
                 guard !OpenVRLinkApp.trackingStarted else { return }
@@ -163,6 +160,28 @@ struct OpenVRLinkApp: App {
 }
 
 /// Which version of the app this is, and what is new in it.
+/// What is new in this version, once after each update: a sheet a little
+/// narrower than the app's window, so that the lines read as a list.
+private struct ChangesView: View {
+    @Environment(\.dismiss) private var dismiss
+    /// How much narrower and shorter than the window, in points.
+    static let inset: CGFloat = 40
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Text("OpenVRLink v" + AppVersion.current).font(.title2)
+            ScrollView {
+                Text(AppVersion.changes)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Button("Dismiss") { dismiss() }
+        }
+        .padding(24)
+        .frame(width: EntryView.windowSize.width - ChangesView.inset,
+               height: EntryView.windowSize.height - ChangesView.inset)
+    }
+}
+
 enum AppVersion {
     /// As in "0.1.0 build 1".
     static let current: String = {
@@ -172,17 +191,29 @@ enum AppVersion {
         return version + " build " + build
     }()
 
+    // TODO: Remove these changes before App Store
+
     /// Shown once after each update. Rewrite for each release.
     static let changes = """
     What's changed?
 
-    • First test build of OpenVRLink!
+    • Fixed borders being transparent when chroma keying is off and FoV has been narrowed
+    • Fixed games exiting when the app exits; SteamVR will now only exit automatically if no games are running
+    • Fixed frame pacing graph not showing blue ping line
+    • Optimized packet handling to reduce unnecessary copies (improved battery life)
+    • SteamVR now shows available framerates, and will attempt to switch framerates if requested*
+    • SteamVR is now told the current running framerate
+    • Default resolution sent to SteamVR is now more accurate (except in RealityKit)
+    • Updated protocol to version 14
 
     ___________________________
 
     Known issues:
 
     • With the RealityKit renderer, taking the headset off and putting it back on does not resume the stream.
+    • Framerate selection does not work correctly on M5 Vision Pros
+    • Streaming from ARM64 Linux machines (eg, DGX Spark) is currently not working.
+    • PSVR2 models requires installing some assets on your PC using scripts from the repo (companion app ETA son)
     """
 }
 
