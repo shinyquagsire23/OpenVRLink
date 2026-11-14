@@ -147,8 +147,12 @@ world's axes, and each eye's pose on the head and its frustum. Eye geometry can
 therefore change while streaming.
 
 This client sends the head's last known pose carried forward by its velocities
-(`TrackedPose.predicted`). A platform that can be asked for the pose at a time
-should be asked instead.
+(`TrackedPose.predicted`); a platform that can be asked for the pose at a time
+should be asked instead. Controllers are carried forward the same way, with
+half their turning rate (`ControllerState.spinSent`, the figure settled on for
+Steam hosts), and the host is told that reduced rate too: with all of it,
+small movements overshot badly on the headset (2026-11-14), and asking ARKit
+for the controller at the later time was no better.
 
 ### What the hands hold (**source**; poses **measured**, inputs and haptics not yet seen to act)
 
@@ -188,10 +192,16 @@ nanoseconds, a frequency, an amplitude. The headset's battery goes in
 ### Coming back to a session
 
 The host keeps a session while an application is attached to it, and takes a
-headset back into it only if the headset describes itself exactly as before:
-otherwise it answers "Headset incompatible with session: headset features
-changed" and closes (**measured**, on reconnecting with hand tracking newly
-declared). The application has to be started again.
+headset back into it only if the headset describes itself as before
+(**source**, `wivrn_session.cpp`): the same system name, the same list of
+refresh rates, the same palm, presence, passthrough and body-tracking
+answers, and frusta equal to the bit. Otherwise it sends a message,
+"Headset incompatible with session: headset features changed", and closes
+(**measured**, on reconnecting with hand tracking newly declared; hand, eye
+and face tracking only earn a warning in the source). A display measured
+twice does not give the same frusta twice, so the client keeps what it told
+each host and tells it the same again while the display measures about the
+same (`WiVRnDisplayMemory`), and sends its refresh rates in one order.
 
 ### The rate asked for
 

@@ -114,6 +114,24 @@ final class WiVRnTests: XCTestCase {
         XCTAssertEqual(right[72], 0)            // right thumb rest touch
     }
 
+    /// A host refuses a returning headset whose frusta differ at all, so one measured a little differently is told the old ones.
+    func testAHostIsToldTheSameFrustaAgain() {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("wivrn-displays-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: file) }
+        let first = [Frustum(left: -1, right: 0.8, down: -0.9, up: 1), Frustum(left: -0.8, right: 1, down: -0.9, up: 1)]
+        XCTAssertEqual(WiVRnDisplayMemory.settled(first, host: "a", file: file)[0].left, -1)
+        var again = first
+        again[0].left = -1.01
+        again[1].up = 1.02
+        let settled = WiVRnDisplayMemory.settled(again, host: "a", file: file)
+        XCTAssertEqual(settled[0].left, -1)
+        XCTAssertEqual(settled[1].up, 1)
+        // Another host has not been told anything yet; and a display that has really changed is taken as it is.
+        XCTAssertEqual(WiVRnDisplayMemory.settled(again, host: "b", file: file)[0].left, -1.01)
+        again[0].left = -1.3
+        XCTAssertEqual(WiVRnDisplayMemory.settled(again, host: "a", file: file)[0].left, -1.3)
+    }
+
     func testLongListsHaveATwoPartLength() {
         var out = Bytes()
         out.append(size: 0x7FFE)
@@ -189,6 +207,17 @@ final class WiVRnTests: XCTestCase {
         let pose = HeadPose(position: Vec3(1, 2, 3), yaw: 0.7, pitch: -0.3).pose
         let back = Pose(position: pose.position, quaternion: pose.quaternion)
         for (a, b) in [(pose.right, back.right), (pose.up, back.up), (pose.forward, back.forward)] {
+            XCTAssertEqual(a.x, b.x, accuracy: 1e-5)
+            XCTAssertEqual(a.y, b.y, accuracy: 1e-5)
+            XCTAssertEqual(a.z, b.z, accuracy: 1e-5)
+        }
+    }
+
+    func testAPoseGivenRelativeToAnotherIsPutBackByPlacing() {
+        let grip = HeadPose(position: Vec3(1, 2, 3), yaw: 0.7, pitch: -0.3).pose
+        let aim = HeadPose(position: Vec3(1.1, 1.9, 2.8), yaw: 0.2, pitch: 0.4).pose
+        let back = grip.placing(grip.relative(aim))
+        for (a, b) in [(aim.position, back.position), (aim.forward, back.forward), (aim.up, back.up)] {
             XCTAssertEqual(a.x, b.x, accuracy: 1e-5)
             XCTAssertEqual(a.y, b.y, accuracy: 1e-5)
             XCTAssertEqual(a.z, b.z, accuracy: 1e-5)

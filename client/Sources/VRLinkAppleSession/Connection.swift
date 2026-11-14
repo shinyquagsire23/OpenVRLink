@@ -213,6 +213,12 @@ public final class Connection: ObservableObject {
                     (session, hostName) = (wivrn, address)
                 }
                 session.onLog = { Log.note($0) }
+                // The host ended it: drop the stream and say why, where the wearer will look.
+                session.onEnded = { [weak self, weak session] reason in
+                    guard let self, let session, self.session === session else { return }
+                    self.stop()
+                    self.show("The stream ended: \(reason)")
+                }
                 session.headProvider = headProvider
                 session.headsetPowerProvider = { [battery] in battery.state }
                 session.handsProvider = handsProvider

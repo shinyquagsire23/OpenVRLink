@@ -44,6 +44,9 @@ public final class WiVRnSession: StreamingSession {
     public var gazeProvider: (() -> Vec3?)?
     public var faceProvider: (() -> FaceExpressions?)?
     public var onRefreshRateRequested: ((Float) -> Void)?
+    public var onEnded: ((String) -> Void)?
+    /// The last thing the host said was wrong, to give as why the stream ended.
+    private var hostComplaint: String?
     public let audio = PlaybackBuffer()
     /// A WiVRn host has no scene of its own: any picture is an application's.
     public var sceneApplicationRunning: Bool { true }
@@ -119,6 +122,10 @@ public final class WiVRnSession: StreamingSession {
         guard let address = TCPSocket.resolve(host), let control = TCPSocket(address: address, port: port),
               let stream = UDPSocket()
         else { throw WiVRnError.unreachable(host) }
+        // A host takes a headset back into a running session only if its
+        // frusta are to the bit what they were (docs/wivrn/protocol.md).
+        var profile = profile
+        profile.eyeFrusta = WiVRnDisplayMemory.settled(profile.eyeFrusta, host: host)
         let session = WiVRnSession(control: control, stream: stream, profile: profile)
 
         // With encryption off the host wants a key all the same, and does nothing with it.
@@ -166,7 +173,9 @@ public final class WiVRnSession: StreamingSession {
             max(WiVRnSession.pixelAlignment, Int(Double(side) * scale) / WiVRnSession.pixelAlignment * WiVRnSession.pixelAlignment)
         }
         return WiVRnHeadsetInfo(renderPixels: render, streamPixels: (encoded(render.width), encoded(render.height)),
-                                refreshRates: [profile.refreshHz] + profile.otherRefreshRates, preferredRate: targetHz,
+                                // In one order whatever the display runs at now: the list has to
+                                // be the same each time, like the frusta.
+                                refreshRates: Set([profile.refreshHz] + profile.otherRefreshRates).sorted(), preferredRate: targetHz,
                                 bitsPerSecond: WiVRnSession.bitsPerSecond, frusta: profile.eyeFrusta,
                                 codecs: [.h265, .h264], systemName: profile.systemName)
     }
@@ -228,10 +237,15 @@ public final class WiVRnSession: StreamingSession {
 
     public func start() {
         let thread = Thread { [self] in
-            do { try run() } catch { onLog?("the stream ended: \(error)") }
+            var reason: String?
+            do { try run() } catch {
+                reason = hostComplaint.map { "the host said: " + $0 } ?? "\(error)"
+                onLog?("the stream ended: \(reason ?? "")")
+            }
             // The host takes the connection closing as the headset leaving,
             // and only then offers itself to be found again.
             control.shutDown()
+            if let reason { onEnded?(reason) }
         }
         thread.name = "wivrn-session"
         thread.qualityOfService = .userInteractive
@@ -317,8 +331,10 @@ public final class WiVRnSession: StreamingSession {
         lock.lock()
         let last = head
         lock.unlock()
-        // TODO: ask the platform for each pose at that time; its own
-        // prediction is better than carrying the velocities forward.
+        // Poses are carried forward by their velocities, as a Steam host
+        // does for itself. (Asking ARKit for a controller at the later time
+        // was tried on the headset, 2026-11-14: it overshot small movements
+        // just as much.)
         let ahead = Float(prediction) / 1e9
         let head = (headProvider?() ?? last).predicted(seconds: ahead)
         var hands = handsProvider?() ?? []
@@ -331,11 +347,16 @@ public final class WiVRnSession: StreamingSession {
             switch hands[side.rawValue] {
             case .controller(let controller):
                 nowHolding[side.rawValue] = WiVRn.InteractionProfile.touch
-                var grip = controller.grip.predicted(seconds: ahead)
+                // With only part of its turning rate (`ControllerState.spinSent`):
+                // carried so far in a straight line, all of it overshoots. The
+                // host is told the same reduced rate, for what looking ahead it does itself.
+                var grip = controller.gripForHost.predicted(seconds: ahead)
                 poses.append(WiVRnDevicePose(WiVRn.Device.grip(side), grip))
                 // The aim moves as the grip does.
                 var aiming = controller
                 aiming.grip = grip
+                // A platform's own aim pose is as of now: it keeps its place on the grip.
+                if let aim = controller.aim { aiming.aim = grip.pose.placing(controller.grip.pose.relative(aim)) }
                 grip.pose = aiming.aimPose(side)
                 poses.append(WiVRnDevicePose(WiVRn.Device.aim(side), grip))
                 inputs += controller.wivrnInputs(side)
@@ -437,8 +458,9 @@ public final class WiVRnSession: StreamingSession {
             hapticPulses += 1
             onHaptic?(HapticPulse(side: side, frequency: frequency,
                                   seconds: max(Float(nanoseconds) / 1e9, HapticPulse.shortest), amplitude: min(1, amplitude)))
-        case .serverMessage(_, let text):
+        case .serverMessage(let kind, let text):
             onLog?("host: " + text)
+            if kind == WiVRn.serverMessageError { hostComplaint = text }
         case .refreshRateChange(let hz):
             onLog?("host asked for \(hz) Hz")
             onRefreshRateRequested?(hz)
@@ -623,5 +645,33 @@ struct ShardAssembler {
         }
         return (Whole(frame: shard.frame, data: data, views: views.views, foveation: views.foveation, feedback: frame.feedback),
                 abandoned)
+    }
+}
+
+/// The frusta each WiVRn host was last told, kept between runs.
+///
+/// A display measured twice does not give the same numbers twice (the eyes
+/// move, and the views with them), and a host that still has a session
+/// running refuses a headset whose frusta differ at all from the ones the
+/// session began with. So a host is told again what it was told before,
+/// for as long as the display still measures about the same.
+enum WiVRnDisplayMemory {
+    /// How far a tangent may have moved and still count as the same display.
+    static let tolerance: Float = 0.05
+    static var file: URL { DataDirectory.url.appendingPathComponent("wivrn-displays.json") }
+
+    static func settled(_ measured: [Frustum], host: String, file: URL = WiVRnDisplayMemory.file) -> [Frustum] {
+        func numbers(_ frusta: [Frustum]) -> [Float] { frusta.flatMap { [$0.left, $0.right, $0.down, $0.up] } }
+        var known = (try? JSONDecoder().decode([String: [Float]].self, from: Data(contentsOf: file))) ?? [:]
+        let now = numbers(measured)
+        if let before = known[host], before.count == now.count, zip(before, now).allSatisfy({ abs($0 - $1) <= tolerance }) {
+            return stride(from: 0, to: before.count, by: 4).map {
+                Frustum(left: before[$0], right: before[$0 + 1], down: before[$0 + 2], up: before[$0 + 3])
+            }
+        }
+        known[host] = now
+        try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? JSONEncoder().encode(known).write(to: file, options: .atomic)
+        return measured
     }
 }

@@ -31,6 +31,9 @@ public protocol StreamingSession: AnyObject {
     /// rate, in Hz. The platform asks its display for it if it can; the
     /// host is always told what the display really runs at.
     var onRefreshRateRequested: ((Float) -> Void)? { get set }
+    /// Called on the session's thread when the stream ends without having
+    /// been stopped (the host closed it, say), with why.
+    var onEnded: ((String) -> Void)? { get set }
     /// Decoded audio waiting to be played.
     var audio: PlaybackBuffer { get }
     /// Whether the host says an application has the scene.

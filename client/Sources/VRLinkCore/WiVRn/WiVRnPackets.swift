@@ -65,6 +65,8 @@ public enum WiVRn {
     static let poseFullyTracked: UInt8 = 0x3F
     /// XrViewStateFlags: orientation and position valid and tracked.
     static let viewFullyTracked: UInt64 = 0xF
+    /// The kind of host message that says why it is about to close the connection.
+    static let serverMessageError: UInt8 = 2
     /// XrSessionState.
     static let sessionStateFocused: Int32 = 5
 

@@ -69,6 +69,14 @@ public struct Pose {
                     up: direction(child.up), forward: direction(child.forward))
     }
 
+    /// `other`, which is in the frame this pose is in, given in this
+    /// pose's own frame (x to its right, y up, z behind it): what
+    /// `placing` undoes.
+    public func relative(_ other: Pose) -> Pose {
+        func own(_ v: Vec3) -> Vec3 { Vec3(v.dot(right), v.dot(up), -v.dot(forward)) }
+        return Pose(position: own(other.position - position), right: own(other.right), up: own(other.up), forward: own(other.forward))
+    }
+
     /// Orientation as a unit quaternion (w, x, y, z), from the rotation whose
     /// columns are this pose's right, up and backward axes.
     public var quaternion: [Float] {

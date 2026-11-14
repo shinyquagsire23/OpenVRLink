@@ -52,6 +52,8 @@ enum PackedPose {
 public final class StreamSession: StreamingSession {
     public var onFrame: ((EncodedFrame) -> Void)?
     public var onLog: ((String) -> Void)?
+    /// Never called yet: a Steam host that goes away is only noticed as silence.
+    public var onEnded: ((String) -> Void)?
 
     public let profile: DeviceProfile
     private let socket: UDPSocket
