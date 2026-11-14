@@ -83,7 +83,7 @@ struct OpenVRLinkApp: App {
             .frame(width: EntryView.windowSize.width, height: EntryView.windowSize.height)
             .onAppear {
                 // Once for each version of the app: say what is new in it.
-                //guard lastUsedAppVersion != AppVersion.current else { return }
+                guard lastUsedAppVersion != AppVersion.current else { return }
                 lastUsedAppVersion = AppVersion.current
                 showChanges = true
             }
