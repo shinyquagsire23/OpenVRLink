@@ -49,7 +49,7 @@ enum PackedPose {
     static let identityOffset: [Float] = [0, 0, 0, 1, 0, 0, 0]
 }
 
-public final class StreamSession {
+public final class StreamSession: StreamingSession {
     public var onFrame: ((EncodedFrame) -> Void)?
     public var onLog: ((String) -> Void)?
 
@@ -262,6 +262,23 @@ public final class StreamSession {
         nextRefresh = displayTime
         refreshPeriod = period
         lock.unlock()
+    }
+
+    // MARK: The same, as any session is told (`StreamingSession`)
+
+    /// A time on the system's clock as this session's.
+    private func sessionTime(_ uptimeNanoseconds: UInt64) -> Int32 {
+        Int32(truncatingIfNeeded: (Int64(bitPattern: uptimeNanoseconds) - Int64(bitPattern: started)) / 1000)
+    }
+
+    public func frameDecoded(_ frameID: UInt16, picture: Int) { frameDecoded(frameID) }
+
+    public func frameShown(_ frameID: UInt16, at uptimeNanoseconds: UInt64) {
+        frameDisplayed(frameID, displayTime: sessionTime(uptimeNanoseconds))
+    }
+
+    public func displayRefreshes(at uptimeNanoseconds: UInt64, period: Double) {
+        displayWillRefresh(at: sessionTime(uptimeNanoseconds), period: period)
     }
 
     // MARK: Sending
@@ -492,7 +509,7 @@ public final class StreamSession {
             lastFrame = (frame.frameID, time, UInt64(Date().timeIntervalSince1970 * 1_000_000))
             handedToDecoder[Int(frame.frameID) % StreamSession.framesRemembered] = time
             framesReceived += 1
-            onFrame?(frame)
+            onFrame?(EncodedFrame(frameID: frame.frameID, data: frame.data, layout: frame.metadata.layout(profile: profile)))
         }
     }
 

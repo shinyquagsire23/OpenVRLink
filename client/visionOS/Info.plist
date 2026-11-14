@@ -13,6 +13,10 @@
 			<string>ExtendedGamepad</string>
 		</dict>
 	</array>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_wivrn._tcp</string>
+	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationPreferredDefaultSceneSessionRole</key>

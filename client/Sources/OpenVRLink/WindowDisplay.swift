@@ -14,7 +14,7 @@ final class WindowDisplay: NSObject, MTKViewDelegate {
     /// Decoded frames waiting for a refresh.
     let frames = DisplayQueue<DecodedFrame>()
     /// Told when frames are shown and when the display will next refresh.
-    var session: StreamSession?
+    var session: (any StreamingSession)?
     /// Which eye the window shows.
     var eye = Eye.left
     /// Seconds between this display's refreshes.
@@ -58,9 +58,11 @@ final class WindowDisplay: NSObject, MTKViewDelegate {
         let picked = frames.next()
         renderer.chromaKey = settings.chromaKeying(inGame: session?.sceneApplicationRunning ?? false)
         if let session {
-            let displayTime = session.now() &+ Int32(refreshPeriod * 1_000_000)
-            session.displayWillRefresh(at: displayTime &+ Int32(refreshPeriod * 1_000_000), period: refreshPeriod)
-            if let picked, picked.isNew { session.frameDisplayed(picked.frame.frameID, displayTime: displayTime) }
+            // Drawn now, seen a refresh later.
+            let period = UInt64(refreshPeriod * 1e9)
+            let seen = Uptime.nanoseconds + period
+            session.displayRefreshes(at: seen + period, period: refreshPeriod)
+            if let picked, picked.isNew { session.frameShown(picked.frame.frameID, at: seen) }
         }
         guard let pass = view.currentRenderPassDescriptor, let drawable = view.currentDrawable,
               let commands = queue.makeCommandBuffer(),
@@ -73,7 +75,7 @@ final class WindowDisplay: NSObject, MTKViewDelegate {
             // frustum shaped like the window.
             let window = EyeView(eye: head.pose.shifted(right: profile.eyesInHead[eye.rawValue].position.x),
                                  frustum: .symmetric(halfAngleDegrees: 45, aspect: Float(size.width / max(1, size.height))))
-            renderer.draw(Composition.quads(for: eye, metadata: frame.metadata, profile: profile),
+            renderer.draw(Composition.quads(for: eye, layout: frame.layout),
                           of: frame, from: window, with: encoder, commands: commands)
         }
         encoder.endEncoding()

@@ -11,7 +11,7 @@ using namespace metal;
 // One corner of a quad, for up to two eyes: each eye has its own position
 // on screen and its own part of the decoded frame to show.
 struct Vertex { float4 position[2]; float2 uv[2]; float2 tile; };
-struct Fragment { float4 position [[position]]; float2 uv; float2 tile; };
+struct Fragment { float4 position [[position]]; float2 uv; float2 tile; uint eye [[flat]]; };
 
 // With vertex amplification every triangle is drawn once per eye, and
 // amplification_id says which eye this copy is for.
@@ -21,6 +21,7 @@ vertex Fragment vertexMain(uint index [[vertex_id]], ushort eye [[amplification_
     out.position = vertices[index].position[eye];
     out.uv = vertices[index].uv[eye];
     out.tile = vertices[index].tile;
+    out.eye = eye;
     return out;
 }
 
@@ -86,7 +87,10 @@ struct Blended {
     float4 cover [[color(0), index(1)]];
 };
 
+// Each eye may show a picture of its own (a host that encodes the eyes
+// apart); when both show the same one, it is bound twice.
 fragment Blended fragmentMain(Fragment in [[stage_in]], texture2d<float> atlas [[texture(0)]],
+                              texture2d<float> otherEyeAtlas [[texture(1)]],
                               sampler atlasSampler [[sampler(0)]],
                               constant QuadStyle &style [[buffer(0)]]) {
     Blended out;
@@ -95,7 +99,8 @@ fragment Blended fragmentMain(Fragment in [[stage_in]], texture2d<float> atlas [
         out.cover = float4(style.fill.a);
         return out;
     }
-    half3 color = half3(atlas.sample(atlasSampler, in.uv).rgb);
+    half3 color = in.eye == 0 ? half3(atlas.sample(atlasSampler, in.uv).rgb)
+                              : half3(otherEyeAtlas.sample(atlasSampler, in.uv).rgb);
     half4 colorOut = half4(color.rgb, 1.0);
     if (CHROMAKEY_ENABLED) {
         half3 CHROMAKEY_COLOR = half3(style.keyColor.rgb);

@@ -143,10 +143,10 @@ final class DecoderTests: XCTestCase {
         let arrived = expectation(description: "a decoded picture")
         var size: (Int, Int)?
         decoder.onImage = { frame in
-            size = (CVPixelBufferGetWidth(frame.image), CVPixelBufferGetHeight(frame.image))
+            size = (CVPixelBufferGetWidth(frame.images[0]), CVPixelBufferGetHeight(frame.images[0]))
             arrived.fulfill()
         }
-        decoder.decode(EncodedFrame(frameID: 1, data: FrameBuffer(copying: keyframe), metadata: FrameMetadata(Bytes(repeating: 0, count: 0xF0))))
+        decoder.decode(EncodedFrame(frameID: 1, data: FrameBuffer(copying: keyframe), layout: .empty))
         wait(for: [arrived], timeout: 5)
         return size
     }

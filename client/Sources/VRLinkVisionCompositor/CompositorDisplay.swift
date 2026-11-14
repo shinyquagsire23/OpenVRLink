@@ -289,12 +289,13 @@ public final class CompositorDisplay {
 
         let picked = connection.frames.next()
         if let session = connection.session, let period = refreshPeriod() {
-            func sessionTime(_ time: TimeInterval) -> Int32 {
-                session.now() &+ Int32((time - CACurrentMediaTime()) * 1_000_000)
+            // The display's times are on the media clock; the session wants the system's uptime.
+            func uptime(_ time: TimeInterval) -> UInt64 {
+                UInt64(max(0, Double(Uptime.nanoseconds) + (time - CACurrentMediaTime()) * 1e9))
             }
-            session.displayWillRefresh(at: sessionTime(displayTime + period), period: period)
+            session.displayRefreshes(at: uptime(displayTime + period), period: period)
             if let picked, picked.isNew {
-                session.frameDisplayed(picked.frame.frameID, displayTime: sessionTime(displayTime))
+                session.frameShown(picked.frame.frameID, at: uptime(displayTime))
             }
         }
 
@@ -347,7 +348,7 @@ public final class CompositorDisplay {
                              originFromDevice: lastOriginFromDevice,
                              behind: MTLClearColor(red: 0, green: 0, blue: 0, alpha: roomBehind ? 0 : 1)) { eye, view in
             guard let frame, let profile else { return [] }
-            let picture = Composition.quads(for: eye, metadata: frame.metadata, profile: profile)
+            let picture = Composition.quads(for: eye, layout: frame.layout)
             guard !roomBehind else { return picture }
             return [Quad.backdrop(for: view, distance: CompositorDisplay.backdropDistance, color: [0, 0, 0, 1])] + picture
         }

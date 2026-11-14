@@ -14,10 +14,18 @@ Since a world-space renderer is practically the default setup for XR runtimes, t
 
 Transforms done by the different graphics backends should be kept minimal (space conversions, etc)
 
+What a session hands on with each frame is a `FrameLayout`: for each eye, where the
+host's eye was and a list of tiles, each a part of one decoded picture and the part of
+that eye's view it fills. Steam's VR Link gives two tiles an eye from one atlas (base and
+fovea); WiVRn gives each eye a picture of its own, squeezed in bands, which comes to a
+grid of tiles (`docs/wivrn/protocol.md`). `Composition` turns tiles into quads and knows
+nothing of either protocol.
+
 ```swift
 struct Quad {                    // produced by the core, per frame, per eye
     var corners: [Vec3]          // world space, meters: top-left, top-right, bottom-left, bottom-right
-    var atlasRect: Rect          // which part of the decoded frame it shows
+    var atlasRect: Rect          // which part of the decoded picture it shows
+    var picture: Int             // which of the frame's decoded pictures
     var feather: Float           // soft border, as a fraction of its width
 }
 struct EyeView {                 // produced by the XR runtime (or a window), per displayed frame
@@ -25,6 +33,14 @@ struct EyeView {                 // produced by the XR runtime (or a window), pe
     var frustum: Frustum         // tangents
 }
 ```
+
+## Protocols
+
+Both Valve's Steam VR Link (`StreamSession`) and WiVRn (`WiVRnSession`) are supported. 
+Displays, decoders and app shells see either as a `StreamingSession`, which provides a 
+common interface between both. Both Steam and WiVRn hosts are listed side-by-side in the
+host browser (WiVRn does its discovery via mDNS though, which means Apple devices will
+have to split functionality for discovery there).
 
 ## Targets
 

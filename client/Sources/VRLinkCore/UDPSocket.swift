@@ -6,7 +6,7 @@ import Foundation
 
 /// A blocking IPv4 UDP socket over the POSIX calls every target platform has.
 public final class UDPSocket {
-    private let descriptor: Int32
+    let descriptor: Int32
 
     /// `interface` names a network interface ("en5") that everything this
     /// socket sends must leave by; nil lets the system's routing choose.

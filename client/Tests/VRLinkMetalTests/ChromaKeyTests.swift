@@ -28,7 +28,7 @@ final class ChromaKeyTests: XCTestCase {
         }
         CVPixelBufferUnlockBaseAddress(image, [])
         CVBufferSetAttachment(image, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
-        return DecodedFrame(frameID: 0, image: image, metadata: FrameMetadata(Bytes(repeating: 0, count: 512)))
+        return DecodedFrame(frameID: 0, images: [image], layout: .empty)
     }
 
     /// Draw `frame` over the whole of a small target and return its middle pixel (blue, green, red, alpha).

@@ -265,14 +265,17 @@ struct EntryView: View {
     /// The window is this size and cannot be made another.
     static let windowSize = CGSize(width: 640, height: 480) // God's intended resolution
     @AppStorage("typedAddress") private var typedAddress = ""
+    /// What the computer at the typed address runs: an address alone does not say.
+    @AppStorage("typedAddressKind") private var typedKind = HostKind.steam
     @State private var askingForAddress = false
 
     /// Connect to `address`, and open the immersive space when there is
     /// a picture to show in it: until then the wearer stays where they
     /// were, in an environment for one.
-    private func stream(from address: String) {
+    private func stream(from address: String, kind: HostKind) {
         Task {
             connection.hostAddress = address
+            connection.hostKind = kind
             connection.waitingForPicture = true
             defer { connection.waitingForPicture = false }
             // Only a compositor layer is told what the displays are like:
@@ -351,9 +354,10 @@ struct EntryView: View {
                 Text(connection.hosts.isEmpty ? " " : "Found On Your Network:").font(.headline)
                 ScrollView(.horizontal) {
                     HStack(spacing: 16) {
-                        ForEach(connection.hosts, id: \.clientID) { host in
-                            Button { stream(from: host.address) } label: {
-                                hostTile(host.hostname, glyph: "desktopcomputer")
+                        ForEach(connection.hosts) { host in
+                            Button { stream(from: host.address, kind: host.kind) } label: {
+                                // A computer may be found twice, once for each thing it runs.
+                                hostTile(host.kind == .steam ? host.name : host.name + " (WiVRn)", glyph: "desktopcomputer")
                             }
                             .buttonBorderShape(.roundedRectangle(radius: 24))
                         }
@@ -393,11 +397,17 @@ struct EntryView: View {
                     .textInputAutocapitalization(.never)
                     .keyboardType(.numbersAndPunctuation)
                     .frame(width: 280)
+                Picker("What it runs", selection: $typedKind) {
+                    Text("Steam").tag(HostKind.steam)
+                    Text("WiVRn").tag(HostKind.wivrn)
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 280)
                 HStack(spacing: 16) {
                     Button("Cancel") { askingForAddress = false }
                     Button("Connect") {
                         askingForAddress = false
-                        stream(from: typedAddress.trimmingCharacters(in: .whitespaces))
+                        stream(from: typedAddress.trimmingCharacters(in: .whitespaces), kind: typedKind)
                     }
                     .disabled(typedAddress.trimmingCharacters(in: .whitespaces).isEmpty)
                 }

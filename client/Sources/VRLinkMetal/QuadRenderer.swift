@@ -184,17 +184,21 @@ public final class QuadRenderer {
     public func draw(eyes: [(quads: [Quad], view: EyeView)], of frame: DecodedFrame?, near: Float, far: Float,
                      with encoder: MTLRenderCommandEncoder, commands: MTLCommandBuffer) {
         guard let first = eyes.first, eyes.count <= 2 else { return }
-        let cvTexture = frame.flatMap { texture(for: $0.image) }
-        let atlas = cvTexture.flatMap(CVMetalTextureGetTexture)
+        let cvTextures = (frame?.images ?? []).map { texture(for: $0) }
+        let pictures = cvTextures.map { $0.flatMap(CVMetalTextureGetTexture) }
+        func picture(_ index: Int) -> MTLTexture? { pictures.indices.contains(index) ? pictures[index] : nil }
         encoder.setRenderPipelineState(pipeline)
         if let depthState { encoder.setDepthStencilState(depthState) }
-        encoder.setFragmentTexture(atlas ?? placeholder, index: 0)
         encoder.setFragmentSamplerState(sampler, index: 0)
         // The key color is compared with the picture as it is sampled:
         // linear light for a linear target, encoded values otherwise.
         let keyColor = (linearOutput ? chromaKey?.linearColor : chromaKey?.color) ?? [0, 0, 0]
         for index in first.quads.indices {
-            if first.quads[index].fill == nil, atlas == nil { continue }
+            // The picture each eye's copy of this quad shows.
+            let shown = (0..<2).map { picture(eyes[min($0, eyes.count - 1)].quads[index].picture) }
+            if first.quads[index].fill == nil, shown.contains(where: { $0 == nil }) { continue }
+            encoder.setFragmentTexture(shown[0] ?? placeholder, index: 0)
+            encoder.setFragmentTexture(shown[1] ?? placeholder, index: 1)
             // Four corners; per corner: a clip position per eye, an atlas
             // coordinate per eye, and the corner's place within the quad.
             var vertices: [Float] = []
@@ -219,7 +223,7 @@ public final class QuadRenderer {
             encoder.setFragmentBytes(style, length: style.count * MemoryLayout<Float>.size, index: 0)
             encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         }
-        let image = frame?.image
-        commands.addCompletedHandler { _ in _ = cvTexture; _ = image }
+        let images = frame?.images
+        commands.addCompletedHandler { _ in _ = cvTextures; _ = images }
     }
 }

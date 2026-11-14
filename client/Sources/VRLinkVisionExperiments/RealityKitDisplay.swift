@@ -192,13 +192,13 @@ public final class RealityKitDisplay {
     }
 
     /// Three textures and their planes, for a frame like this one shown through `frusta`.
-    private func makeSets(for metadata: FrameMetadata, frusta: [Frustum]) {
+    private func makeSets(for eyePixels: (width: Int, height: Int), frusta: [Frustum]) {
         guard materials.count == 2 else { return }
         // Foveated when the device can (`FoveatedFlatten`); otherwise a
         // plain texture of a size that keeps most of the foveal tile's detail.
         var scale = RealityKitDisplay.flattenScale
-        scale = min(scale, Double(RealityKitDisplay.largestSide) / Double(max(metadata.atlasWidth, metadata.tileHeight, 1)))
-        var size = (width: max(16, Int(Double(metadata.atlasWidth) * scale)), height: max(16, Int(Double(metadata.tileHeight) * scale)))
+        scale = min(scale, Double(RealityKitDisplay.largestSide) / Double(max(eyePixels.width, eyePixels.height, 1)))
+        var size = (width: max(16, Int(Double(eyePixels.width) * scale)), height: max(16, Int(Double(eyePixels.height) * scale)))
         let sameFrusta = zip(frusta, madeForFrusta).allSatisfy {
             $0.left == $1.left && $0.right == $1.right && $0.down == $1.down && $0.up == $1.up
         } && frusta.count == madeForFrusta.count
@@ -263,12 +263,13 @@ public final class RealityKitDisplay {
                 period = vsync.refreshPeriod
                 displayTime = vsync.nextFrameTime
             }
-            func sessionTime(_ time: TimeInterval) -> Int32 {
-                session.now() &+ Int32((time - CACurrentMediaTime()) * 1_000_000)
+            // The display's times are on the media clock; the session wants the system's uptime.
+            func uptime(_ time: TimeInterval) -> UInt64 {
+                UInt64(max(0, Double(Uptime.nanoseconds) + (time - CACurrentMediaTime()) * 1e9))
             }
-            session.displayWillRefresh(at: sessionTime(displayTime + period), period: period)
+            session.displayRefreshes(at: uptime(displayTime + period), period: period)
             if let picked, picked.isNew {
-                session.frameDisplayed(picked.frame.frameID, displayTime: sessionTime(displayTime))
+                session.frameShown(picked.frame.frameID, at: uptime(displayTime))
             }
         }
         guard let picked, picked.isNew, let profile else {
@@ -283,7 +284,7 @@ public final class RealityKitDisplay {
             return
         }
         let frame = picked.frame
-        makeSets(for: frame.metadata, frusta: profile.eyeFrusta)
+        makeSets(for: frame.layout.eyePixels, frusta: profile.eyeFrusta)
         guard sets.count == 3, let commands = queue.makeCommandBuffer() else { return }
         framesDrawn += 1
         let set = sets[framesDrawn % 3]
@@ -303,14 +304,14 @@ public final class RealityKitDisplay {
             pass.colorAttachments[0].storeAction = .store
             pass.rasterizationRateMap = foveated?.target.maps[eye.rawValue]
             guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { return }
-            let hostEye = frame.metadata.renderPose.placing(profile.eyesInHead[eye.rawValue])
+            let hostEye = frame.layout.views[eye.rawValue].eye
             hostEyes.append(hostEye)
             // The left eye goes in the lower half of the texture, which is
             // the half the left material reads.
             encoder.setViewport(foveated?.target.viewport(eye)
                                 ?? MTLViewport(originX: 0, originY: eye == .left ? Double(eyeSize.height) : 0,
                                                width: Double(eyeSize.width), height: Double(eyeSize.height), znear: 0, zfar: 1))
-            renderer.draw(Composition.quads(for: eye, metadata: frame.metadata, profile: profile), of: frame,
+            renderer.draw(Composition.quads(for: eye, layout: frame.layout), of: frame,
                           from: EyeView(eye: hostEye, frustum: profile.eyeFrusta[eye.rawValue]),
                           with: encoder, commands: commands)
             encoder.endEncoding()

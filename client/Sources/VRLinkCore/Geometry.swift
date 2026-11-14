@@ -33,6 +33,25 @@ public struct Pose {
         self.forward = forward
     }
 
+    /// From a unit quaternion (w, x, y, z); the inverse of `quaternion`.
+    public init(position: Vec3, quaternion q: [Float]) {
+        let (w, x, y, z) = (q[0], q[1], q[2], q[3])
+        self.position = position
+        right = Vec3(1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y))
+        up = Vec3(2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x))
+        forward = Vec3(2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y)) * -1
+    }
+
+    /// Turned about the world-space axis `turn` points along, by its length in radians.
+    public func turned(by turn: Vec3) -> Pose {
+        let angle = turn.dot(turn).squareRoot()
+        guard angle > 1e-6 else { return self }
+        let axis = turn * (1 / angle), c = Float(cos(Double(angle))), s = Float(sin(Double(angle)))
+        // Rodrigues' rotation of each axis.
+        func rotate(_ v: Vec3) -> Vec3 { v * c + axis.cross(v) * s + axis * (axis.dot(v) * (1 - c)) }
+        return Pose(position: position, right: rotate(right), up: rotate(up), forward: rotate(forward))
+    }
+
     /// The same orientation, moved `meters` along its own right axis.
     /// An eye is the head shifted by half the interpupillary distance.
     public func shifted(right meters: Float) -> Pose {
@@ -162,6 +181,19 @@ public struct TrackedPose {
     public var angularVelocity = Vec3(0, 0, 0)
 
     public init(pose: Pose) { self.pose = pose }
+
+    /// The turning rate about the world's axes; `angularVelocity` is about the pose's own.
+    public var worldAngularVelocity: Vec3 {
+        pose.right * angularVelocity.x + pose.up * angularVelocity.y + pose.forward * -angularVelocity.z
+    }
+
+    /// Where this will be `seconds` from now if it keeps moving and turning as it is.
+    public func predicted(seconds: Float) -> TrackedPose {
+        var out = self
+        out.pose = pose.turned(by: worldAngularVelocity * seconds)
+        out.pose.position = pose.position + linearVelocity * seconds
+        return out
+    }
 
     /// The same pose with velocities measured from where it was `seconds` ago.
     public func withVelocities(since earlier: Pose, seconds: Float) -> TrackedPose {

@@ -48,6 +48,32 @@ public struct FrameMetadata {
             down: base.up * (rowsAboveCentre - (inset.y + Float(tileHeight))) / rowsAboveCentre,
             up: base.up * (rowsAboveCentre - inset.y) / rowsAboveCentre)
     }
+
+    /// Feathered border of the foveal tile, as a fraction of its width.
+    static let foveaFeather: Float = 0.06
+
+    /// The frame as tiles: per eye the base tile, then the sharper foveal
+    /// tile over its middle. The atlas holds them top to bottom: left
+    /// fovea, left base, right fovea, right base.
+    public func layout(profile: DeviceProfile) -> FrameLayout {
+        let tiles = Float(atlasHeight / max(1, tileHeight))
+        // Rows are pulled in half a texel so that linear filtering does not
+        // reach into the neighboring tile.
+        let halfTexel = 0.5 / Float(max(1, atlasHeight))
+        func tile(_ index: Int, _ frustum: Frustum, feather: Float) -> FrameLayout.Tile {
+            FrameLayout.Tile(frustum: frustum, top: Float(index) / tiles + halfTexel,
+                             bottom: Float(index + 1) / tiles - halfTexel, feather: feather)
+        }
+        let views = Eye.allCases.map { eye -> FrameLayout.View in
+            let base = profile.eyeFrusta[eye.rawValue]
+            // The eye the host rendered from: the head it rendered for, then the eye's place on that head.
+            return FrameLayout.View(eye: renderPose.placing(profile.eyesInHead[eye.rawValue]), tiles: [
+                tile(eye.rawValue * 2 + 1, base, feather: 0),
+                tile(eye.rawValue * 2, foveaFrustum(eye: eye.rawValue, base: base), feather: FrameMetadata.foveaFeather),
+            ])
+        }
+        return FrameLayout(views: views, eyePixels: (atlasWidth, tileHeight))
+    }
 }
 
 struct FrameDescriptor {
@@ -138,14 +164,24 @@ public final class FrameBuffer {
 /// A complete encoded frame, ready for the decoder.
 public struct EncodedFrame {
     public let frameID: UInt16
+    /// Which of the frame's pictures this is, for a host that encodes each on its own.
+    public let picture: Int
     public let data: FrameBuffer
-    public let metadata: FrameMetadata
+    public let layout: FrameLayout
 
-    public init(frameID: UInt16, data: FrameBuffer, metadata: FrameMetadata) {
+    public init(frameID: UInt16, picture: Int = 0, data: FrameBuffer, layout: FrameLayout) {
         self.frameID = frameID
+        self.picture = picture
         self.data = data
-        self.metadata = metadata
+        self.layout = layout
     }
+}
+
+/// A frame as the assembler finishes it: whole, with the host's metadata.
+struct AssembledFrame {
+    let frameID: UInt16
+    let data: FrameBuffer
+    let metadata: FrameMetadata
 }
 
 /// Turns video packets into frames for a decoder, in order.
@@ -225,7 +261,7 @@ final class FrameAssembler {
     private var next: UInt16?                // the frame id the decoder needs next
     private var waitingForKeyframeSince: Int32?
     private var requests: [SVLElement] = []
-    private var ready: [EncodedFrame] = []
+    private var ready: [AssembledFrame] = []
 
     /// Bumped to ask the host for a keyframe (sent in every pose message)
     private(set) var resetCounter: UInt16 = 0
@@ -237,7 +273,7 @@ final class FrameAssembler {
 
     /// Retransmit requests to send, and frames to decode, since the last call.
     func takeRequests() -> [SVLElement] { defer { requests = [] }; return requests }
-    func takeFrames() -> [EncodedFrame] { defer { ready = [] }; return ready }
+    func takeFrames() -> [AssembledFrame] { defer { ready = [] }; return ready }
 
     // MARK: Input
 
@@ -400,7 +436,7 @@ final class FrameAssembler {
         }
         guard waitingForKeyframeSince == nil, var expected = next else { return }
         while let frame = frames[expected], frame.complete, let data = frame.buffer, let metadata = frame.metadata {
-            ready.append(EncodedFrame(frameID: expected, data: data, metadata: metadata))
+            ready.append(AssembledFrame(frameID: expected, data: data, metadata: metadata))
             frames[expected] = nil
             expected &+= 1
         }

@@ -12,21 +12,84 @@ import VRLinkCore
 /// No output pixel format is requested: asking for one makes VideoToolbox
 /// convert (and on visionOS, copy). Whatever biplanar YCbCr the hardware
 /// produces goes to the GPU as it is, and the sampler converts it to RGB.
-/// A decoded picture as this platform's decoder and renderer agree to pass it:
-/// a VideoToolbox pixel buffer, still on the GPU side.
+/// A decoded frame as this platform's decoder and renderer agree to pass it:
+/// VideoToolbox pixel buffers, still on the GPU side. Steam's VR Link sends
+/// one picture a frame, with every tile in it; WiVRn one for each eye.
 public struct DecodedFrame {
     public let frameID: UInt16
-    public let image: CVPixelBuffer
-    public let metadata: FrameMetadata
+    public let images: [CVPixelBuffer]
+    public let layout: FrameLayout
+
+    public init(frameID: UInt16, images: [CVPixelBuffer], layout: FrameLayout) {
+        self.frameID = frameID
+        self.images = images
+        self.layout = layout
+    }
 }
 
+/// Encoded pictures in, whole decoded frames out: one `PictureDecoder` for
+/// each picture a frame has, and a frame is handed on when all of its
+/// pictures are decoded.
 public final class VideoDecoder {
     public var onImage: ((DecodedFrame) -> Void)?
-    /// Called, on the thread that calls `decode`, when the stream's
-    /// format becomes known and each time it changes.
+    /// Called, on the thread that calls `decode`, when the format of a
+    /// frame's first picture becomes known and each time it changes.
     public var onFormat: ((CMVideoFormatDescription) -> Void)?
 
     public init() {}
+
+    private var decoders: [PictureDecoder] = []
+    private let lock = NSLock()
+    /// Frames some of whose pictures are decoded, oldest first.
+    private var waiting: [(frameID: UInt16, images: [Int: CVPixelBuffer])] = []
+    /// A frame still short of a picture when this many newer ones have
+    /// begun will not get it: that picture was lost on the way.
+    static let framesWaiting = 4
+
+    public func decode(_ frame: EncodedFrame) {
+        while decoders.count <= frame.picture {
+            let picture = decoders.count
+            let decoder = PictureDecoder()
+            decoder.onImage = { [weak self] frameID, image, layout in
+                self?.decoded(frameID, picture: picture, image, layout)
+            }
+            if picture == 0 { decoder.onFormat = { [weak self] in self?.onFormat?($0) } }
+            decoders.append(decoder)
+        }
+        decoders[frame.picture].decode(frame)
+    }
+
+    private func decoded(_ frameID: UInt16, picture: Int, _ image: CVPixelBuffer, _ layout: FrameLayout) {
+        if layout.pictures <= 1 {
+            onImage?(DecodedFrame(frameID: frameID, images: [image], layout: layout))
+            return
+        }
+        lock.lock()
+        let index = waiting.firstIndex { $0.frameID == frameID } ?? waiting.count
+        if index == waiting.count { waiting.append((frameID, [:])) }
+        waiting[index].images[picture] = image
+        var whole: [CVPixelBuffer]?
+        if waiting[index].images.count == layout.pictures {
+            whole = (0..<layout.pictures).compactMap { waiting[index].images[$0] }
+            waiting.removeFirst(index + 1)            // and with it, any older frame still short
+        } else if waiting.count > VideoDecoder.framesWaiting {
+            waiting.removeFirst()
+        }
+        lock.unlock()
+        if let whole, whole.count == layout.pictures {
+            onImage?(DecodedFrame(frameID: frameID, images: whole, layout: layout))
+        }
+    }
+}
+
+/// One picture's decoder.
+final class PictureDecoder {
+    var onImage: ((UInt16, CVPixelBuffer, FrameLayout) -> Void)?
+    /// Called, on the thread that calls `decode`, when the stream's
+    /// format becomes known and each time it changes.
+    var onFormat: ((CMVideoFormatDescription) -> Void)?
+
+    init() {}
 
     private var session: VTDecompressionSession?
     private var format: CMVideoFormatDescription?
@@ -113,7 +176,7 @@ public final class VideoDecoder {
 
     /// Decode one frame. The frame's memory is taken over: it goes to
     /// VideoToolbox as it is, with no copy, so a frame can be decoded once.
-    public func decode(_ frame: EncodedFrame) {
+    func decode(_ frame: EncodedFrame) {
         let whole = UnsafeBufferPointer(frame.data.bytes)
         if let seen = AnnexB.keyframeCodec(whole), seen != codec {
             if let codec { Log.note("decoder: the stream changed from \(codec.rawValue) to \(seen.rawValue)") }
@@ -162,7 +225,7 @@ public final class VideoDecoder {
             // into the format description.
             let units = AnnexB.units(in: UnsafeBufferPointer(memory))
             for unit in units where unit.size > 0 {
-                let (type, isParameterSet) = VideoDecoder.classify(memory[unit.payload], codec)
+                let (type, isParameterSet) = PictureDecoder.classify(memory[unit.payload], codec)
                 guard isParameterSet else { continue }
                 let bytes = Bytes(memory[unit.payload..<unit.payload + unit.size])
                 if parameterSets[type] != bytes {
@@ -234,7 +297,7 @@ public final class VideoDecoder {
             infoFlagsOut: nil
         ) { [weak self] status, _, image, _, _ in
             if status == noErr, let image {
-                self?.onImage?(DecodedFrame(frameID: frame.frameID, image: image, metadata: frame.metadata))
+                self?.onImage?(frame.frameID, image, frame.layout)
             } else {
                 self?.noteFailure(status)
             }

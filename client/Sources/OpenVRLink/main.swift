@@ -32,6 +32,8 @@ final class ViewerView: MTKView {
     var onHeadChanged: ((HeadPose) -> Void)?
     var onSwapEyes: (() -> Void)?
     let controllers = HeldControllers()
+    var swaying = false
+    private let started = Date()
     private var keysDown = Set<String>()
     private var lastStep = Date()
     private var previous = HeadPose(position: Vec3(0, 1.6, 0))
@@ -62,6 +64,10 @@ final class ViewerView: MTKView {
         let seconds = Float(now.timeIntervalSince(lastStep))
         lastStep = now
         guard seconds > 0 else { return }
+        if swaying {
+            // Testing aid: look left and right by itself, a turn every eight seconds.
+            head.yaw = 0.6 * Float(sin(now.timeIntervalSince(started) * .pi / 4))
+        }
         let facing = HeadPose(position: head.position, yaw: head.yaw).pose   // level: ignores pitch
         var ahead: Float = 0, sideways: Float = 0
         if keysDown.contains("w") { ahead += 1 }
@@ -107,15 +113,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let decoder = VideoDecoder()
     let microphone = MicrophoneInput()
     let faceCamera = FaceCamera()
-    var session: StreamSession?
+    var session: (any StreamingSession)?
     var movementTimer: Timer?
 
     let simulatedLoss: Double
     var audioOutput: AudioOutput?
 
-    init(hostAddress: String?, simulatedLoss: Double) {
+    /// Whether the host is a WiVRn one, as against Steam.
+    let wivrn: Bool
+
+    init(hostAddress: String?, simulatedLoss: Double, wivrn: Bool) {
         self.hostAddress = hostAddress
         self.simulatedLoss = simulatedLoss
+        self.wivrn = wivrn
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -132,6 +142,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             $0.scaled(horizontal: settings.fovScaleHorizontal, vertical: settings.fovScaleVertical)
         }
         view = ViewerView(frame: NSRect(x: 0, y: 0, width: 900, height: 900))
+        view.swaying = sway
         view.preferredFramesPerSecond = refreshHz
         print("display refreshes at \(refreshHz) Hz")
         guard let renderer = WindowDisplay(view: view, profile: profile, settings: settings)
@@ -150,7 +161,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
 
         decoder.onImage = { [weak self, renderer] frame in
-            self?.session?.frameDecoded(frame.frameID)
+            for picture in frame.images.indices { self?.session?.frameDecoded(frame.frameID, picture: picture) }
             renderer.frames.push(frame)
         }
         view.onSwapEyes = { [weak self] in
@@ -165,7 +176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         movementTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 120, repeats: true) { [weak self] _ in
             self?.view.stepMovement()
         }
-        Thread.detachNewThread { [self] in connect(profile: profile) }
+        Thread.detachNewThread { [self] in wivrn ? connectWiVRn(profile: profile) : connect(profile: profile) }
     }
 
     private var hostName = ""
@@ -177,6 +188,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setTitle(_ text: String) {
         print(text)
         DispatchQueue.main.async { self.window.title = "OpenVRLink — " + text }
+    }
+
+    /// Connect to a WiVRn host and start streaming: video and the head, so far.
+    private func connectWiVRn(profile: DeviceProfile) {
+        do {
+            var address = hostAddress ?? ""
+            if hostAddress == nil {
+                setTitle("looking for WiVRn hosts")
+                let browser = ServiceBrowser(type: "_wivrn._tcp")
+                let found = DispatchSemaphore(value: 0)
+                browser.start { services in
+                    guard let first = services.first, address.isEmpty else { return }
+                    print("  \(first.name) at \(first.host)")
+                    address = first.host
+                    found.signal()
+                }
+                // The browser has to outlive the wait: it stops listening when it goes.
+                let heard = withExtendedLifetime(browser) { found.wait(timeout: .now() + 5) }
+                guard heard == .success else { throw WiVRnError.unreachable("any address; none announced itself") }
+            }
+            setTitle("connecting to WiVRn on \(address)")
+            let session = try WiVRnSession.connect(host: address, profile: profile,
+                                                   name: (Host.current().localizedName ?? "Mac") + " (OpenVRLink)")
+            session.onLog = { Log.note($0) }
+            session.onFrame = { [decoder] frame in decoder.decode(frame) }
+            session.start()
+            DispatchQueue.main.async {
+                self.session = session
+                self.renderer.session = session
+                self.audioOutput = AudioOutput(buffer: session.audio)
+                session.setHead(self.view.head.tracked)
+            }
+            hostName = address
+            showEyeInTitle()
+        } catch {
+            print("could not start: \(error)")
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+        }
     }
 
     /// Find the host, pair with it if needed, and start streaming. Blocks for
@@ -274,26 +323,34 @@ let quitSignals = [SIGTERM, SIGINT].map { number -> DispatchSourceSignal in
     return source
 }
 // Arguments: an optional host address; `--mic` to send this Mac's microphone
-// to the host; and `--loss <percent>`, a testing aid that throws away that
-// share of incoming video and audio to exercise loss recovery on a clean network.
+// to the host; `--loss <percent>`, a testing aid that throws away that
+// share of incoming video and audio to exercise loss recovery on a clean
+// network; `--wivrn`, for a host that runs WiVRn and not Steam; and
+// `--sway`, a testing aid that turns the head left and right by itself.
 var hostAddress: String?
 var simulatedLoss = 0.0
 var useMicrophone = false
+var wivrn = false
+var sway = false
 var arguments = CommandLine.arguments.dropFirst()
 while let argument = arguments.popFirst() {
     if argument == "--loss", let percent = arguments.popFirst().flatMap(Double.init) {
         simulatedLoss = percent / 100
     } else if argument == "--mic" {
         useMicrophone = true
+    } else if argument == "--wivrn" {
+        wivrn = true
+    } else if argument == "--sway" {
+        sway = true
     } else if hostAddress == nil, !argument.hasPrefix("-") {
         hostAddress = argument
     } else {
-        print("usage: OpenVRLink [host address] [--mic] [--loss <percent>]")
+        print("usage: OpenVRLink [host address] [--mic] [--loss <percent>] [--wivrn] [--sway]")
         exit(2)
     }
 }
 let application = NSApplication.shared
-let delegate = AppDelegate(hostAddress: hostAddress, simulatedLoss: simulatedLoss)
+let delegate = AppDelegate(hostAddress: hostAddress, simulatedLoss: simulatedLoss, wivrn: wivrn)
 application.delegate = delegate
 application.setActivationPolicy(.regular)
 application.run()
