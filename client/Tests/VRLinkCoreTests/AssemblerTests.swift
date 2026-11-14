@@ -28,7 +28,7 @@ final class AssemblerTests: XCTestCase {
             let blocks: [Bytes] = (0..<8).map { slot in
                 let index = stripe * 8 + slot
                 guard index < count else { return Bytes(repeating: 0, count: 1024) }
-                var block = dataPackets[index].value
+                var block = Bytes(dataPackets[index].value)
                 block.append(zeros: 1024 - block.count)
                 return block
             }

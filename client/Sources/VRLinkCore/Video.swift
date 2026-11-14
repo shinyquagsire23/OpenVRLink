@@ -63,7 +63,9 @@ struct FrameDescriptor {
     let valueTransportBytes: Bytes
 
     init(_ element: SVLElement) {
+        // A part of the datagram: `byte` and `integer(at:)` count from its start.
         let value = element.value
+        func byte(_ offset: Int) -> UInt8 { value[value.startIndex + offset] }
         frameID = element.id
         txTime = value.integer(at: 0x00)
         hostClockOffset = value.integer(at: 0x04)
@@ -71,15 +73,15 @@ struct FrameDescriptor {
         let declared = Int(value.integer(at: 0x16) as UInt16)
         let metadataSize = declared == 0 ? 0xF0 : declared
         hostVersion = value.integer(at: 0x18)
-        fecMode = value.count > 0x0D ? value[0x0D] : 0
+        fecMode = value.count > 0x0D ? byte(0x0D) : 0
         metadata = FrameMetadata(Bytes(value.dropFirst(0x20).prefix(metadataSize)))
         // The trailer's counted sections; what follows them is stale host memory.
         let trailer = 0x20 + metadataSize
-        if value.count >= trailer + 16, value[trailer + 0x0C] == 3 {
-            let records = Int(value[trailer + 0x0D]), events = Int(value[trailer + 0x0E])
+        if value.count >= trailer + 16, byte(trailer + 0x0C) == 3 {
+            let records = Int(byte(trailer + 0x0D)), events = Int(byte(trailer + 0x0E))
             let start = trailer + 0x10 + 32 * records + 8 * events
-            let end = min(start + Int(value[trailer + 0x0F]), value.count)
-            valueTransportBytes = start < end ? Bytes(value[start..<end]) : []
+            let end = min(start + Int(byte(trailer + 0x0F)), value.count)
+            valueTransportBytes = start < end ? Bytes(value.dropFirst(start).prefix(end - start)) : []
         } else {
             valueTransportBytes = []
         }
@@ -99,9 +101,12 @@ public final class FrameBuffer {
     public private(set) var count: Int
 
     /// A block with room for `capacity` bytes, holding a frame of `count`.
+    /// The room past the frame's end is zeros.
     init(count: Int, capacity: Int) {
-        memory = UnsafeMutableRawPointer(malloc(max(capacity, count, 1))!).assumingMemoryBound(to: UInt8.self)
+        let size = max(capacity, count, 1)
+        memory = UnsafeMutableRawPointer(malloc(size)!).assumingMemoryBound(to: UInt8.self)
         self.count = count
+        if size > count { (memory! + count).update(repeating: 0, count: size - count) }
     }
 
     /// A copy of `bytes`; for tests and for frames that do not come from the network.
@@ -155,6 +160,7 @@ public struct EncodedFrame {
 /// until that keyframe arrives.
 final class FrameAssembler {
     static let packetSize = FEC.packetSize
+    private static let zeroPacket = Bytes(repeating: 0, count: FEC.packetSize)
     static let firstParityID = 0x800
     /// In a retransmit request, in place of a packet id: "resend the descriptor".
     static let descriptorRequestID: UInt16 = 0xFFFF
@@ -179,8 +185,8 @@ final class FrameAssembler {
         /// Which data packets are in the buffer.
         var have: Set<Int> = []
         /// Data packets that arrived before the size was known.
-        var early: [Int: Bytes] = [:]
-        var parity: [Int: Bytes] = [:]       // keyed by parity index: stripe * 2 (P) or stripe * 2 + 1 (Q)
+        var early: [Int: ByteSlice] = [:]
+        var parity: [Int: ByteSlice] = [:]   // keyed by parity index: stripe * 2 (P) or stripe * 2 + 1 (Q)
         var highestGroup = 0
         var lastActivity: Int32 = 0          // last packet received or request sent
         var lastPacket: Int32 = 0            // last packet received
@@ -192,7 +198,7 @@ final class FrameAssembler {
         var dataCount: Int { (size + packetSize - 1) / packetSize }
 
         /// Stores a data packet
-        mutating func store(_ index: Int, _ packet: Bytes) {
+        mutating func store(_ index: Int, _ packet: ByteSlice) {
             guard index < dataCount, !have.contains(index) else { return }
             if buffer == nil { buffer = FrameBuffer(count: size, capacity: dataCount * packetSize) }
             let room = min(packet.count, packetSize)
@@ -204,14 +210,13 @@ final class FrameAssembler {
             have.insert(index)
         }
 
-        /// Pops a data packet out of the buffer, zero-extended to full length.
-        /// Returns nil if it has not arrived yet.
-        func packet(_ index: Int) -> Bytes? {
+        /// A data packet where it lies in the buffer, at full length: the
+        /// short last packet runs on into the zeros after the frame, which
+        /// is how the host encoded it. Nil if it has not arrived yet.
+        /// Good only while the frame's buffer is.
+        func packet(_ index: Int) -> UnsafeBufferPointer<UInt8>? {
             guard have.contains(index), let buffer else { return nil }
-            let length = min(packetSize, size - index * packetSize)
-            var out = Bytes(UnsafeBufferPointer(start: buffer.bytes.baseAddress! + index * packetSize, count: length))
-            out.append(zeros: packetSize - length)
-            return out
+            return UnsafeBufferPointer(start: buffer.bytes.baseAddress! + index * packetSize, count: packetSize)
         }
     }
 
@@ -333,14 +338,16 @@ final class FrameAssembler {
             let missing = ids.filter { $0 < frame.dataCount && !frame.have.contains($0) }
             let p = frame.parity[stripe * 2], q = frame.parity[stripe * 2 + 1]
             guard !missing.isEmpty, missing.count <= (p == nil ? 0 : 1) + (q == nil ? 0 : 1) else { continue }
-            // Packets past the end of the frame are known zeros, and the short
-            // last packet is zero-extended, exactly as the host encoded them.
-            let blocks: [Bytes?] = ids.map { id in
-                id >= frame.dataCount ? Bytes(repeating: 0, count: FEC.packetSize) : frame.packet(id)
+            // The packets that arrived are read where they lie in the frame.
+            // Packets past the end of the frame are known zeros, exactly as
+            // the host encoded them.
+            let rebuilt: [Int: Bytes]? = FrameAssembler.zeroPacket.withUnsafeBufferPointer { zeros in
+                FEC.repair(data: ids.map { $0 >= frame.dataCount ? zeros : frame.packet($0) }, p: p, q: q)
             }
-            guard let repaired = FEC.repair(data: blocks, p: p, q: q) else { continue }
+            guard let rebuilt else { continue }
             for id in missing {
-                frame.store(id, repaired[id - stripe * FEC.dataPerStripe])
+                guard let packet = rebuilt[id - stripe * FEC.dataPerStripe] else { continue }
+                frame.store(id, packet[...])
                 repairedByFEC += 1
             }
         }
@@ -400,8 +407,11 @@ final class FrameAssembler {
         next = expected
         // If later frames are finished and have waited too long for this one,
         // or the host can no longer resend it, then it is not coming.
-        let waiting = frames.filter { $0.value.complete && Int16(bitPattern: $0.key &- expected) > 0 }
-        let oldestWait = waiting.values.map { now &- $0.completedAt }.max() ?? 0
+        // (A plain loop: this runs for every packet.)
+        var oldestWait: Int32 = 0
+        for (id, frame) in frames where frame.complete && Int16(bitPattern: id &- expected) > 0 {
+            oldestWait = max(oldestWait, now &- frame.completedAt)
+        }
         let outOfWindow = Int16(bitPattern: newest &- expected) >= Int16(FrameAssembler.frameWindow)
         if oldestWait > FrameAssembler.giveUpAfter || outOfWindow {
             framesAbandoned += 1

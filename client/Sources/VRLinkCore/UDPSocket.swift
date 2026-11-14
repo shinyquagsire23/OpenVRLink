@@ -112,27 +112,41 @@ public final class UDPSocket {
         }
     }
 
+    /// No datagram of this protocol is longer.
+    static let largestDatagram = 2084
+
     /// One datagram, or nil if none arrives within the timeout.
     public func receive(timeout seconds: Double) -> Bytes? {
-        receiveFrom(timeout: seconds)?.bytes
+        receive(timeout: seconds, sender: nil)
     }
 
     /// One datagram and the address it came from.
     public func receiveFrom(timeout seconds: Double) -> (bytes: Bytes, sender: String)? {
-        var poller = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
-        guard poll(&poller, 1, Int32(max(0, seconds) * 1000)) > 0 else { return nil }
-        var buffer = Bytes(repeating: 0, count: 2084)
         var address = sockaddr_in()
-        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let count = withUnsafeMutablePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                recvfrom(descriptor, &buffer, buffer.count, 0, $0, &length)
-            }
-        }
-        guard count > 0 else { return nil }
+        guard let bytes = receive(timeout: seconds, sender: &address) else { return nil }
         var text = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
         inet_ntop(AF_INET, &address.sin_addr, &text, socklen_t(text.count))
-        return (Bytes(buffer.prefix(count)), String(cString: text))
+        return (bytes, String(cString: text))
+    }
+
+    /// The datagram is received straight into the array that is returned:
+    /// its memory is not filled first, and nothing is copied afterwards.
+    private func receive(timeout seconds: Double, sender: UnsafeMutablePointer<sockaddr_in>?) -> Bytes? {
+        var poller = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
+        guard poll(&poller, 1, Int32(max(0, seconds) * 1000)) > 0 else { return nil }
+        let bytes = Bytes(unsafeUninitializedCapacity: UDPSocket.largestDatagram) { buffer, count in
+            var received = 0
+            if let sender {
+                var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+                received = sender.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    recvfrom(descriptor, buffer.baseAddress, buffer.count, 0, $0, &length)
+                }
+            } else {
+                received = recv(descriptor, buffer.baseAddress, buffer.count, 0)
+            }
+            count = max(0, received)
+        }
+        return bytes.isEmpty ? nil : bytes
     }
 
     /// Every address on the local IPv4 subnets, for sweeping. Subnets with

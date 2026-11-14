@@ -40,12 +40,16 @@ extension Primitives {
 
     private static func crypt(_ bytes: Bytes, key: Bytes, iv: Bytes?, encrypting: Bool, options: CCOptions) -> Bytes? {
         guard key.count == kCCKeySizeAES128 || key.count == kCCKeySizeAES256 else { return nil }
-        var out = Bytes(repeating: 0, count: bytes.count + Primitives.block)
-        var moved = 0
-        let status = CCCrypt(CCOperation(encrypting ? kCCEncrypt : kCCDecrypt), CCAlgorithm(kCCAlgorithmAES), options,
-                             key, key.count, iv, bytes, bytes.count, &out, out.count, &moved)
-        guard status == kCCSuccess else { return nil }
-        return Bytes(out.prefix(moved))
+        // Written straight into the array that is returned, which is neither
+        // filled first nor copied afterwards: this runs for every datagram.
+        var status = CCCryptorStatus(kCCSuccess)
+        let out = Bytes(unsafeUninitializedCapacity: bytes.count + Primitives.block) { buffer, count in
+            var moved = 0
+            status = CCCrypt(CCOperation(encrypting ? kCCEncrypt : kCCDecrypt), CCAlgorithm(kCCAlgorithmAES), options,
+                             key, key.count, iv, bytes, bytes.count, buffer.baseAddress, buffer.count, &moved)
+            count = status == kCCSuccess ? moved : 0
+        }
+        return status == kCCSuccess ? out : nil
     }
 
     /// RSA-OAEP with SHA-1, to a public key given as a DER

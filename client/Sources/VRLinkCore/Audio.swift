@@ -20,41 +20,56 @@ public final class PlaybackBuffer {
     static let maximum = sampleRate * 120 / 1000 // 120ms
 
     private let lock = NSLock()
-    private var samples: [Int16] = [] // interleaved
+    /// Interleaved samples in a ring: `stored` of them, the oldest at
+    /// `oldest`, wrapping at the end. Nothing is shifted as audio is
+    /// played, and nothing is allocated on the audio device's thread.
+    private var ring = [Int16](repeating: 0, count: PlaybackBuffer.maximum * PlaybackBuffer.channels)
+    private var oldest = 0, stored = 0
     private var playing = false
     public private(set) var underruns = 0
     public private(set) var overflows = 0
 
     public init() {}
 
-    func write(_ pcm: ArraySlice<UInt8>) {
+    func write(_ pcm: ByteSlice) {
         lock.lock()
-        var index = pcm.startIndex
-        while index + 1 < pcm.endIndex {
-            samples.append(Int16(bitPattern: UInt16(pcm[index]) | UInt16(pcm[index + 1]) << 8))
-            index += 2
-        }
-        let excess = samples.count - PlaybackBuffer.maximum * PlaybackBuffer.channels
-        if excess > 0 {
-            samples.removeFirst(excess + (PlaybackBuffer.maximum - PlaybackBuffer.startThreshold) * PlaybackBuffer.channels)
+        defer { lock.unlock() }
+        // With no room for all of it, the oldest audio goes first: all but
+        // what playback needs to start from, so that the delay which built
+        // up is shed in one step.
+        let arriving = pcm.count / 2
+        if stored + arriving > ring.count {
+            let kept = min(stored, PlaybackBuffer.startThreshold * PlaybackBuffer.channels)
+            oldest = (oldest + stored - kept) % ring.count
+            stored = kept
             overflows += 1
         }
-        lock.unlock()
+        var index = pcm.startIndex
+        var slot = (oldest + stored) % ring.count
+        for _ in 0..<min(arriving, ring.count - stored) {
+            ring[slot] = Int16(bitPattern: UInt16(pcm[index]) | UInt16(pcm[index + 1]) << 8)
+            index += 2
+            slot = slot + 1 == ring.count ? 0 : slot + 1
+            stored += 1
+        }
     }
 
     /// Fill `output` for the audio device
     public func read(into output: UnsafeMutableBufferPointer<Int16>) {
         lock.lock()
         defer { lock.unlock() }
-        if !playing, samples.count >= PlaybackBuffer.startThreshold * PlaybackBuffer.channels { playing = true }
-        guard playing, samples.count >= output.count else {
-            if playing, !samples.isEmpty { underruns += 1 }
+        if !playing, stored >= PlaybackBuffer.startThreshold * PlaybackBuffer.channels { playing = true }
+        guard playing, stored >= output.count else {
+            if playing, stored > 0 { underruns += 1 }
             playing = false
             for index in output.indices { output[index] = 0 }
             return
         }
-        for index in output.indices { output[index] = samples[index] }
-        samples.removeFirst(output.count)
+        for index in output.indices {
+            output[index] = ring[oldest]
+            oldest = oldest + 1 == ring.count ? 0 : oldest + 1
+        }
+        stored -= output.count
     }
 }
 
@@ -67,9 +82,9 @@ final class AudioReceiver {
 
     private struct Group {
         var number: Int
-        var a: Bytes?
-        var b: Bytes?
-        var parity: (payload: Bytes, shorterLength: Int)?
+        var a: ByteSlice?
+        var b: ByteSlice?
+        var parity: (payload: ByteSlice, shorterLength: Int)?
         var aPlayed = false
         var bPlayed = false
     }
@@ -113,13 +128,13 @@ final class AudioReceiver {
     }
 
     /// The missing one of A and B is the XOR of the parity and the other
-    private func rebuild(from other: Bytes, parity: (payload: Bytes, shorterLength: Int)) -> Bytes {
+    private func rebuild(from other: ByteSlice, parity: (payload: ByteSlice, shorterLength: Int)) -> ByteSlice {
         // The two data packets have lengths max = parity length and min = shorterLength.
         let length = other.count == parity.payload.count ? parity.shorterLength : parity.payload.count
-        var out = parity.payload
-        for index in 0..<min(other.count, out.count) { out[index] ^= other[index] }
+        var out = Bytes(parity.payload)
+        for (index, byte) in other.prefix(out.count).enumerated() { out[index] ^= byte }
         recovered += 1
-        return Bytes(out.prefix(length))
+        return out.prefix(length)
     }
 
     /// Play what can be played in order, A then B
@@ -130,7 +145,7 @@ final class AudioReceiver {
                 current.a = rebuild(from: b, parity: parity)
             }
             if let a = current.a {
-                buffer.write(a[...])
+                buffer.write(a)
                 current.aPlayed = true
             }
         }
@@ -139,7 +154,7 @@ final class AudioReceiver {
                 current.b = rebuild(from: a, parity: parity)
             }
             if let b = current.b {
-                buffer.write(b[...])
+                buffer.write(b)
                 current.bPlayed = true
             }
         }
@@ -150,7 +165,7 @@ final class AudioReceiver {
         guard let current = group else { return }
         if !current.aPlayed { lost += 1 }
         if !current.bPlayed {
-            if let b = current.b { buffer.write(b[...]) } else { lost += 1 }
+            if let b = current.b { buffer.write(b) } else { lost += 1 }
         }
     }
 }

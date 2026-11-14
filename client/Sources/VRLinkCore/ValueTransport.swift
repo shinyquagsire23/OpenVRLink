@@ -105,8 +105,12 @@ public final class ValueTransport {
             // the host repeats it forever.
             acksOwed.append((version, id, UInt16(chunk)))
             var incoming: Incoming
+            // Taken out of the table while it is written to, so that its
+            // bytes have one owner and the chunk goes in without a copy
+            // of the whole value.
             if let current = inProgress[id], current.version == version {
                 incoming = current
+                inProgress[id] = nil
             } else {
                 if inProgress[id] == nil, remote[id]?.version == version { continue }   // duplicate of a finished value
                 incoming = Incoming(version: version, data: Bytes(repeating: 0, count: total),

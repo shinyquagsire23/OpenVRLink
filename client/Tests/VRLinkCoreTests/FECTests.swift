@@ -34,7 +34,9 @@ final class FECTests: XCTestCase {
                 received[first] = nil
                 received[second] = nil
                 let repaired = FEC.repair(data: Array(received[0..<8]), p: received[8], q: received[9])
-                XCTAssertEqual(repaired, data, "lost \(first) and \(second)")
+                let lost = [first, second].filter { $0 < 8 }
+                XCTAssertEqual(repaired, Dictionary(lost.map { ($0, data[$0]) }, uniquingKeysWith: { a, _ in a }),
+                               "lost \(first) and \(second)")
             }
         }
     }

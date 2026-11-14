@@ -17,7 +17,7 @@ final class MicrophoneTests: XCTestCase {
         // The parity gives back either packet from the other.
         var rebuilt = packets[2].value
         for index in packets[0].value.indices { rebuilt[index] ^= packets[0].value[index] }
-        XCTAssertEqual(Bytes(rebuilt.prefix(300)), packets[1].value)
+        XCTAssertEqual(Bytes(rebuilt.prefix(300)), Bytes(packets[1].value))
         XCTAssertTrue(uplink.takePackets().isEmpty)
     }
 

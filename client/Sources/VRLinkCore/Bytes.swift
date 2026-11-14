@@ -5,6 +5,10 @@
 /// Little-endian byte packing. Everything on the SVL wire is little-endian.
 
 public typealias Bytes = [UInt8]
+/// Part of a `Bytes` without a copy of its own: it keeps the whole array
+/// alive and shares its memory. Its indices are the array's, so code that
+/// reads one counts from `startIndex` (as `integer(at:)` does).
+public typealias ByteSlice = ArraySlice<UInt8>
 
 public struct ByteReader {
     public let bytes: Bytes
@@ -35,18 +39,24 @@ public struct ByteReader {
     public mutating func skip(_ count: Int) { offset += count }
 }
 
-public extension Array where Element == UInt8 {
-    /// Reads past the end as zero, so a short message parses as zeros rather than trapping.
+public extension RandomAccessCollection where Element == UInt8, Index == Int {
+    /// The integer `offset` bytes after the first byte, for an array and
+    /// for a slice of one alike. Reads past the end as zero, so a short
+    /// message parses as zeros rather than trapping.
+    @inlinable
     func integer<T: FixedWidthInteger>(at offset: Int) -> T {
         var value: T = 0
         for index in 0..<MemoryLayout<T>.size where offset + index < count {
-            value |= T(truncatingIfNeeded: self[offset + index]) << T(index * 8)
+            value |= T(truncatingIfNeeded: self[startIndex + offset + index]) << T(index * 8)
         }
         return value
     }
 
+    @inlinable
     func float(at offset: Int) -> Float { Float(bitPattern: integer(at: offset) as UInt32) }
+}
 
+public extension Array where Element == UInt8 {
     mutating func append<T: FixedWidthInteger>(integer value: T) {
         for index in 0..<MemoryLayout<T>.size {
             append(UInt8(truncatingIfNeeded: value >> T(index * 8)))

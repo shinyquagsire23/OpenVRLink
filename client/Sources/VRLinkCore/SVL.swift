@@ -60,16 +60,23 @@ public struct SVLElement {
     public var type: UInt8
     public var id: UInt16            // per class: video frame id
     public var index: UInt16         // per class: video packet id, descriptor group
-    public var value: Bytes
+    /// The payload. For an element off the wire this is a part of the
+    /// datagram it came in, not a copy: a video packet is copied once,
+    /// into its frame.
+    public var value: ByteSlice
 
     public var kind: SVLKind { SVLKind(messageClass, type) }
 
-    public init(_ kind: SVLKind, id: UInt16 = 0, index: UInt16 = 0, value: Bytes) {
+    public init(_ kind: SVLKind, id: UInt16 = 0, index: UInt16 = 0, value: ByteSlice) {
         self.messageClass = kind.messageClass
         self.type = kind.type
         self.id = id
         self.index = index
         self.value = value
+    }
+
+    public init(_ kind: SVLKind, id: UInt16 = 0, index: UInt16 = 0, value: Bytes) {
+        self.init(kind, id: id, index: index, value: value[...])
     }
 }
 
@@ -130,7 +137,7 @@ public enum SVL {
                 elements.append(SVLElement(SVLKind(datagram[offset], datagram[offset + 1]),
                                            id: datagram.integer(at: offset + 2),
                                            index: datagram.integer(at: offset + 6),
-                                           value: Bytes(datagram[offset + 8..<end])))
+                                           value: datagram[offset + 8..<end]))
             }
             offset = end
         }

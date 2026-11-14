@@ -526,9 +526,9 @@ public final class StreamSession {
                 if simulatedLoss > 0, Double.random(in: 0..<1) < simulatedLoss { break }
                 audioReceiver.accept(element)
             case .valueTransport:
-                valuesCompleted(values.receive(element.value))
+                valuesCompleted(values.receive(Bytes(element.value)))
             case .haptics:
-                for pulse in HapticPulse.parse(element.value, seen: &hapticsSeen) {
+                for pulse in HapticPulse.parse(Bytes(element.value), seen: &hapticsSeen) {
                     hapticPulses += 1
                     onHaptic?(pulse)
                 }
@@ -536,8 +536,10 @@ public final class StreamSession {
                 onLog?("host: " + String(decoding: element.value.dropFirst(4), as: UTF8.self))
             default:
                 // the host's address list, and anything unknown
-                noteForStudy("message class \(element.messageClass) type 0x" + String(element.kind.type, radix: 16),
-                             element.value, version: nil)
+                if StreamSession.studyingHost {
+                    noteForStudy("message class \(element.messageClass) type 0x" + String(element.kind.type, radix: 16),
+                                 Bytes(element.value), version: nil)
+                }
             }
         }
     }
