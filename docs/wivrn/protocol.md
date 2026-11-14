@@ -10,8 +10,7 @@ description of what goes over the wire and an implementation written from it
 (`client/Sources/VRLinkCore/WiVRn/`).
 
 Not done yet: encryption and pairing (the host must be started with
-`--no-encrypt`), the microphone, face and eye tracking, the transparency
-stream, the host's list of applications.
+`--no-encrypt`), the host's list of applications.
 
 ## One release, one protocol
 
@@ -136,6 +135,27 @@ of the frustum, the picture being linear in the tangent of the angle.
 (**measured**); drawn as 25 quads per eye, hello_xr's cubes are square and no
 seams show.
 
+The bands change while streaming, and the two eyes' need not match: one eye
+came in 11 bands across while the other came in 17 (**measured**, 2026-11-14,
+with no gaze sent). A band of no pixels is left out, so the eyes do not have
+the same number of quads.
+
+### Transparency (**source**, **measured** with WayVR's see-through mode)
+
+A headset that declares passthrough lets applications ask for a picture with
+transparent parts. The first shard of each frame says whether this frame has
+any; when it has, a frame of stream 2 comes with it: one picture, as wide as
+an eye's and half as tall, whose brightness is how opaque the colors are. The
+left eye's is in its left half and the right eye's in its right, each squeezed
+by the same bands as the colors (so a point at `(u, v)` of an eye's picture is
+at `((u + eye) / 2, v)` of this one, in fractions). The colors come already
+multiplied by the opacity.
+
+The third stream is encoded like the others and counts against the encoder:
+1600 x 1600 per eye for a 120 Hz display fell to 97 frames a second when
+WayVR's transparent background brought it in (**measured**), so the client's
+budget counts it from the start.
+
 ## Tracking (**source**, **measured** for the head)
 
 The host says which devices it wants located and how far ahead of the asking
@@ -211,13 +231,34 @@ A WiVRn host does not ask for rates itself. This client asks for the lowest
 rate the display offers, and asks the display for the same: the encoder's
 budget (above) then buys the most pixels a frame.
 
+### Eyes and face (**source**; not yet seen to act)
+
+Where the eyes look is one more pose in the tracking packet, device 89: on
+the head, at its origin, facing the point looked at. The face goes at the end
+of the tracking packet as one of several forms; this client sends
+XR_FB_face_tracking2's (form 2): a sample time, 70 weights, the confidence in
+the lower and the upper face, and two flags. `headset_info_packet` says
+whether either will come.
+
 ## Clock
 
 All times are the headset's. The host sends `timesync_query` with a time of its
 own and the headset returns it with its own time beside it; from those the host
 works out the offset. The headset estimates nothing.
 
-## Audio (**source**; not listened to yet)
+## Audio (**source**; the speaker **measured**, the microphone not yet heard)
 
 Raw interleaved 16-bit PCM at the format the headset offered, in `audio_data`
 packets on the stream, with no parity.
+
+The microphone goes the other way in the same packet, at the format offered
+for it (one channel at 48 kHz here), but only while the host wants it: it
+sends `feature_control` (feature 1) on and off as something on the host
+starts and stops listening.
+
+## Loss
+
+A picture given up for want of a shard is reported to the host, which makes
+that eye's next frame a keyframe. What arrives for that eye before the
+keyframe builds on the missing picture: the client reports those as lost
+too and gives none of them to the decoder.

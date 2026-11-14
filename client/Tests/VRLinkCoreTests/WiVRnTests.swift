@@ -66,6 +66,17 @@ final class WiVRnTests: XCTestCase {
         // kind, 4 sizes, 2 rates, settings (21), speaker (6), no microphone,
         // 2 frusta, 7 flags, trackers, 1 codec, no depth, name, language, country, variant
         XCTAssertEqual(info.packet.count, 1 + 8 + 10 + 21 + 6 + 1 + 32 + 7 + 4 + 6 + 1 + 5 + 4 + 4 + 2)
+        // A microphone adds its channel count and rate.
+        var withMicrophone = info
+        withMicrophone.microphone = true
+        XCTAssertEqual(withMicrophone.packet.count, info.packet.count + 5)
+        // A face adds a time, 70 weights, two confidences and two flags.
+        let face = FaceExpressions(weights: [Float](repeating: 0.5, count: 70))
+        let withFace = WiVRnPacket.tracking(produced: 1, time: 2, views: [view, view], holding: [0, 0],
+                                            poses: [WiVRnDevicePose(WiVRn.Device.head, TrackedPose(pose: view.pose))], face: face)
+        XCTAssertEqual(withFace.count, tracking.count + 8 + 280 + 8 + 2)
+        // kind, a time, a length, the samples
+        XCTAssertEqual(WiVRnPacket.audio(time: 1, samples: [1, 2, 3, 4]).count, 1 + 8 + 2 + 4)
     }
 
     func testHandAndInputPacketsAreAsLongAsTheirFields() {
@@ -132,6 +143,15 @@ final class WiVRnTests: XCTestCase {
         XCTAssertEqual(WiVRnDisplayMemory.settled(again, host: "a", file: file)[0].left, -1.3)
     }
 
+    func testMicrophoneAudioIsCutToFitADatagramAndNotKeptForever() {
+        let microphone = WiVRnMicrophone()
+        microphone.capture(Bytes(repeating: 1, count: 3000))
+        XCTAssertEqual(microphone.take().map(\.count), [1200, 1200, 600])
+        XCTAssertTrue(microphone.take().isEmpty)
+        microphone.capture(Bytes(repeating: 1, count: WiVRnMicrophone.most + 500))
+        XCTAssertEqual(microphone.take().reduce(0) { $0 + $1.count }, WiVRnMicrophone.most)
+    }
+
     func testLongListsHaveATwoPartLength() {
         var out = Bytes()
         out.append(size: 0x7FFE)
@@ -172,6 +192,25 @@ final class WiVRnTests: XCTestCase {
         XCTAssertEqual(tiles[2].frustum.right, 0.5, accuracy: 1e-6)
         XCTAssertEqual(tiles[0].frustum.up, 1, accuracy: 1e-6)
         XCTAssertEqual(tiles[0].frustum.down, -0.8, accuracy: 1e-6)
+    }
+
+    /// The picture of transparency has the left eye in its left half and the right eye in its right.
+    func testTransparencyIsFoundInItsHalfOfTheThirdPicture() {
+        let view = WiVRnView(pose: Pose(position: Vec3(0, 0, 0), quaternion: [1, 0, 0, 0]), frustum: .symmetric(halfAngleDegrees: 45))
+        let squeeze = WiVRnFoveation(across: [10, 60, 10], down: [80])
+        let opaque = WiVRnSession.layout(views: [view, view], foveation: [squeeze, squeeze], encoded: (80, 80))
+        XCTAssertFalse(opaque.transparent)
+        XCTAssertEqual(opaque.pictures, 2)
+        let layout = WiVRnSession.layout(views: [view, view], foveation: [squeeze, squeeze], encoded: (80, 80), alpha: true)
+        XCTAssertTrue(layout.transparent)
+        XCTAssertEqual(layout.pictures, 3)
+        let left = layout.views[0].tiles[1].alpha, right = layout.views[1].tiles[1].alpha
+        XCTAssertEqual(left?.picture, 2)
+        XCTAssertEqual(left?.left ?? -1, 0.0625, accuracy: 1e-6)          // 10 of 80 pixels in, halved
+        XCTAssertEqual(left?.right ?? -1, 0.4375, accuracy: 1e-6)
+        XCTAssertEqual(right?.left ?? -1, 0.5625, accuracy: 1e-6)
+        XCTAssertEqual(right?.bottom ?? -1, 1, accuracy: 1e-6)
+        XCTAssertNotNil(Composition.quads(for: .right, layout: layout)[1].alpha)
     }
 
     private func parsed(_ packet: Bytes) -> WiVRnShard {

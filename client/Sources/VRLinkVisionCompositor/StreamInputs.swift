@@ -48,6 +48,9 @@ public final class StreamInputs {
         guard var profile = measured.value?.profile else { return nil }
         let chosen = settings.current
         profile.senseControllerModels = chosen.senseControllerModels
+        // Both renderers can say where the eyes look: one from the display's
+        // rate map, the other from the Persona's eyes.
+        profile.tracksGaze = true
         profile.otherRefreshRates = StreamInputs.displayRates
         profile.eyeFrusta = profile.eyeFrusta.map {
             $0.scaled(horizontal: chosen.fovScaleHorizontal, vertical: chosen.fovScaleVertical)

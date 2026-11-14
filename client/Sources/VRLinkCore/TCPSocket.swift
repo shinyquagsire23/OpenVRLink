@@ -10,9 +10,25 @@ public final class TCPSocket {
     private let sendLock = NSLock()
 
     /// Connects to `address` (IPv4, in numbers), giving up after `timeout` seconds.
-    public init?(address: String, port: UInt16, timeout: Double = 5) {
+    /// `interface` names a network interface the connection must use; nil
+    /// lets the system's routing choose.
+    public init?(address: String, port: UInt16, timeout: Double = 5, interface: String? = nil) {
         descriptor = socket(AF_INET, SOCK_STREAM, 0)
         if descriptor < 0 { return nil }
+        if let interface {
+            #if canImport(Darwin)
+            var index = if_nametoindex(interface)
+            guard index != 0,
+                  setsockopt(descriptor, IPPROTO_IP, IP_BOUND_IF, &index, socklen_t(MemoryLayout<UInt32>.size)) == 0
+            else {
+                close(descriptor)
+                return nil
+            }
+            #else
+            close(descriptor)
+            return nil      // binding to an interface is not written for this platform yet
+            #endif
+        }
         var target = sockaddr_in()
         target.sin_family = sa_family_t(AF_INET)
         target.sin_port = port.bigEndian

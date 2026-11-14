@@ -40,6 +40,8 @@ public enum WiVRn {
     /// takes a side, the right hand's follows the left's.
     enum Device {
         static let head: UInt8 = 0
+        /// Where the eyes look, as a pose on the head.
+        static let eyeGaze: UInt8 = 89
         /// What the host asks to vibrate: a controller, its trigger, its thumb rest.
         static let haptics: [UInt8: Side] = [1: .left, 2: .right, 3: .left, 4: .right, 5: .left, 6: .right]
         static func grip(_ side: Side) -> UInt8 { side == .left ? 11 : 14 }
@@ -67,6 +69,12 @@ public enum WiVRn {
     static let viewFullyTracked: UInt64 = 0xF
     /// The kind of host message that says why it is about to close the connection.
     static let serverMessageError: UInt8 = 2
+    /// Which feature a `feature_control` packet turns on or off.
+    static let featureMicrophone: Int32 = 1
+    /// How the face is described (`face_type`): not at all, or as the 70
+    /// weights of XR_FB_face_tracking2. The same number says which form
+    /// the face in a tracking packet takes.
+    static let faceNone: UInt8 = 0, faceFB2: UInt8 = 2
     /// XrSessionState.
     static let sessionStateFocused: Int32 = 5
 
@@ -257,6 +265,7 @@ struct WiVRnHeadsetInfo {
     var frusta: [Frustum]
     var codecs: [WiVRn.Codec]
     var systemName: String
+    var microphone = false, eyeGaze = false, face = false
 
     /// The speaker offered: what `PlaybackBuffer` plays.
     static let speakerChannels: UInt8 = 2, speakerRate: UInt32 = 48_000
@@ -277,17 +286,25 @@ struct WiVRnHeadsetInfo {
         out.append(integer: bitsPerSecond)
         out.append(0)
         out.append(integer: UInt32(0))
-        // A speaker; no microphone.
+        // A speaker, and a microphone if there is one to send.
         out.append(1)
         out.append(WiVRnHeadsetInfo.speakerChannels)
         out.append(integer: WiVRnHeadsetInfo.speakerRate)
-        out.append(0)
+        out.append(microphone ? 1 : 0)
+        if microphone {
+            out.append(1)                           // one channel
+            out.append(integer: UInt32(MicrophoneUplink.sampleRate))
+        }
         for frustum in frusta { out.append(frustum: frustum) }
-        // Hand tracking: yes. Eye gaze, palm pose, user presence, passthrough: none.
+        // Hand tracking: yes. Eye gaze: as said. Palm pose and user presence: no.
+        // Passthrough: yes, which lets applications ask for a transparent picture.
         out.append(1)
-        out.append(zeros: 4)
-        // Face and body tracking: none; no other trackers.
+        out.append(eyeGaze ? 1 : 0)
         out.append(zeros: 2)
+        out.append(1)
+        // The face as FB's weights, or not at all; no body tracking; no other trackers.
+        out.append(face ? WiVRn.faceFB2 : WiVRn.faceNone)
+        out.append(0)
         out.append(integer: UInt32(0))
         out.append(size: codecs.count)
         for codec in codecs { out.append(integer: codec.rawValue) }
@@ -371,7 +388,7 @@ enum WiVRnPacket {
     /// `time`, worked out at `produced`; with it, each eye's place on the
     /// head and its frustum. `holding` is an `InteractionProfile` for each hand.
     static func tracking(produced: Int64, time: Int64, views: [WiVRnView], holding: [UInt8],
-                         poses: [WiVRnDevicePose]) -> Bytes {
+                         poses: [WiVRnDevicePose], face: FaceExpressions? = nil) -> Bytes {
         var out: Bytes = [WiVRn.FromHeadset.tracking.rawValue]
         out.append(contentsOf: holding)
         out.append(WiVRn.InteractionProfile.none)   // no gamepad
@@ -391,7 +408,20 @@ enum WiVRnPacket {
             out.append(pose.device)
             out.append(pose.flags)
         }
-        out.append(0)                               // face tracking: none
+        guard let face else {
+            out.append(WiVRn.faceNone)
+            return out
+        }
+        // XR_FB_face_tracking2: when it was sampled, 70 weights, the
+        // confidence in the lower and the upper face, "valid", and "the
+        // eyes' weights follow the eyes" (they are not measured apart here).
+        out.append(WiVRn.faceFB2)
+        out.append(integer: produced)
+        for weight in face.weights { out.append(float: weight) }
+        out.append(float: face.lowerFaceConfidence)
+        out.append(float: face.upperFaceConfidence)
+        out.append(1)
+        out.append(0)
         return out
     }
 
@@ -436,6 +466,15 @@ enum WiVRnPacket {
             out |= UInt32(max(0, min(1023, parts[index] * scale + 512.5))) << shift
             shift = shift &- 10
         }
+        return out
+    }
+
+    /// Microphone audio: 16-bit samples at the format offered, and when they were captured.
+    static func audio(time: Int64, samples: ByteSlice) -> Bytes {
+        var out: Bytes = [WiVRn.FromHeadset.audio.rawValue]
+        out.append(integer: time)
+        out.append(size: samples.count)
+        out.append(contentsOf: samples)
         return out
     }
 

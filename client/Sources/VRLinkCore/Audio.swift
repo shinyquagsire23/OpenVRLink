@@ -170,10 +170,17 @@ final class AudioReceiver {
     }
 }
 
+/// Where a platform's microphone capture puts what it hears: little-endian
+/// signed 16-bit mono at `MicrophoneUplink.sampleRate`, as it comes. Safe to
+/// feed from an audio thread.
+public protocol MicrophoneSink: AnyObject {
+    func capture(_ samples: Bytes)
+}
+
 /// Microphone audio uplink
 /// mono 16-bit samples at 48 kHz, cut into 1024-byte packets with parity info added.
 /// Safe to feed from an audio thread.
-public final class MicrophoneUplink {
+public final class MicrophoneUplink: MicrophoneSink {
     public static let sampleRate = 48_000
     /// 48 kHz, one channel, as the packets' format word: (channels - 1) | (rate / 10) << 2.
     static let formatWord: UInt16 = UInt16(sampleRate / 10) << 2

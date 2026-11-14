@@ -210,8 +210,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             setTitle("connecting to WiVRn on \(address)")
             let session = try WiVRnSession.connect(host: address, profile: profile,
-                                                   name: (Host.current().localizedName ?? "Mac") + " (OpenVRLink)")
+                                                   name: (Host.current().localizedName ?? "Mac") + " (OpenVRLink)",
+                                                   microphone: useMicrophone, preferring: WiredInterfaces.names()) { Log.note($0) }
             session.onLog = { Log.note($0) }
+            if useMicrophone {
+                MicrophoneInput.requestPermission { [microphone] allowed in
+                    let started = allowed && microphone.start(into: session.microphoneSink)
+                    print(started ? "microphone: ready for the host" : "microphone: not available or not permitted")
+                }
+            }
+            // The face experiment, with this Mac's camera standing in for a Persona.
+            if Settings.load().faceFromCamera {
+                faceCamera.faceCalibration = Settings.load().faceCalibration
+                faceCamera.start()
+                session.faceProvider = { [faceCamera] in faceCamera.estimate()?.face }
+            }
             session.handsProvider = { [controllers = view.controllers] in controllers.get() }
             session.onFrame = { [decoder] frame in decoder.decode(frame) }
             session.start()

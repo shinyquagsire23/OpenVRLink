@@ -40,9 +40,15 @@ public final class WiVRnSession: StreamingSession {
     public var handsProvider: (() -> [HandInput?])?
     public var headsetPowerProvider: (() -> PowerState?)?
     public var onHaptic: ((HapticPulse) -> Void)?
-    /// Not sent yet: where the eyes look, and the face.
     public var gazeProvider: (() -> Vec3?)?
     public var faceProvider: (() -> FaceExpressions?)?
+    private let microphone = WiVRnMicrophone()
+    public var microphoneSink: any MicrophoneSink { microphone }
+    /// Whether the host wants the microphone now: it says when something there listens.
+    private var microphoneWanted = false
+    /// A picture given up for want of a shard is followed by ones that
+    /// build on it; nothing of that picture is decoded until a keyframe.
+    private var awaitingKeyframe = [false, false, false]
     public var onRefreshRateRequested: ((Float) -> Void)?
     public var onEnded: ((String) -> Void)?
     /// The last thing the host said was wrong, to give as why the stream ended.
@@ -75,15 +81,17 @@ public final class WiVRnSession: StreamingSession {
     static let encodedPixelsPerSecond = 600e6
     /// Encoders want sides that are multiples of this.
     static let pixelAlignment = 32
+    /// The host's third video stream: how opaque each eye's picture is.
+    static let alphaPicture = 2
     /// Frames of each picture whose progress is remembered for the host.
     static let framesRemembered = 64
     /// The largest packet on the control socket; the host refuses larger ones itself.
     static let largestControlPacket = 16 << 20
 
     private var description: WiVRnVideoDescription?
-    private var assemblers = [ShardAssembler(stream: 0), ShardAssembler(stream: 1)]
+    private var assemblers = (0..<3).map { ShardAssembler(stream: UInt8($0)) }
     /// Progress of recent frames, by picture and by frame number modulo `framesRemembered`.
-    private var feedback = [[WiVRnFeedback?]](repeating: [WiVRnFeedback?](repeating: nil, count: WiVRnSession.framesRemembered), count: 2)
+    private var feedback = [[WiVRnFeedback?]](repeating: [WiVRnFeedback?](repeating: nil, count: WiVRnSession.framesRemembered), count: 3)
     /// Until the host says otherwise: the head, as it is when asked.
     private var pattern: [(device: UInt8, prediction: Int64)] = [(WiVRn.Device.head, 0)]
     /// The rate the stream is asked for, and the display with it: the
@@ -98,8 +106,10 @@ public final class WiVRnSession: StreamingSession {
     /// Set as each frame begins: the hands' joints go once a frame.
     private var jointsDue = true
     private var powerSent: PowerState?
+    private var hasMicrophone = false
     private var foveationNoted: [WiVRnFoveation] = []
-    private var framesReceived = [0, 0], framesLost = [0, 0], hapticPulses = 0
+    private var alphaNoted = false
+    private var framesReceived = [0, 0, 0], framesLost = [0, 0, 0], hapticPulses = 0
 
     private init(control: TCPSocket, stream: UDPSocket, profile: DeviceProfile) {
         self.control = control
@@ -117,16 +127,38 @@ public final class WiVRnSession: StreamingSession {
     /// Connects, and tells the host about the headset. Takes up to a few
     /// seconds; the stream begins once `start` is called.
     /// `name` is what the host lists this headset as.
+    /// `microphone`: whether there is one to send. `preferring` lists
+    /// network interfaces to try first, in order (a platform puts its
+    /// wired ones here); the system's own routing is the fallback.
     public static func connect(host: String, port: UInt16 = WiVRn.defaultPort, profile: DeviceProfile,
-                               name: String) throws -> WiVRnSession {
-        guard let address = TCPSocket.resolve(host), let control = TCPSocket(address: address, port: port),
-              let stream = UDPSocket()
-        else { throw WiVRnError.unreachable(host) }
+                               name: String, microphone: Bool = false, preferring preferred: [String] = [],
+                               onLog: ((String) -> Void)? = nil) throws -> WiVRnSession {
+        guard let address = TCPSocket.resolve(host) else { throw WiVRnError.unreachable(host) }
+        var sockets: (control: TCPSocket, stream: UDPSocket)?
+        for interface in preferred where sockets == nil {
+            if let control = TCPSocket(address: address, port: port, timeout: 1, interface: interface),
+               let stream = UDPSocket(interface: interface) {
+                sockets = (control, stream)
+                onLog?("using wired interface \(interface)")
+            }
+        }
+        if sockets == nil, let control = TCPSocket(address: address, port: port), let stream = UDPSocket() {
+            sockets = (control, stream)
+        }
+        guard let (control, stream) = sockets else { throw WiVRnError.unreachable(host) }
         // A host takes a headset back into a running session only if its
         // frusta are to the bit what they were (docs/wivrn/protocol.md).
         var profile = profile
-        profile.eyeFrusta = WiVRnDisplayMemory.settled(profile.eyeFrusta, host: host)
+        let measured = profile.eyeFrusta
+        profile.eyeFrusta = WiVRnDisplayMemory.settled(measured, host: host)
+        // For when a host refuses a returning headset all the same: what it was told.
+        func text(_ frusta: [Frustum]) -> String {
+            frusta.map { String(format: "%.4f %.4f %.4f %.4f", $0.left, $0.right, $0.down, $0.up) }.joined(separator: " | ")
+        }
+        onLog?("frusta told to the host: " + text(profile.eyeFrusta)
+               + (text(measured) == text(profile.eyeFrusta) ? " (as measured)" : "; measured now: " + text(measured)))
         let session = WiVRnSession(control: control, stream: stream, profile: profile)
+        session.hasMicrophone = microphone
 
         // With encryption off the host wants a key all the same, and does nothing with it.
         let key = (0..<32).map { _ in UInt8.random(in: 0...255) }
@@ -167,7 +199,11 @@ public final class WiVRnSession: StreamingSession {
 
     private func headsetInfo() -> WiVRnHeadsetInfo {
         let render = profile.eyePixels ?? WiVRnSession.defaultEyePixels
-        let perEye = WiVRnSession.encodedPixelsPerSecond / Double(targetHz) / 2
+        // Two eyes, and the picture of transparency, half an eye's size,
+        // which the host encodes as well whenever an application's picture
+        // has transparent parts: with it left out of the sum, WayVR's
+        // see-through mode ran at 97 frames a second for a 120 Hz display.
+        let perEye = WiVRnSession.encodedPixelsPerSecond / Double(targetHz) / 2.5
         let scale = min(1, (perEye / Double(render.width * render.height)).squareRoot())
         func encoded(_ side: Int) -> Int {
             max(WiVRnSession.pixelAlignment, Int(Double(side) * scale) / WiVRnSession.pixelAlignment * WiVRnSession.pixelAlignment)
@@ -177,7 +213,8 @@ public final class WiVRnSession: StreamingSession {
                                 // be the same each time, like the frusta.
                                 refreshRates: Set([profile.refreshHz] + profile.otherRefreshRates).sorted(), preferredRate: targetHz,
                                 bitsPerSecond: WiVRnSession.bitsPerSecond, frusta: profile.eyeFrusta,
-                                codecs: [.h265, .h264], systemName: profile.systemName)
+                                codecs: [.h265, .h264], systemName: profile.systemName,
+                                microphone: hasMicrophone, eyeGaze: profile.tracksGaze, face: profile.tracksEyesOrFace)
     }
 
     // MARK: The control socket
@@ -287,6 +324,11 @@ public final class WiVRnSession: StreamingSession {
             }
 
             let time = WiVRnSession.now()
+            // What the microphone has heard goes as it comes, while the host
+            // wants it; otherwise it is thrown away, not kept for later.
+            for packet in microphone.take() where microphoneWanted {
+                stream.send(WiVRnPacket.audio(time: time, samples: packet))
+            }
             while let next = sends.first, next.at <= time {
                 sends.removeFirst()
                 sendTracking(at: time, prediction: next.prediction)
@@ -306,7 +348,7 @@ public final class WiVRnSession: StreamingSession {
                 onLog?("left eye \(framesReceived[0]) frames/s, right eye \(framesReceived[1]); so far \(framesLost[0]) and \(framesLost[1]) lost"
                        + "; audio \(audio.underruns) underruns, \(audio.overflows) overflows"
                        + (hapticPulses > 0 ? "; \(hapticPulses) haptic pulses played" : ""))
-                framesReceived = [0, 0]
+                framesReceived = [0, 0, 0]
                 hapticPulses = 0
                 nextReport = nextReport.addingTimeInterval(1)
             }
@@ -391,8 +433,19 @@ public final class WiVRnSession: StreamingSession {
                          WiVRn.InteractionProfile.touch: "a controller"]
             onLog?("left hand is now \(names[nowHolding[0]] ?? "?"), right \(names[nowHolding[1]] ?? "?")")
         }
+        // Where the eyes look, as a pose on the head: at the head's own
+        // origin, facing the point looked at.
+        if profile.tracksGaze, let point = gazeProvider?(), length(point) > 0.001 {
+            let forward = point * (1 / length(point))
+            var sideways = forward.cross(Vec3(0, 1, 0))
+            if length(sideways) < 0.001 { sideways = Vec3(1, 0, 0) }
+            let right = sideways * (1 / length(sideways))
+            poses.append(WiVRnDevicePose(WiVRn.Device.eyeGaze,
+                                         Pose(position: Vec3(0, 0, 0), right: right, up: right.cross(forward), forward: forward)))
+        }
         let views = Eye.allCases.map { WiVRnView(pose: profile.eyesInHead[$0.rawValue], frustum: profile.eyeFrusta[$0.rawValue]) }
-        stream.send(WiVRnPacket.tracking(produced: time, time: time + prediction, views: views, holding: holding, poses: poses))
+        stream.send(WiVRnPacket.tracking(produced: time, time: time + prediction, views: views, holding: holding, poses: poses,
+                                         face: profile.tracksEyesOrFace ? faceProvider?() : nil))
 
         // Every input every time, so that one lost is made good by the next.
         if !inputs.isEmpty {
@@ -419,12 +472,13 @@ public final class WiVRnSession: StreamingSession {
     private func handle(_ packet: WiVRnToHeadset) throws {
         switch packet {
         case .videoShard(let shard):
-            guard Int(shard.stream) < assemblers.count else { break }        // transparency: not drawn
+            guard Int(shard.stream) < assemblers.count else { break }
             let stream = Int(shard.stream)
             let result = assemblers[stream].accept(shard, now: WiVRnSession.now())
             for lost in result.abandoned {
                 // A frame that never came whole: the host answers with a keyframe.
                 framesLost[stream] += 1
+                awaitingKeyframe[stream] = true
                 try? sendControl(lost.packet)
             }
             if let whole = result.complete { finished(whole, picture: stream) }
@@ -444,7 +498,7 @@ public final class WiVRnSession: StreamingSession {
         case .videoDescription(let description):
             if description != self.description {
                 self.description = description
-                assemblers = [ShardAssembler(stream: 0), ShardAssembler(stream: 1)]
+                assemblers = (0..<3).map { ShardAssembler(stream: UInt8($0)) }
                 let names = description.codecs.prefix(2).map { WiVRn.Codec(rawValue: $0).map { "\($0)" } ?? "codec \($0)" }
                 onLog?("video: \(description.width) x \(description.height) per eye, \(names.joined(separator: " and ")), "
                        + "\(description.frameRate) frames/s for a \(description.refreshRate) Hz display")
@@ -464,7 +518,12 @@ public final class WiVRnSession: StreamingSession {
         case .refreshRateChange(let hz):
             onLog?("host asked for \(hz) Hz")
             onRefreshRateRequested?(hz)
-        case .featureControl, .cryptoHandshake, .handshake, .other:
+        case .featureControl(let feature, let on):
+            if feature == WiVRn.featureMicrophone, on != microphoneWanted {
+                microphoneWanted = on
+                onLog?(on ? "the host is listening to the microphone" : "the host stopped listening to the microphone")
+            }
+        case .cryptoHandshake, .handshake, .other:
             break
         }
     }
@@ -474,13 +533,25 @@ public final class WiVRnSession: StreamingSession {
         guard let description else { return }
         framesReceived[picture] += 1
         var progress = whole.feedback
+        if awaitingKeyframe[picture] {
+            if AnnexB.keyframeCodec(UnsafeBufferPointer(whole.data.bytes)) == nil {
+                // Builds on a picture that never arrived: told to the host as lost, like that one.
+                try? sendControl(progress.packet)
+                return
+            }
+            awaitingKeyframe[picture] = false
+        }
         progress.sentToDecoder = WiVRnSession.now()
         lock.lock()
         feedback[picture][Int(whole.frame % UInt64(WiVRnSession.framesRemembered))] = progress
         lock.unlock()
         try? sendControl(progress.packet)
         let layout = WiVRnSession.layout(views: whole.views, foveation: whole.foveation,
-                                         encoded: (description.width, description.height))
+                                         encoded: (description.width, description.height), alpha: whole.alpha)
+        if whole.alpha != alphaNoted {
+            alphaNoted = whole.alpha
+            onLog?(whole.alpha ? "video: the picture now has transparent parts" : "video: the picture is opaque again")
+        }
         if whole.foveation != foveationNoted {
             foveationNoted = whole.foveation
             let bands = whole.foveation.map { "\($0.across.count) across and \($0.down.count) down" }
@@ -495,7 +566,12 @@ public final class WiVRnSession: StreamingSession {
     /// rectangle at one scale, and so one tile. What an eye sees is linear
     /// in the tangent of the angle, so a band's share of the unsqueezed
     /// picture is its share of the frustum.
-    static func layout(views: [WiVRnView], foveation: [WiVRnFoveation], encoded: (width: Int, height: Int)) -> FrameLayout {
+    ///
+    /// With `alpha`, a third picture holds how opaque each eye's picture
+    /// is, squeezed the same way: the left eye's in its left half, the
+    /// right eye's in its right half.
+    static func layout(views: [WiVRnView], foveation: [WiVRnFoveation], encoded: (width: Int, height: Int),
+                       alpha: Bool = false) -> FrameLayout {
         var pixels = (width: 0, height: 0)
         let layoutViews = views.indices.map { eye -> FrameLayout.View in
             let whole = views[eye].frustum, squeeze = foveation[eye]
@@ -511,14 +587,20 @@ public final class WiVRnSession: StreamingSession {
                                           right: whole.left + (whole.right - whole.left) * column.source.upperBound,
                                           down: whole.up - (whole.up - whole.down) * row.source.upperBound,
                                           up: whole.up - (whole.up - whole.down) * row.source.lowerBound)
+                    let half = Float(eye) / 2
+                    let transparency = !alpha ? nil : AlphaSource(
+                        picture: WiVRnSession.alphaPicture,
+                        left: half + column.encoded.lowerBound / 2, top: row.encoded.lowerBound,
+                        right: half + column.encoded.upperBound / 2, bottom: row.encoded.upperBound)
                     tiles.append(FrameLayout.Tile(frustum: frustum, picture: eye,
                                                   left: column.encoded.lowerBound, top: row.encoded.lowerBound,
-                                                  right: column.encoded.upperBound, bottom: row.encoded.upperBound))
+                                                  right: column.encoded.upperBound, bottom: row.encoded.upperBound,
+                                                  alpha: transparency))
                 }
             }
             return FrameLayout.View(eye: views[eye].pose, tiles: tiles)
         }
-        return FrameLayout(views: layoutViews, pictures: views.count, eyePixels: pixels)
+        return FrameLayout(views: layoutViews, pictures: views.count + (alpha ? 1 : 0), eyePixels: pixels)
     }
 
     // MARK: What the display side reports
@@ -534,7 +616,7 @@ public final class WiVRnSession: StreamingSession {
     }
 
     public func frameShown(_ frameID: UInt16, at uptimeNanoseconds: UInt64) {
-        report(frameID, pictures: [0, 1]) {
+        report(frameID, pictures: [0, 1, 2]) {
             $0.drawn = WiVRnSession.now()
             $0.displayed = Int64(bitPattern: uptimeNanoseconds)
             $0.timesDisplayed &+= 1
@@ -583,6 +665,8 @@ struct ShardAssembler {
         var data: FrameBuffer
         var views: [WiVRnView]
         var foveation: [WiVRnFoveation]
+        /// Whether a picture of transparency goes with this frame.
+        var alpha: Bool
         var feedback: WiVRnFeedback
     }
 
@@ -643,7 +727,8 @@ struct ShardAssembler {
             }
             offset += part.count
         }
-        return (Whole(frame: shard.frame, data: data, views: views.views, foveation: views.foveation, feedback: frame.feedback),
+        return (Whole(frame: shard.frame, data: data, views: views.views, foveation: views.foveation, alpha: views.alpha,
+                      feedback: frame.feedback),
                 abandoned)
     }
 }
@@ -673,5 +758,33 @@ enum WiVRnDisplayMemory {
         try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? JSONEncoder().encode(known).write(to: file, options: .atomic)
         return measured
+    }
+}
+
+/// Microphone audio waiting to go to the host: fed from the audio thread,
+/// taken by the session's.
+final class WiVRnMicrophone: MicrophoneSink {
+    private let lock = NSLock()
+    private var waiting = Bytes()
+    /// As much as goes in one datagram with room to spare, in bytes; a whole number of samples.
+    static let largestPacket = 1200
+    /// More than this waiting means nobody is taking it: about half a second.
+    static let most = MicrophoneUplink.sampleRate
+
+    func capture(_ samples: Bytes) {
+        lock.lock()
+        waiting.append(contentsOf: samples)
+        if waiting.count > WiVRnMicrophone.most { waiting.removeFirst(waiting.count - WiVRnMicrophone.most) }
+        lock.unlock()
+    }
+
+    func take() -> [ByteSlice] {
+        lock.lock()
+        let all = waiting
+        waiting = []
+        lock.unlock()
+        return stride(from: 0, to: all.count, by: WiVRnMicrophone.largestPacket).map {
+            all[$0..<min($0 + WiVRnMicrophone.largestPacket, all.count)]
+        }
     }
 }

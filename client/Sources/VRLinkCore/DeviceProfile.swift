@@ -116,6 +116,10 @@ public struct DeviceProfile {
     /// the unknown model got 10 bits and the size from the settings
     /// (probed 2026-11-13). Nothing writes that section yet.
     public var tracksEyesOrFace = false
+    /// Whether the platform can say where the eyes look at all, however
+    /// roughly. A WiVRn host is told so; a Steam host learns it from
+    /// `tracksEyesOrFace`, which also changes what headset it is shown.
+    public var tracksGaze = false
 
     private func staticHMDProps() -> Bytes {
         if tracksEyesOrFace {

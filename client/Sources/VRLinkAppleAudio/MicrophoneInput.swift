@@ -25,7 +25,7 @@ public final class MicrophoneInput {
 
     /// Start capturing into `uplink`
     /// Returns False if there is no usable microphone
-    public func start(into uplink: MicrophoneUplink) -> Bool {
+    public func start(into uplink: any MicrophoneSink) -> Bool {
         #if !os(macOS)
         // Playing and recording together. AudioOutput watches for the
         // interruption this change can cause and restarts itself.

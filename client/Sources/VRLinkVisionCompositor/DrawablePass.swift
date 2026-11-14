@@ -14,7 +14,7 @@ import simd
 /// Draw quads into one compositor drawable, both eyes in one pass.
 ///
 /// `quads` is asked once per eye for what that eye should see, given where
-/// the eye is; both eyes must be given the same number of quads. Returns
+/// the eye is; the eyes need not have the same number of quads. Returns
 /// the two eye views used (world space), or none if nothing could be drawn.
 @discardableResult
 func drawQuads(into drawable: LayerRenderer.Drawable, commands: MTLCommandBuffer, renderer: QuadRenderer,

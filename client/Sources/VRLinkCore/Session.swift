@@ -65,6 +65,7 @@ public final class StreamSession: StreamingSession {
     public var audio: PlaybackBuffer { audioReceiver.buffer }
     /// Microphone audio for the host; a platform's capture feeds it.
     public let microphone = MicrophoneUplink()
+    public var microphoneSink: any MicrophoneSink { microphone }
     private var clock = ClockOffset()
     private var statisticsSent = 0
     private let started = Uptime.nanoseconds

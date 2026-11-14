@@ -343,7 +343,8 @@ public final class CompositorDisplay {
         // enough: visionOS shows the room wherever no depth was written,
         // whatever the color there, so the black is a quad of its own,
         // far behind the picture.
-        let roomBehind = frame == nil || profile == nil || renderer.chromaKey != nil
+        // A frame with transparency of its own shows the room through it.
+        let roomBehind = frame == nil || profile == nil || renderer.chromaKey != nil || frame?.layout.transparent == true
         let eyes = drawQuads(into: drawable, commands: commands, renderer: renderer, frame: frame,
                              originFromDevice: lastOriginFromDevice,
                              behind: MTLClearColor(red: 0, green: 0, blue: 0, alpha: roomBehind ? 0 : 1)) { eye, view in

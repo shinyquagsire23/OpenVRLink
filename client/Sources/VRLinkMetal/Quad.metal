@@ -10,8 +10,9 @@ using namespace metal;
 
 // One corner of a quad, for up to two eyes: each eye has its own position
 // on screen and its own part of the decoded frame to show.
-struct Vertex { float4 position[2]; float2 uv[2]; float2 tile; };
-struct Fragment { float4 position [[position]]; float2 uv; float2 tile; uint eye [[flat]]; };
+// alphaUV is where the same corner is in the picture of transparency, when there is one.
+struct Vertex { float4 position[2]; float2 uv[2]; float2 alphaUV[2]; float2 tile; };
+struct Fragment { float4 position [[position]]; float2 uv; float2 alphaUV; float2 tile; uint eye [[flat]]; };
 
 // With vertex amplification every triangle is drawn once per eye, and
 // amplification_id says which eye this copy is for.
@@ -20,6 +21,7 @@ vertex Fragment vertexMain(uint index [[vertex_id]], ushort eye [[amplification_
     Fragment out;
     out.position = vertices[index].position[eye];
     out.uv = vertices[index].uv[eye];
+    out.alphaUV = vertices[index].alphaUV[eye];
     out.tile = vertices[index].tile;
     out.eye = eye;
     return out;
@@ -29,7 +31,8 @@ vertex Fragment vertexMain(uint index [[vertex_id]], ushort eye [[amplification_
 // so there is no color conversion here.
 // keyColor is in the same light as the sampled picture; keyRange is
 // the near and far blend distances.
-struct QuadStyle { float feather; float4 fill; float4 keyColor; float2 keyRange; };
+// hasAlpha: the frame has a picture of transparency (not zero), or is opaque.
+struct QuadStyle { float feather; float hasAlpha; float4 fill; float4 keyColor; float2 keyRange; };
 
 // Whether there is chroma keying at all is fixed when the pipeline is
 // built, so that it costs nothing when off. Its color and distances
@@ -91,6 +94,8 @@ struct Blended {
 // apart); when both show the same one, it is bound twice.
 fragment Blended fragmentMain(Fragment in [[stage_in]], texture2d<float> atlas [[texture(0)]],
                               texture2d<float> otherEyeAtlas [[texture(1)]],
+                              texture2d<float> alpha [[texture(2)]],
+                              texture2d<float> otherEyeAlpha [[texture(3)]],
                               sampler atlasSampler [[sampler(0)]],
                               constant QuadStyle &style [[buffer(0)]]) {
     Blended out;
@@ -102,6 +107,17 @@ fragment Blended fragmentMain(Fragment in [[stage_in]], texture2d<float> atlas [
     half3 color = in.eye == 0 ? half3(atlas.sample(atlasSampler, in.uv).rgb)
                               : half3(otherEyeAtlas.sample(atlasSampler, in.uv).rgb);
     half4 colorOut = half4(color.rgb, 1.0);
+    // A host that sends transparency sends it as a picture of its own,
+    // whose brightness is how opaque the colors are; the colors come
+    // already multiplied by it. Where nothing is opaque nothing is
+    // drawn, and no depth: the room shows.
+    float opacity = 1.0;
+    if (style.hasAlpha != 0.0) {
+        opacity = in.eye == 0 ? alpha.sample(atlasSampler, in.alphaUV).r : otherEyeAlpha.sample(atlasSampler, in.alphaUV).r;
+        if (opacity < 0.02) {
+            discard_fragment();
+        }
+    }
     if (CHROMAKEY_ENABLED) {
         half3 CHROMAKEY_COLOR = half3(style.keyColor.rgb);
         half2 CHROMAKEY_LERP_DIST_RANGE = half2(style.keyRange);
@@ -116,7 +132,7 @@ fragment Blended fragmentMain(Fragment in [[stage_in]], texture2d<float> atlas [
     // ALVR blends that color with "source alpha" for color and alpha
     // alike, which leaves (rgb * a, a * a) in an empty target. The same
     // is written here directly.
-    float4 keyed = float4(float3(colorOut.rgb) * float(colorOut.a), float(colorOut.a * colorOut.a));
+    float4 keyed = float4(float3(colorOut.rgb) * float(colorOut.a), float(colorOut.a * colorOut.a) * opacity);
 
     // A feathered quad (the fovea) fades into the one behind it: it
     // adds its own color times the feather and keeps the rest of what
@@ -124,6 +140,6 @@ fragment Blended fragmentMain(Fragment in [[stage_in]], texture2d<float> atlas [
     float toEdge = min(min(in.tile.x, 1.0 - in.tile.x), min(in.tile.y, 1.0 - in.tile.y));
     float feather = style.feather > 0.0 ? saturate(toEdge / style.feather) : 1.0;
     out.color = keyed * feather;
-    out.cover = float4(feather);
+    out.cover = float4(feather * opacity);
     return out;
 }

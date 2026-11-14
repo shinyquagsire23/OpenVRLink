@@ -18,7 +18,9 @@ What a session hands on with each frame is a `FrameLayout`: for each eye, where 
 host's eye was and a list of tiles, each a part of one decoded picture and the part of
 that eye's view it fills. Steam's VR Link gives two tiles an eye from one atlas (base and
 fovea); WiVRn gives each eye a picture of its own, squeezed in bands, which comes to a
-grid of tiles (`docs/wivrn/protocol.md`). `Composition` turns tiles into quads and knows
+grid of tiles (`docs/wivrn/protocol.md`), and, when an application's picture has
+transparent parts, a third picture saying how opaque each tile's colors are. A frame
+with any transparency gets no black behind it on a headset: the room shows through. `Composition` turns tiles into quads and knows
 nothing of either protocol.
 
 ```swift

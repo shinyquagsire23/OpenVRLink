@@ -8,6 +8,20 @@
 /// Because setting up a world-space renderer for XR is practically the default,
 /// this avoids a lot of headache regarding scaling or shader conventions.
 
+/// Where a part of a picture's transparency is kept, for a host that sends
+/// it apart from the colors: in which decoded picture, and where in it
+/// (0...1, origin top-left). That picture's brightness is how opaque the
+/// colors are, and the colors come already multiplied by it.
+public struct AlphaSource {
+    public var picture: Int
+    public var left, top, right, bottom: Float
+
+    public init(picture: Int, left: Float, top: Float, right: Float, bottom: Float) {
+        self.picture = picture
+        self.left = left; self.top = top; self.right = right; self.bottom = bottom
+    }
+}
+
 /// A rectangle in world space showing part of the decoded frame.
 public struct Quad {
     /// World space, meters: top-left, top-right, bottom-left, bottom-right.
@@ -22,10 +36,14 @@ public struct Quad {
     public var fill: [Float]?
     /// Which of the frame's decoded pictures it shows.
     public var picture: Int
+    /// Where its transparency is, when the frame has any.
+    public var alpha: AlphaSource?
 
     public init(corners: [Vec3], atlasLeft: Float = 0, atlasTop: Float = 0, atlasRight: Float = 0,
-                atlasBottom: Float = 0, feather: Float = 0, fill: [Float]? = nil, picture: Int = 0) {
+                atlasBottom: Float = 0, feather: Float = 0, fill: [Float]? = nil, picture: Int = 0,
+                alpha: AlphaSource? = nil) {
         self.picture = picture
+        self.alpha = alpha
         self.corners = corners
         self.atlasLeft = atlasLeft; self.atlasTop = atlasTop
         self.atlasRight = atlasRight; self.atlasBottom = atlasBottom
@@ -71,9 +89,12 @@ public struct FrameLayout {
         public var left, top, right, bottom: Float
         /// Soft border, as a fraction of its width.
         public var feather: Float
+        /// Where its transparency is, when the frame has any.
+        public var alpha: AlphaSource?
 
         public init(frustum: Frustum, picture: Int = 0, left: Float = 0, top: Float = 0, right: Float = 1,
-                    bottom: Float = 1, feather: Float = 0) {
+                    bottom: Float = 1, feather: Float = 0, alpha: AlphaSource? = nil) {
+            self.alpha = alpha
             self.frustum = frustum
             self.picture = picture
             self.left = left; self.top = top; self.right = right; self.bottom = bottom
@@ -107,6 +128,10 @@ public struct FrameLayout {
         self.eyePixels = eyePixels
     }
 
+    /// Whether what is behind the picture shows through any of it: the
+    /// room on a headset, then, and no black put behind the picture.
+    public var transparent: Bool { views.contains { $0.tiles.contains { $0.alpha != nil } } }
+
     /// No picture at all; for tests and placeholders.
     public static let empty = FrameLayout(views: [], eyePixels: (0, 0))
 }
@@ -125,7 +150,7 @@ public enum Composition {
         return view.tiles.map { tile in
             Quad(corners: tile.frustum.corners(from: view.eye, distance: distance),
                  atlasLeft: tile.left, atlasTop: tile.top, atlasRight: tile.right, atlasBottom: tile.bottom,
-                 feather: tile.feather, picture: tile.picture)
+                 feather: tile.feather, picture: tile.picture, alpha: tile.alpha)
         }
     }
 }

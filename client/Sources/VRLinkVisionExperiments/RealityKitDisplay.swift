@@ -187,8 +187,11 @@ public final class RealityKitDisplay {
     /// Black behind a picture that is not keyed, so that one narrower
     /// than the display (the field-of-view setting) has a black margin and
     /// not the room. With keying, or with no picture, the room shows.
+    /// Whether the frame now shown has transparent parts of its own: the room shows through them.
+    private var pictureTransparent = false
+
     private func showBackdrop(_ pictureShown: Bool) {
-        backdrop?.isEnabled = pictureShown && renderer.chromaKey == nil
+        backdrop?.isEnabled = pictureShown && renderer.chromaKey == nil && !pictureTransparent
     }
 
     /// Three textures and their planes, for a frame like this one shown through `frusta`.
@@ -298,9 +301,11 @@ public final class RealityKitDisplay {
             let pass = MTLRenderPassDescriptor()
             pass.colorAttachments[0].texture = target
             pass.colorAttachments[0].loadAction = eye == Eye.allCases.first ? .clear : .load
-            // Where the picture fades out at its edge it fades to black, unless it is keyed.
+            // Where the picture fades out at its edge it fades to black, unless
+            // it is keyed or has transparent parts of its own.
+            pictureTransparent = frame.layout.transparent
             pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0,
-                                                                alpha: renderer.chromaKey == nil ? 1 : 0)
+                                                                alpha: renderer.chromaKey == nil && !pictureTransparent ? 1 : 0)
             pass.colorAttachments[0].storeAction = .store
             pass.rasterizationRateMap = foveated?.target.maps[eye.rawValue]
             guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { return }

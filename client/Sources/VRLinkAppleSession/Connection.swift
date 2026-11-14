@@ -207,11 +207,12 @@ public final class Connection: ObservableObject {
                 case .steam:
                     guard let (steam, name) = try steamSession(address, profile: profile, cancelled: cancelled) else { return }
                     (session, hostName) = (steam, name)
-                    if microphoneWanted { sendMicrophone(to: steam) }
                 case .wivrn:
-                    guard let wivrn = try wivrnSession(address, profile: profile, cancelled: cancelled) else { return }
+                    guard let wivrn = try wivrnSession(address, profile: profile, microphone: microphoneWanted, cancelled: cancelled)
+                    else { return }
                     (session, hostName) = (wivrn, address)
                 }
+                if microphoneWanted { sendMicrophone(to: session.microphoneSink) }
                 session.onLog = { Log.note($0) }
                 // The host ended it: drop the stream and say why, where the wearer will look.
                 session.onEnded = { [weak self, weak session] reason in
@@ -291,12 +292,14 @@ public final class Connection: ObservableObject {
 
     /// Connect to a WiVRn host, trying again for as long as nothing
     /// answers there. Nil when the wearer gave up meanwhile.
-    private func wivrnSession(_ address: String, profile: DeviceProfile, cancelled: () -> Bool) throws -> WiVRnSession? {
+    private func wivrnSession(_ address: String, profile: DeviceProfile, microphone: Bool, cancelled: () -> Bool) throws -> WiVRnSession? {
         show("Looking for WiVRn on \(address)")
         while true {
             if cancelled() { return nil }
             do {
-                return try WiVRnSession.connect(host: address, profile: profile, name: deviceName)
+                // Over a cable if there is one that reaches it (the developer strap's Ethernet).
+                return try WiVRnSession.connect(host: address, profile: profile, name: deviceName, microphone: microphone,
+                                                preferring: WiredInterfaces.names()) { Log.note($0) }
             } catch WiVRnError.unreachable {
                 // Not there yet, or the local-network permission is still being asked for.
                 Thread.sleep(forTimeInterval: 1)
@@ -304,12 +307,12 @@ public final class Connection: ObservableObject {
         }
     }
 
-    private func sendMicrophone(to session: StreamSession) {
+    private func sendMicrophone(to sink: any MicrophoneSink) {
         DispatchQueue.main.async {
             MicrophoneInput.requestPermission { allowed in
                 DispatchQueue.main.async {
                     let input = MicrophoneInput()
-                    if allowed, input.start(into: session.microphone) {
+                    if allowed, input.start(into: sink) {
                         self.microphone = input
                         print("Connection: sending mic to the host")
                     } else {

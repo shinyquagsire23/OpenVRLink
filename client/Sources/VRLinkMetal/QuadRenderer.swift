@@ -183,7 +183,7 @@ public final class QuadRenderer {
     /// Flat-colored quads need no frame; quads that show the frame are skipped without one.
     public func draw(eyes: [(quads: [Quad], view: EyeView)], of frame: DecodedFrame?, near: Float, far: Float,
                      with encoder: MTLRenderCommandEncoder, commands: MTLCommandBuffer) {
-        guard let first = eyes.first, eyes.count <= 2 else { return }
+        guard !eyes.isEmpty, eyes.count <= 2 else { return }
         let cvTextures = (frame?.images ?? []).map { texture(for: $0) }
         let pictures = cvTextures.map { $0.flatMap(CVMetalTextureGetTexture) }
         func picture(_ index: Int) -> MTLTexture? { pictures.indices.contains(index) ? pictures[index] : nil }
@@ -193,34 +193,57 @@ public final class QuadRenderer {
         // The key color is compared with the picture as it is sampled:
         // linear light for a linear target, encoded values otherwise.
         let keyColor = (linearOutput ? chromaKey?.linearColor : chromaKey?.color) ?? [0, 0, 0]
-        for index in first.quads.indices {
+        // The eyes need not have the same quads, nor as many: a host that
+        // squeezes each eye's picture around where it looks cuts the two
+        // differently. Each draw carries one quad of each eye, and an eye
+        // that has run out draws nothing in it.
+        func quad(_ slot: Int, _ index: Int) -> Quad? {
+            let quads = eyes[min(slot, eyes.count - 1)].quads
+            return quads.indices.contains(index) ? quads[index] : nil
+        }
+        for index in 0..<(eyes.map { $0.quads.count }.max() ?? 0) {
+            let pair = (0..<2).map { quad($0, index) }
+            guard let style = pair[0] ?? pair[1] else { continue }
             // The picture each eye's copy of this quad shows.
-            let shown = (0..<2).map { picture(eyes[min($0, eyes.count - 1)].quads[index].picture) }
-            if first.quads[index].fill == nil, shown.contains(where: { $0 == nil }) { continue }
+            let shown = pair.map { $0.flatMap { picture($0.picture) } }
+            if style.fill == nil, zip(pair, shown).contains(where: { $0 != nil && $1 == nil }) { continue }
             encoder.setFragmentTexture(shown[0] ?? placeholder, index: 0)
             encoder.setFragmentTexture(shown[1] ?? placeholder, index: 1)
+            // The picture of transparency for each eye's copy, when the frame has one.
+            let alphas = pair.map { $0?.alpha.flatMap { picture($0.picture) } }
+            let hasAlpha = style.fill == nil && !zip(pair, alphas).contains(where: { $0 != nil && $1 == nil })
+            encoder.setFragmentTexture(alphas[0] ?? placeholder, index: 2)
+            encoder.setFragmentTexture(alphas[1] ?? placeholder, index: 3)
             // Four corners; per corner: a clip position per eye, an atlas
             // coordinate per eye, and the corner's place within the quad.
             var vertices: [Float] = []
             for corner in 0..<4 {
                 let across: Float = corner % 2 == 0 ? 0 : 1, down: Float = corner < 2 ? 0 : 1
-                var positions: [Float] = [], coordinates: [Float] = []
+                var positions: [Float] = [], coordinates: [Float] = [], alphaCoordinates: [Float] = []
                 for slot in 0..<2 {
                     let eye = eyes[min(slot, eyes.count - 1)]
-                    let quad = eye.quads[index]
+                    guard let quad = pair[slot] else {
+                        // All four corners at one point: no area, nothing drawn.
+                        positions += [0, 0, 0, 1]
+                        coordinates += [0, 0]
+                        alphaCoordinates += [0, 0]
+                        continue
+                    }
                     positions += eye.view.frustum.project(quad.corners[corner], from: eye.view.eye,
                                                           near: near, far: far, reversed: reversedDepth)
                     coordinates += [across == 0 ? quad.atlasLeft : quad.atlasRight,
                                     down == 0 ? quad.atlasTop : quad.atlasBottom]
+                    alphaCoordinates += [(across == 0 ? quad.alpha?.left : quad.alpha?.right) ?? 0,
+                                         (down == 0 ? quad.alpha?.top : quad.alpha?.bottom) ?? 0]
                 }
-                vertices += positions + coordinates + [across, down, 0, 0]
+                vertices += positions + coordinates + alphaCoordinates + [across, down, 0, 0]
             }
             // QuadStyle: the feather, padding to the color's alignment, the
             // fill color, the key color (padded), the key distances (padded).
-            let style: [Float] = [first.quads[index].feather, 0, 0, 0] + (first.quads[index].fill ?? [0, 0, 0, 0])
+            let styleValues: [Float] = [style.feather, hasAlpha ? 1 : 0, 0, 0] + (style.fill ?? [0, 0, 0, 0])
                 + keyColor + [0, chromaKey?.near ?? 0, chromaKey?.far ?? 1, 0, 0]
             encoder.setVertexBytes(vertices, length: vertices.count * MemoryLayout<Float>.size, index: 0)
-            encoder.setFragmentBytes(style, length: style.count * MemoryLayout<Float>.size, index: 0)
+            encoder.setFragmentBytes(styleValues, length: styleValues.count * MemoryLayout<Float>.size, index: 0)
             encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         }
         let images = frame?.images
