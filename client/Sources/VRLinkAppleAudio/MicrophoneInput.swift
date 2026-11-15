@@ -9,7 +9,7 @@ import VRLinkCore
 public final class MicrophoneInput {
     private let engine = AVAudioEngine()
     private var converter: AVAudioConverter?
-    private let wanted = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: Double(MicrophoneUplink.sampleRate),
+    private let wanted = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: Double(MicrophoneFormat.sampleRate),
                                        channels: 1, interleaved: true)!
 
     public init() {}

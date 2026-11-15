@@ -46,7 +46,7 @@ public final class WiVRnSession: StreamingSession {
     public var onHaptic: ((HapticPulse) -> Void)?
     public var gazeProvider: (() -> Vec3?)?
     public var faceProvider: (() -> FaceExpressions?)?
-    private let microphone = WiVRnMicrophone()
+    private let microphone = WiVRnSession.microphoneQueue()
     public var microphoneSink: any MicrophoneSink { microphone }
     /// Whether the host wants the microphone now: it says when something there listens.
     private var microphoneWanted = false
@@ -97,6 +97,13 @@ public final class WiVRnSession: StreamingSession {
     static let framesRemembered = 64
     /// The largest packet on the control socket; the host refuses larger ones itself.
     static let largestControlPacket = 16 << 20
+
+    /// Maximum microphone payload per UDP datagram in bytes (aligned to whole samples),
+    /// and a half-second backlog limit so audio doesn't accumulate when nobody is consuming it.
+    static let microphonePacket = 1200, microphoneBacklog = MicrophoneFormat.bytesPerSecond / 2
+    static func microphoneQueue() -> MicrophoneQueue {
+        MicrophoneQueue(largestPacket: microphonePacket, most: microphoneBacklog)
+    }
 
     private var description: WiVRnVideoDescription?
     private var assemblers = (0..<3).map { ShardAssembler(stream: UInt8($0)) }
@@ -383,7 +390,7 @@ public final class WiVRnSession: StreamingSession {
             // What the microphone has heard goes as it comes, while the host
             // wants it; otherwise it is thrown away, not kept for later.
             for packet in microphone.take() where microphoneWanted {
-                sendStream(WiVRnPacket.audio(time: time, samples: packet))
+                sendStream(WiVRnPacket.audio(time: time, samples: packet[...]))
             }
             while let next = sends.first, next.at <= time {
                 sends.removeFirst()
@@ -799,33 +806,5 @@ enum WiVRnDisplayMemory {
         try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? JSONEncoder().encode(known).write(to: file, options: .atomic)
         return measured
-    }
-}
-
-/// Microphone audio waiting to go to the host: fed from the audio thread,
-/// taken by the session's.
-final class WiVRnMicrophone: MicrophoneSink {
-    private let lock = NSLock()
-    private var waiting = Bytes()
-    /// As much as goes in one datagram with room to spare, in bytes; a whole number of samples.
-    static let largestPacket = 1200
-    /// More than this waiting means nobody is taking it: about half a second.
-    static let most = MicrophoneUplink.sampleRate
-
-    func capture(_ samples: Bytes) {
-        lock.lock()
-        waiting.append(contentsOf: samples)
-        if waiting.count > WiVRnMicrophone.most { waiting.removeFirst(waiting.count - WiVRnMicrophone.most) }
-        lock.unlock()
-    }
-
-    func take() -> [ByteSlice] {
-        lock.lock()
-        let all = waiting
-        waiting = []
-        lock.unlock()
-        return stride(from: 0, to: all.count, by: WiVRnMicrophone.largestPacket).map {
-            all[$0..<min($0 + WiVRnMicrophone.largestPacket, all.count)]
-        }
     }
 }

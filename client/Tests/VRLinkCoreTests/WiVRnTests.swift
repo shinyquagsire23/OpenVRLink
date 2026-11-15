@@ -144,12 +144,17 @@ final class WiVRnTests: XCTestCase {
     }
 
     func testMicrophoneAudioIsCutToFitADatagramAndNotKeptForever() {
-        let microphone = WiVRnMicrophone()
+        let microphone = WiVRnSession.microphoneQueue()
         microphone.capture(Bytes(repeating: 1, count: 3000))
         XCTAssertEqual(microphone.take().map(\.count), [1200, 1200, 600])
         XCTAssertTrue(microphone.take().isEmpty)
-        microphone.capture(Bytes(repeating: 1, count: WiVRnMicrophone.most + 500))
-        XCTAssertEqual(microphone.take().reduce(0) { $0 + $1.count }, WiVRnMicrophone.most)
+        // Exceeding the half-second limit drops an entire 1200-byte chunk so 16-bit samples stay aligned.
+        microphone.capture(Bytes(repeating: 1, count: 48_000 + 500))
+        let kept = microphone.take()
+        XCTAssertEqual(kept.reduce(0) { $0 + $1.count }, 48_000 + 500 - 1200)
+        XCTAssertTrue(kept.allSatisfy { $0.count % 2 == 0 })
+        // Audio packets consist of a 1-byte type, 8-byte timestamp, 2-byte byte length, and the raw PCM bytes.
+        XCTAssertEqual(WiVRnPacket.audio(time: 1, samples: kept[0][...]).count, 1 + 8 + 2 + 1200)
     }
 
     func testLongListsHaveATwoPartLength() {

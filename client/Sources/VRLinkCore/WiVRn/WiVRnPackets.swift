@@ -302,7 +302,7 @@ struct WiVRnHeadsetInfo {
         out.append(microphone ? 1 : 0)
         if microphone {
             out.append(1)                           // one channel
-            out.append(integer: UInt32(MicrophoneUplink.sampleRate))
+            out.append(integer: UInt32(MicrophoneFormat.sampleRate))
         }
         for frustum in frusta { out.append(frustum: frustum) }
         // Hand tracking: yes. Eye gaze: as said. Palm pose and user presence: no.

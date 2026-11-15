@@ -170,66 +170,97 @@ final class AudioReceiver {
     }
 }
 
-/// Where a platform's microphone capture puts what it hears: little-endian
-/// signed 16-bit mono at `MicrophoneUplink.sampleRate`, as it comes. Safe to
-/// feed from an audio thread.
+/// Audio format used for microphone capture across protocols: 48 kHz little-endian
+/// signed 16-bit mono PCM.
+public enum MicrophoneFormat {
+    public static let sampleRate = 48_000
+    static let bytesPerSecond = sampleRate * 2
+}
+
+/// Receives captured microphone samples formatted as `MicrophoneFormat`.
+/// Implementations must be safe to call from a real-time audio thread.
 public protocol MicrophoneSink: AnyObject {
     func capture(_ samples: Bytes)
 }
 
-/// Microphone audio uplink
-/// mono 16-bit samples at 48 kHz, cut into 1024-byte packets with parity info added.
-/// Safe to feed from an audio thread.
+/// Thread-safe buffer for outgoing microphone audio. The audio thread appends samples,
+/// which are split into packet-sized chunks and drained by the session thread.
+/// If a session stalls and the buffer exceeds its capacity, the oldest chunks are dropped
+/// rather than sending stale audio.
+public final class MicrophoneQueue: MicrophoneSink {
+    private let lock = NSLock()
+    private var waiting: [Bytes] = []
+    private var bytesWaiting = 0
+    private let largestPacket: Int, most: Int
+
+    /// `largestPacket` is the maximum chunk size in bytes (must be a multiple of the sample size).
+    /// `most` is the maximum number of buffered bytes to retain before dropping the oldest chunks.
+    init(largestPacket: Int, most: Int) {
+        self.largestPacket = largestPacket
+        self.most = most
+    }
+
+    public func capture(_ samples: Bytes) {
+        lock.lock()
+        defer { lock.unlock() }
+        for start in stride(from: 0, to: samples.count, by: largestPacket) {
+            waiting.append(Bytes(samples[start..<min(start + largestPacket, samples.count)]))
+        }
+        bytesWaiting += samples.count
+        while bytesWaiting > most, let oldest = waiting.first {
+            bytesWaiting -= oldest.count
+            waiting.removeFirst()
+        }
+    }
+
+    /// Drains and returns all buffered audio chunks captured since the last call.
+    func take() -> [Bytes] {
+        lock.lock()
+        defer { lock.unlock() }
+        let out = waiting
+        waiting = []
+        bytesWaiting = 0
+        return out
+    }
+}
+
+/// Formats microphone audio for VR Link (Steam): splits samples into packets of up to 1024 bytes
+/// and inserts an XOR parity packet after every pair of data packets.
+/// Audio is queued on the audio thread and packetized on the session thread.
 public final class MicrophoneUplink: MicrophoneSink {
-    public static let sampleRate = 48_000
-    /// 48 kHz, one channel, as the packets' format word: (channels - 1) | (rate / 10) << 2.
-    static let formatWord: UInt16 = UInt16(sampleRate / 10) << 2
+    /// Format word for 48 kHz mono: `(channels - 1) | (rate / 10) << 2`.
+    static let formatWord: UInt16 = UInt16(MicrophoneFormat.sampleRate / 10) << 2
     static let largestPacket = 1024
 
-    private let lock = NSLock()
-    private var waiting: [SVLElement] = []
+    /// Buffer at most one second of audio if the session stalls.
+    private let queue = MicrophoneQueue(largestPacket: largestPacket, most: MicrophoneFormat.bytesPerSecond)
     private var sequence: UInt16 = 0
     private var first: Bytes? // the first data packet of the pair being built
 
     public init() {}
 
-    /// Accepts little-endian signed-16-bit mono at 48 kHz
-    public func capture(_ samples: Bytes) {
-        lock.lock()
-        defer { lock.unlock() }
-        var offset = 0
-        while offset < samples.count {
-            let end = min(offset + MicrophoneUplink.largestPacket, samples.count)
-            add(Bytes(samples[offset..<end]))
-            offset = end
-        }
-        // Don't let a stalled session pile up more than about a second
-        if waiting.count > 150 { waiting.removeFirst(waiting.count - 150) }
-    }
+    public func capture(_ samples: Bytes) { queue.capture(samples) }
 
-    private func add(_ payload: Bytes) {
-        waiting.append(SVLElement(.audioVariable, id: sequence, index: MicrophoneUplink.formatWord, value: payload))
-        sequence &+= 1
-        guard let a = first else {
-            first = payload
-            return
-        }
-        // Parity packet
-        var parity = Bytes(repeating: 0, count: max(a.count, payload.count))
-        for index in a.indices { parity[index] ^= a[index] }
-        for index in payload.indices { parity[index] ^= payload[index] }
-        waiting.append(SVLElement(.audioVariable, id: sequence, index: UInt16(min(a.count, payload.count)), value: parity))
-        sequence &+= 1
-        if sequence == 0xFFFF { sequence = 0 } // multiple of 3, so the pairs stay aligned
-        first = nil
-    }
-
-    /// Pop everything captured since the last call, as SVLElements
+    /// Drains queued audio and returns SVL packets ready to send to the host.
+    /// Must only be called from the session thread.
     func takePackets() -> [SVLElement] {
-        lock.lock()
-        defer { lock.unlock() }
-        let out = waiting
-        waiting = []
+        var out: [SVLElement] = []
+        for payload in queue.take() {
+            out.append(SVLElement(.audioVariable, id: sequence, index: MicrophoneUplink.formatWord, value: payload))
+            sequence &+= 1
+            guard let a = first else {
+                first = payload
+                continue
+            }
+            // Parity packet
+            var parity = Bytes(repeating: 0, count: max(a.count, payload.count))
+            for index in a.indices { parity[index] ^= a[index] }
+            for index in payload.indices { parity[index] ^= payload[index] }
+            out.append(SVLElement(.audioVariable, id: sequence, index: UInt16(min(a.count, payload.count)), value: parity))
+            sequence &+= 1
+            if sequence == 0xFFFF { sequence = 0 } // multiple of 3, so the pairs stay aligned
+            first = nil
+        }
         return out
     }
 }
