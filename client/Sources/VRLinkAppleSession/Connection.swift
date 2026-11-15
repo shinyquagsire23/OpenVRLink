@@ -44,6 +44,10 @@ public final class Connection: ObservableObject {
     /// Connecting, with the immersive space still to be opened: it is
     /// opened when there is a picture to show in it.
     @Published public var waitingForPicture = false
+    /// A WiVRn host that does not know this headset is waiting for the PIN
+    /// it shows: the entry window asks for it and answers with `answerPin`.
+    @Published public var askingForPin = false
+    private var pinAnswer: String??
     /// The host the user chose.
     /// When the headset is doffed and re-donned, it will resume from this
     /// host instead of re-asking the user.
@@ -290,15 +294,43 @@ public final class Connection: ObservableObject {
         return (session, host.hostname)
     }
 
+    /// The PIN the wearer types, or nil if they would rather not. Waits for
+    /// as long as they take; the host itself gives up after two minutes.
+    private func askForPin(cancelled: () -> Bool) -> String? {
+        lock.lock()
+        pinAnswer = nil
+        lock.unlock()
+        show("The host wants its PIN")
+        DispatchQueue.main.async { self.askingForPin = true }
+        while !cancelled() {
+            lock.lock()
+            let answer = pinAnswer
+            lock.unlock()
+            if let answer { return answer }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        DispatchQueue.main.async { self.askingForPin = false }
+        return nil
+    }
+
+    /// What was typed when `askingForPin` was set, or nil for "never mind".
+    public func answerPin(_ pin: String?) {
+        lock.lock()
+        pinAnswer = .some(pin)
+        lock.unlock()
+        askingForPin = false
+    }
+
     /// Connect to a WiVRn host, trying again for as long as nothing
     /// answers there. Nil when the wearer gave up meanwhile.
-    private func wivrnSession(_ address: String, profile: DeviceProfile, microphone: Bool, cancelled: () -> Bool) throws -> WiVRnSession? {
+    private func wivrnSession(_ address: String, profile: DeviceProfile, microphone: Bool, cancelled: @escaping () -> Bool) throws -> WiVRnSession? {
         show("Looking for WiVRn on \(address)")
         while true {
             if cancelled() { return nil }
             do {
                 // Over a cable if there is one that reaches it (the developer strap's Ethernet).
-                return try WiVRnSession.connect(host: address, profile: profile, name: deviceName, microphone: microphone,
+                return try WiVRnSession.connect(host: address, profile: profile, name: deviceName,
+                                                pin: { [self] in askForPin(cancelled: cancelled) }, microphone: microphone,
                                                 preferring: WiredInterfaces.names()) { Log.note($0) }
             } catch WiVRnError.unreachable {
                 // Not there yet, or the local-network permission is still being asked for.

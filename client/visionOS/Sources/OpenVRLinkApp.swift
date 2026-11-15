@@ -268,6 +268,7 @@ struct EntryView: View {
     /// What the computer at the typed address runs: an address alone does not say.
     @AppStorage("typedAddressKind") private var typedKind = HostKind.steam
     @State private var askingForAddress = false
+    @State private var typedPin = ""
 
     /// Connect to `address`, and open the immersive space when there is
     /// a picture to show in it: until then the wearer stays where they
@@ -388,6 +389,28 @@ struct EntryView: View {
         }
         .padding(32)
         .task { connection.searchForHosts() }
+        // A WiVRn host that has not met this headset shows a PIN and waits for it.
+        .sheet(isPresented: Binding(get: { connection.askingForPin },
+                                    set: { if !$0, connection.askingForPin { connection.answerPin(nil) } })) {
+            VStack(spacing: 20) {
+                Text("Pair with WiVRn").font(.title2)
+                Text("Type the PIN the computer shows.").foregroundStyle(.secondary)
+                TextField("000000", text: $typedPin)
+                    .textFieldStyle(.roundedBorder)
+                    .keyboardType(.numberPad)
+                    .multilineTextAlignment(.center)
+                    .frame(width: 200)
+                HStack(spacing: 16) {
+                    Button("Cancel") { connection.answerPin(nil) }
+                    Button("Pair") {
+                        connection.answerPin(typedPin.trimmingCharacters(in: .whitespaces))
+                        typedPin = ""
+                    }
+                    .disabled(typedPin.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            }
+            .padding(32)
+        }
         .sheet(isPresented: $askingForAddress) {
             VStack(spacing: 20) {
                 Text("Connect by IP Address").font(.title2)

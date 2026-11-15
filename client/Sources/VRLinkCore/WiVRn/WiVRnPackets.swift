@@ -80,14 +80,14 @@ public enum WiVRn {
 
     /// Which packet, from the headset.
     enum FromHeadset: UInt8 {
-        case cryptoHandshake = 0, headsetInfo = 3, feedback = 5, audio = 6, handshake = 7, tracking = 8
+        case cryptoHandshake = 0, pinCheck1 = 1, pinCheck3 = 2, headsetInfo = 3, feedback = 5, audio = 6, handshake = 7, tracking = 8
         case handTracking = 10, inputs = 15, battery = 17
         case timesyncResponse = 16, refreshRateChanged = 19, sessionStateChanged = 20
     }
 
     /// Which packet, to the headset.
     enum ToHeadsetKind: UInt8 {
-        case cryptoHandshake = 0, handshake = 3, serverMessage = 4, audioDescription = 5, videoDescription = 6
+        case cryptoHandshake = 0, pinCheck2 = 1, pinCheck4 = 2, handshake = 3, serverMessage = 4, audioDescription = 5, videoDescription = 6
         case audio = 7, videoShard = 8, haptics = 9, timesyncQuery = 10, trackingControl = 11
         case featureControl = 12, refreshRateChange = 13
     }
@@ -181,6 +181,9 @@ struct WiVRnVideoDescription: Equatable {
 
 enum WiVRnToHeadset {
     case cryptoHandshake(publicKey: String, state: UInt8)
+    /// The host's halves of the PIN check: its second and fourth messages.
+    case pinCheck2([Natural])
+    case pinCheck4([Natural])
     case handshake(streamPort: Int32)
     case serverMessage(kind: UInt8, text: String)
     case audioDescription(speaker: (channels: UInt8, rate: UInt32)?, microphone: (channels: UInt8, rate: UInt32)?)
@@ -203,6 +206,10 @@ enum WiVRnToHeadset {
         switch WiVRn.ToHeadsetKind(rawValue: kind) {
         case .cryptoHandshake:
             self = .cryptoHandshake(publicKey: reader.string(), state: reader.integer())
+        case .pinCheck2:
+            self = .pinCheck2((0..<WiVRnPinCheck.counts.second).map { _ in Natural(bytes: Bytes(reader.span())) })
+        case .pinCheck4:
+            self = .pinCheck4((0..<WiVRnPinCheck.counts.fourth).map { _ in Natural(bytes: Bytes(reader.span())) })
         case .handshake:
             self = .handshake(streamPort: reader.integer())
         case .serverMessage:
@@ -361,6 +368,18 @@ enum WiVRnPacket {
         return out
     }()
 
+    /// The headset's first or third message of the PIN check. A fixed
+    /// number of numbers, each its bytes (most significant first) with their count in front.
+    static func pinCheck(_ kind: WiVRn.FromHeadset, _ numbers: [Natural]) -> Bytes {
+        var out: Bytes = [kind.rawValue]
+        for number in numbers {
+            let bytes = number.bytes
+            out.append(size: bytes.count)
+            out.append(contentsOf: bytes)
+        }
+        return out
+    }
+
     static let handshake: Bytes = [WiVRn.FromHeadset.handshake.rawValue]
 
     static func timesyncResponse(query: Int64, response: Int64) -> Bytes {
@@ -499,13 +518,6 @@ enum WiVRnPacket {
         return out
     }
 
-    /// A public key as the host wants one, in PEM. With encryption off the
-    /// host only checks that it is a key. This is an X25519 one: the
-    /// fixed twelve bytes that say so, then the key's 32.
-    static func publicKeyPEM(_ key: Bytes) -> String {
-        let prefix: Bytes = [0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x03, 0x21, 0x00]
-        return "-----BEGIN PUBLIC KEY-----\n" + Data(prefix + key).base64EncodedString() + "\n-----END PUBLIC KEY-----\n"
-    }
 }
 
 /// Reads a packet's fields in order. Reading past the end gives zeros and

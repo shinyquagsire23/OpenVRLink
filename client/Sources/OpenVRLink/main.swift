@@ -209,8 +209,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard heard == .success else { throw WiVRnError.unreachable("any address; none announced itself") }
             }
             setTitle("connecting to WiVRn on \(address)")
-            let session = try WiVRnSession.connect(host: address, profile: profile,
+            // A testing aid: "address:port" for a host on another port than WiVRn's own.
+            var port = WiVRn.defaultPort
+            if let colon = address.lastIndex(of: ":"), let given = UInt16(address[address.index(after: colon)...]) {
+                port = given
+                address = String(address[..<colon])
+            }
+            let session = try WiVRnSession.connect(host: address, port: port, profile: profile,
                                                    name: (Host.current().localizedName ?? "Mac") + " (OpenVRLink)",
+                                                   pin: {
+                                                       if let wivrnPin { return wivrnPin }
+                                                       print("The host wants its PIN. Type it here: ", terminator: "")
+                                                       return readLine()?.trimmingCharacters(in: .whitespaces)
+                                                   },
                                                    microphone: useMicrophone, preferring: WiredInterfaces.names()) { Log.note($0) }
             session.onLog = { Log.note($0) }
             if useMicrophone {
@@ -340,12 +351,15 @@ let quitSignals = [SIGTERM, SIGINT].map { number -> DispatchSourceSignal in
 // to the host; `--loss <percent>`, a testing aid that throws away that
 // share of incoming video and audio to exercise loss recovery on a clean
 // network; `--wivrn`, for a host that runs WiVRn and not Steam; and
-// `--sway`, a testing aid that turns the head left and right by itself.
+// `--sway`, a testing aid that turns the head left and right by itself;
+// `--pin <digits>`, the PIN a WiVRn host shows when it pairs (asked for
+// on the terminal when not given).
 var hostAddress: String?
 var simulatedLoss = 0.0
 var useMicrophone = false
 var wivrn = false
 var sway = false
+var wivrnPin: String?
 var arguments = CommandLine.arguments.dropFirst()
 while let argument = arguments.popFirst() {
     if argument == "--loss", let percent = arguments.popFirst().flatMap(Double.init) {
@@ -356,10 +370,12 @@ while let argument = arguments.popFirst() {
         wivrn = true
     } else if argument == "--sway" {
         sway = true
+    } else if argument == "--pin", let digits = arguments.popFirst() {
+        wivrnPin = digits
     } else if hostAddress == nil, !argument.hasPrefix("-") {
         hostAddress = argument
     } else {
-        print("usage: OpenVRLink [host address] [--mic] [--loss <percent>] [--wivrn] [--sway]")
+        print("usage: OpenVRLink [host address] [--mic] [--loss <percent>] [--wivrn] [--sway] [--pin <digits>]")
         exit(2)
     }
 }

@@ -9,7 +9,9 @@ public enum WiVRnError: Error, CustomStringConvertible {
     case noReply
     case closed
     case wrongVersion
-    case encrypted
+    case pinNeeded
+    case wrongPin
+    case pinCheckFailed
     case pairingDisabled
     case unexpected(String)
 
@@ -19,8 +21,10 @@ public enum WiVRnError: Error, CustomStringConvertible {
         case .noReply: return "the host stopped answering"
         case .closed: return "the host closed the connection"
         case .wrongVersion: return "the host runs another release of WiVRn than this client knows (\(WiVRn.release))"
-        case .encrypted: return "the host wants an encrypted stream, which this client does not have yet; start it with --no-encrypt"
-        case .pairingDisabled: return "the host is not accepting new headsets"
+        case .pinNeeded: return "the host wants its PIN, and none was given"
+        case .wrongPin: return "that is not the PIN the host shows"
+        case .pinCheckFailed: return "the PIN could not be checked with the host"
+        case .pairingDisabled: return "the host does not know this headset and is not pairing with new ones"
         case .unexpected(let what): return "the host sent \(what) where something else was due"
         }
     }
@@ -61,6 +65,12 @@ public final class WiVRnSession: StreamingSession {
     private let control: TCPSocket
     private let stream: UDPSocket
     private var controlReceived = Bytes()
+    /// With an encrypting host: each direction of the control socket is one
+    /// long run of AES in counter mode, lengths and all.
+    private var controlIn: Primitives.CounterCipher?
+    private var controlOut: Primitives.CounterCipher?
+    private let controlSendLock = NSLock()
+    private var streamCipher: WiVRnStreamCipher?
 
     private let lock = NSLock()
     private var running = true
@@ -130,8 +140,13 @@ public final class WiVRnSession: StreamingSession {
     /// `microphone`: whether there is one to send. `preferring` lists
     /// network interfaces to try first, in order (a platform puts its
     /// wired ones here); the system's own routing is the fallback.
+    /// `identity` is what the host knows this headset by once paired
+    /// (`WiVRnIdentity.own`). `pin` is asked when the host wants the PIN
+    /// it shows, and may take as long as typing it does (the host waits
+    /// two minutes); nil from it gives up.
     public static func connect(host: String, port: UInt16 = WiVRn.defaultPort, profile: DeviceProfile,
-                               name: String, microphone: Bool = false, preferring preferred: [String] = [],
+                               name: String, identity: Bytes = WiVRnIdentity.own(), pin: (() -> String?)? = nil,
+                               microphone: Bool = false, preferring preferred: [String] = [],
                                onLog: ((String) -> Void)? = nil) throws -> WiVRnSession {
         guard let address = TCPSocket.resolve(host) else { throw WiVRnError.unreachable(host) }
         var sockets: (control: TCPSocket, stream: UDPSocket)?
@@ -160,15 +175,21 @@ public final class WiVRnSession: StreamingSession {
         let session = WiVRnSession(control: control, stream: stream, profile: profile)
         session.hasMicrophone = microphone
 
-        // With encryption off the host wants a key all the same, and does nothing with it.
-        let key = (0..<32).map { _ in UInt8.random(in: 0...255) }
-        try session.sendControl(WiVRnPacket.cryptoHandshake(publicKey: WiVRnPacket.publicKeyPEM(key), name: name))
+        try session.sendControl(WiVRnPacket.cryptoHandshake(publicKey: WiVRnIdentity.pem(identity), name: name))
         guard case .cryptoHandshake(_, let state) = try session.awaitControl() else {
             throw WiVRnError.unexpected("no answer to the first packet")
         }
         switch WiVRn.CryptoState(rawValue: state) {
-        case .encryptionDisabled: break
-        case .pinNeeded, .alreadyPaired: throw WiVRnError.encrypted
+        case .encryptionDisabled:
+            onLog?("the host does not encrypt")
+        case .pinNeeded:
+            guard let typed = pin?() else { throw WiVRnError.pinNeeded }
+            try session.checkPin(typed)
+            onLog?("the host has the same PIN, and knows this headset from now on")
+            try session.encrypt(pin: typed)
+        case .alreadyPaired:
+            onLog?("the host knows this headset")
+            try session.encrypt(pin: WiVRnSecrets.pairedPin)
         case .pairingDisabled: throw WiVRnError.pairingDisabled
         case .incompatibleVersion: throw WiVRnError.wrongVersion
         case nil: throw WiVRnError.unexpected("an answer this client does not know (\(state))")
@@ -186,7 +207,7 @@ public final class WiVRnSession: StreamingSession {
         let deadline = Date().addingTimeInterval(10)
         while !acknowledged {
             guard Date() < deadline else { throw WiVRnError.noReply }
-            stream.send(WiVRnPacket.handshake)
+            session.sendStream(WiVRnPacket.handshake)
             if let packet = try session.awaitControl(timeout: 0.1, required: false) {
                 guard case .handshake = packet else { throw WiVRnError.unexpected("something other than its handshake") }
                 acknowledged = true
@@ -195,6 +216,32 @@ public final class WiVRnSession: StreamingSession {
         try session.sendControl(session.headsetInfo().packet)
         try session.sendControl(WiVRnPacket.sessionState(WiVRn.sessionStateFocused))
         return session
+    }
+
+    /// The PIN check (WiVRnPairing.swift): four messages, the headset's first.
+    private func checkPin(_ pin: String) throws {
+        var check = WiVRnPinCheck(pin: pin)
+        do {
+            try sendControl(WiVRnPacket.pinCheck(.pinCheck1, check.first()))
+            guard case .pinCheck2(let second) = try awaitControl() else { throw WiVRnError.pinCheckFailed }
+            try sendControl(WiVRnPacket.pinCheck(.pinCheck3, try check.third(answering: second)))
+            guard case .pinCheck4(let fourth) = try awaitControl() else { throw WiVRnError.pinCheckFailed }
+            guard try check.matches(fourth) else { throw WiVRnError.wrongPin }
+        } catch is WiVRnPinCheck.Failure {
+            throw WiVRnError.pinCheckFailed
+        }
+    }
+
+    /// From here on everything on both sockets is encrypted.
+    private func encrypt(pin: String) throws {
+        guard let secrets = WiVRnSecrets(pin: pin),
+              let incoming = Primitives.CounterCipher(key: secrets.controlKey, counter: secrets.controlCounterToHeadset),
+              let outgoing = Primitives.CounterCipher(key: secrets.controlKey, counter: secrets.controlCounterFromHeadset)
+        else { throw WiVRnError.pinCheckFailed }
+        // What has come already came before the host began encrypting.
+        controlIn = incoming
+        controlOut = outgoing
+        streamCipher = WiVRnStreamCipher(secrets)
     }
 
     private func headsetInfo() -> WiVRnHeadsetInfo {
@@ -224,7 +271,10 @@ public final class WiVRnSession: StreamingSession {
         var framed = Bytes()
         framed.append(integer: UInt32(packet.count))
         framed.append(contentsOf: packet)
-        guard control.send(framed) else { throw WiVRnError.closed }
+        // Encrypted in the order sent: the cipher carries on from one packet to the next.
+        controlSendLock.lock()
+        defer { controlSendLock.unlock() }
+        guard control.send(controlOut?.apply(framed) ?? framed) else { throw WiVRnError.closed }
     }
 
     /// The next whole packet already received on the control socket.
@@ -239,7 +289,12 @@ public final class WiVRnSession: StreamingSession {
 
     private func readControl() throws {
         guard let bytes = control.receiveAvailable() else { throw WiVRnError.closed }
-        controlReceived.append(contentsOf: bytes)
+        controlReceived.append(contentsOf: controlIn?.apply(bytes) ?? bytes)
+    }
+
+    /// One packet on the stream socket.
+    private func sendStream(_ packet: Bytes) {
+        stream.send(streamCipher?.sealed(packet) ?? packet)
     }
 
     /// Wait for one packet on the control socket.
@@ -313,7 +368,8 @@ public final class WiVRnSession: StreamingSession {
             if readable[0] {
                 // Take what has arrived, not only one: a frame comes as a burst.
                 while let datagram = stream.receive(timeout: 0) {
-                    if let packet = WiVRnToHeadset(datagram) { try handle(packet) }
+                    guard let opened = streamCipher == nil ? datagram : streamCipher?.opened(datagram) else { continue }
+                    if let packet = WiVRnToHeadset(opened) { try handle(packet) }
                 }
             }
             if readable[1] {
@@ -327,7 +383,7 @@ public final class WiVRnSession: StreamingSession {
             // What the microphone has heard goes as it comes, while the host
             // wants it; otherwise it is thrown away, not kept for later.
             for packet in microphone.take() where microphoneWanted {
-                stream.send(WiVRnPacket.audio(time: time, samples: packet))
+                sendStream(WiVRnPacket.audio(time: time, samples: packet))
             }
             while let next = sends.first, next.at <= time {
                 sends.removeFirst()
@@ -444,12 +500,12 @@ public final class WiVRnSession: StreamingSession {
                                          Pose(position: Vec3(0, 0, 0), right: right, up: right.cross(forward), forward: forward)))
         }
         let views = Eye.allCases.map { WiVRnView(pose: profile.eyesInHead[$0.rawValue], frustum: profile.eyeFrusta[$0.rawValue]) }
-        stream.send(WiVRnPacket.tracking(produced: time, time: time + prediction, views: views, holding: holding, poses: poses,
+        sendStream(WiVRnPacket.tracking(produced: time, time: time + prediction, views: views, holding: holding, poses: poses,
                                          face: profile.tracksEyesOrFace ? faceProvider?() : nil))
 
         // Every input every time, so that one lost is made good by the next.
         if !inputs.isEmpty {
-            stream.send(WiVRnPacket.inputs(inputs.map { input in
+            sendStream(WiVRnPacket.inputs(inputs.map { input in
                 var sent = inputsSent[input.id] ?? (input.value, time)
                 if sent.value != input.value { sent = (input.value, time) }
                 inputsSent[input.id] = sent
@@ -462,7 +518,7 @@ public final class WiVRnSession: StreamingSession {
             for side in Side.allCases where pattern.contains(where: { $0.device == WiVRn.Device.hand(side) }) {
                 var joints: [Pose]?
                 if case .hand(let hand) = hands[side.rawValue] { joints = hand.joints }
-                stream.send(WiVRnPacket.handTracking(produced: time, time: time, side: side, joints: joints))
+                sendStream(WiVRnPacket.handTracking(produced: time, time: time, side: side, joints: joints))
             }
         }
     }
@@ -485,7 +541,7 @@ public final class WiVRnSession: StreamingSession {
         case .audio(_, let payload):
             audio.write(payload)
         case .timesyncQuery(let query):
-            stream.send(WiVRnPacket.timesyncResponse(query: query, response: WiVRnSession.now()))
+            sendStream(WiVRnPacket.timesyncResponse(query: query, response: WiVRnSession.now()))
         case .trackingControl(let pattern, _):
             guard !pattern.isEmpty else { break }
             // The host tunes how far ahead as it measures the delay; that it
@@ -523,7 +579,7 @@ public final class WiVRnSession: StreamingSession {
                 microphoneWanted = on
                 onLog?(on ? "the host is listening to the microphone" : "the host stopped listening to the microphone")
             }
-        case .cryptoHandshake, .handshake, .other:
+        case .cryptoHandshake, .pinCheck2, .pinCheck4, .handshake, .other:
             break
         }
     }

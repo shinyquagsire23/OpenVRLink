@@ -4,13 +4,13 @@
 
 import Foundation
 
-/// The five standard cryptographic operations the protocol is made of
-/// (docs/remoteplay/crypto.md, docs/svl-transport/session-args-and-crypto.md),
-/// and nothing of the protocol itself.
+/// The standard cryptographic operations the protocols are made of
+/// (docs/remoteplay/crypto.md, docs/svl-transport/session-args-and-crypto.md,
+/// docs/wivrn/protocol.md), and nothing of the protocols themselves.
 ///
 /// On Apple's systems they are the operating system's own (CryptoKit,
-/// CommonCrypto and Security), so that the app carries no cryptography of
-/// its own. Elsewhere they are swift-crypto's. This is the one place where
+/// CommonCrypto and Security), so that the app encrypts nothing with code
+/// of its own. Elsewhere they are swift-crypto's. This is the one place where
 /// the core chooses by platform instead of being handed a backend: the two
 /// halves below must stay the same, function for function.
 enum Primitives {
@@ -90,6 +90,43 @@ extension Primitives {
         return Bytes(info[(bits.lowerBound + 1)..<bits.upperBound])
     }
 
+    /// PBKDF2 with HMAC-SHA1: `count` bytes from a password and a salt.
+    static func pbkdf2SHA1(password: Bytes, salt: Bytes, rounds: Int, count: Int) -> Bytes? {
+        var out = Bytes(repeating: 0, count: count)
+        let status = password.withUnsafeBytes { secret in
+            CCKeyDerivationPBKDF(CCPBKDFAlgorithm(kCCPBKDF2), secret.bindMemory(to: CChar.self).baseAddress, password.count,
+                                 salt, salt.count, CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA1), UInt32(rounds), &out, count)
+        }
+        return status == Int32(kCCSuccess) ? out : nil
+    }
+
+    /// AES in counter mode: a run of bytes that is the same to encrypt and
+    /// to decrypt, and carries on from one call to the next. The counter is
+    /// a whole block of 16 bytes, counted up as one number, most significant byte first.
+    final class CounterCipher {
+        private var cryptor: CCCryptorRef?
+
+        init?(key: Bytes, counter: Bytes) {
+            guard key.count == kCCKeySizeAES128 || key.count == kCCKeySizeAES256, counter.count == Primitives.block,
+                  CCCryptorCreateWithMode(CCOperation(kCCEncrypt), CCMode(kCCModeCTR), CCAlgorithm(kCCAlgorithmAES),
+                                          CCPadding(ccNoPadding), counter, key, key.count, nil, 0, 0,
+                                          CCModeOptions(kCCModeOptionCTR_BE), &cryptor) == kCCSuccess
+            else { return nil }
+        }
+
+        deinit { CCCryptorRelease(cryptor) }
+
+        func apply<Run: ContiguousBytes>(_ bytes: Run) -> Bytes {
+            bytes.withUnsafeBytes { input in
+                Bytes(unsafeUninitializedCapacity: input.count) { buffer, count in
+                    var moved = 0
+                    let status = CCCryptorUpdate(cryptor, input.baseAddress, input.count, buffer.baseAddress, buffer.count, &moved)
+                    count = status == kCCSuccess ? moved : 0
+                }
+            }
+        }
+    }
+
     /// One side of an X25519 key agreement.
     struct KeyAgreement {
         private let privateKey: Curve25519.KeyAgreement.PrivateKey
@@ -154,6 +191,44 @@ extension Primitives {
               let encrypted = try? key.encrypt(bytes, padding: .PKCS1_OAEP)
         else { return nil }
         return Bytes(encrypted)
+    }
+
+    /// PBKDF2 with HMAC-SHA1: `count` bytes from a password and a salt.
+    static func pbkdf2SHA1(password: Bytes, salt: Bytes, rounds: Int, count: Int) -> Bytes? {
+        let key = try? KDF.Insecure.PBKDF2.deriveKey(from: password, salt: salt, using: .insecureSHA1,
+                                                     outputByteCount: count, unsafeUncheckedRounds: rounds)
+        return key.map { $0.withUnsafeBytes { Bytes($0) } }
+    }
+
+    /// AES in counter mode: a run of bytes that is the same to encrypt and
+    /// to decrypt, and carries on from one call to the next. The counter is
+    /// a whole block of 16 bytes, counted up as one number, most significant byte first.
+    final class CounterCipher {
+        private let key: Bytes
+        private var counter: Bytes
+        /// What is left of the block made from the last counter.
+        private var pad = ByteSlice()
+
+        init?(key: Bytes, counter: Bytes) {
+            guard key.count == 16 || key.count == 32, counter.count == Primitives.block else { return nil }
+            self.key = key
+            self.counter = counter
+        }
+
+        func apply<Run: ContiguousBytes>(_ bytes: Run) -> Bytes {
+            var out = bytes.withUnsafeBytes { Bytes($0) }
+            for index in out.indices {
+                if pad.isEmpty {
+                    pad = (Primitives.aesBlock(counter, key: key, encrypting: true) ?? Bytes(repeating: 0, count: Primitives.block))[...]
+                    for place in counter.indices.reversed() {
+                        counter[place] &+= 1
+                        if counter[place] != 0 { break }
+                    }
+                }
+                out[index] ^= pad.removeFirst()
+            }
+            return out
+        }
     }
 
     /// One side of an X25519 key agreement.
