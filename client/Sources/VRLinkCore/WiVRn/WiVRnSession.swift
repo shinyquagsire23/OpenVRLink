@@ -75,7 +75,9 @@ public final class WiVRnSession: StreamingSession {
     private let lock = NSLock()
     private var running = true
     private var head = HeadPose(position: Vec3(0, 1.6, 0)).tracked
-    private var refreshPeriod: Double
+    /// Tracks the display refresh rate last reported to the host. Protected by `lock`.
+    private var rate: RefreshRate
+    private var refreshPeriod: Double { rate.period }
 
     /// What the host asks of the encoder, bits per second. WiVRn's own default.
     static let bitsPerSecond: UInt32 = 50_000_000
@@ -122,7 +124,7 @@ public final class WiVRnSession: StreamingSession {
     private var holding: [UInt8] = [WiVRn.InteractionProfile.none, WiVRn.InteractionProfile.none]
     /// Set as each frame begins: the hands' joints go once a frame.
     private var jointsDue = true
-    private var powerSent: PowerState?
+    private var powerSent = PowerNews()
     private var hasMicrophone = false
     private var foveationNoted: [WiVRnFoveation] = []
     private var alphaNoted = false
@@ -132,9 +134,9 @@ public final class WiVRnSession: StreamingSession {
         self.control = control
         self.stream = stream
         self.profile = profile
-        // Not what the display runs at now: if it does not go to the rate
-        // asked for, that is noticed as a change and the host is told.
-        refreshPeriod = 1 / Double(([profile.refreshHz] + profile.otherRefreshRates).min() ?? profile.refreshHz)
+        // Initialize to the requested target rate. If the display stays at a different rate,
+        // `rate.follow` will detect the mismatch on the first refresh and notify the host.
+        rate = RefreshRate(hz: ([profile.refreshHz] + profile.otherRefreshRates).min() ?? profile.refreshHz)
     }
 
     private static func now() -> Int64 { Int64(bitPattern: Uptime.nanoseconds) }
@@ -404,8 +406,7 @@ public final class WiVRnSession: StreamingSession {
                 sends = trackingTimes(from: frameStart)
             }
             if Date() >= nextReport {
-                if let power = headsetPowerProvider?()?.rounded, power != powerSent {
-                    powerSent = power
+                if let power = powerSent.news(headsetPowerProvider?()) {
                     try? sendControl(WiVRnPacket.battery(power))
                 }
                 onLog?("left eye \(framesReceived[0]) frames/s, right eye \(framesReceived[1]); so far \(framesLost[0]) and \(framesLost[1]) lost"
@@ -673,15 +674,11 @@ public final class WiVRnSession: StreamingSession {
 
     public func displayRefreshes(at uptimeNanoseconds: UInt64, period: Double) {
         lock.lock()
-        let before = refreshPeriod
-        // The display's rate has changed when the period is off by more than a little.
-        let changed = abs(period - before) > before * 0.02
-        if changed { refreshPeriod = period }
+        let change = rate.follow(period)
         lock.unlock()
-        guard changed else { return }
-        let from = Float((1 / before).rounded()), to = Float((1 / period).rounded())
-        onLog?("display now refreshes at \(to) Hz")
-        try? sendControl(WiVRnPacket.refreshRateChanged(from: from, to: to))
+        guard let change else { return }
+        onLog?(change.note)
+        try? sendControl(WiVRnPacket.refreshRateChanged(from: change.from, to: change.to))
     }
 
     /// Note a step in a frame's progress and tell the host. Called from the decoder's and the display's threads.

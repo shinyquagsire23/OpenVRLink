@@ -56,3 +56,46 @@ public protocol StreamingSession: AnyObject {
     /// When the display's next refresh will be seen, and how far apart refreshes are, in seconds.
     func displayRefreshes(at uptimeNanoseconds: UInt64, period: Double)
 }
+
+/// Tracks the display's refresh rate across protocols. Display APIs only report next-vsync
+/// timestamps and frame intervals rather than explicit rate-change events, so we detect rate
+/// changes here by watching for significant shifts in the measured refresh period.
+struct RefreshRate {
+    /// Frame interval in seconds.
+    private(set) var period: Double
+    /// Refresh rate rounded to the nearest integer Hz, matching what hosts expect.
+    var hz: Float { Float((1 / period).rounded()) }
+    /// Relative period jitter ignored before treating a measurement as a new refresh rate (2%).
+    static let tolerance = 0.02
+
+    struct Change: Equatable {
+        var from: Float, to: Float
+        /// Formatted message for session logs.
+        var note: String { "display now refreshes at \(to) Hz" }
+    }
+
+    init(hz: Float) { period = 1 / Double(hz) }
+
+    /// Updates the tracked period from a display measurement. Returns a `Change` if the period
+    /// shifted beyond `tolerance` so the caller can notify the host, or nil if the rate is unchanged.
+    mutating func follow(_ measured: Double) -> Change? {
+        guard measured > 0, abs(measured - period) > period * RefreshRate.tolerance else { return nil }
+        let before = hz
+        period = measured
+        return Change(from: before, to: hz)
+    }
+}
+
+/// Deduplicates battery status updates for a single device so the host is only notified
+/// when the charge level changes by at least 1% or the charging state flips.
+struct PowerNews {
+    private var told: PowerState?
+
+    /// Returns the rounded battery state if it changed since the last update, or nil if
+    /// unchanged or unavailable on the current platform.
+    mutating func news(_ power: PowerState?) -> PowerState? {
+        guard let power = power?.rounded, power != told else { return nil }
+        told = power
+        return power
+    }
+}

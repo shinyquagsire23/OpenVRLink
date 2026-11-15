@@ -72,7 +72,9 @@ public final class StreamSession: StreamingSession {
     private var sequence: UInt16 = 0
     private var frameCounter: Int32 = 0
     private var frameDisplayTime: Int32 = 0
-    private var framePeriod: Double
+    /// Tracks the display refresh rate last reported to the host.
+    private var rate: RefreshRate
+    private var framePeriod: Double { rate.period }
     private var hostInstance: Bytes?
     /// Nil until the host has said; it says again to a client that returns.
     private var applicationRunning: Bool?
@@ -138,7 +140,7 @@ public final class StreamSession: StreamingSession {
         self.link = link
         self.socket = socket
         self.profile = profile
-        framePeriod = 1 / Double(profile.refreshHz)
+        rate = RefreshRate(hz: profile.refreshHz)
         audioReceiver.onLog = { [weak self] in self?.onLog?($0) }
         for (id, value) in profile.startupValues() { values.publish(id, value) }
         // "The headset has focus": the host logs "Remote was continued".
@@ -167,12 +169,11 @@ public final class StreamSession: StreamingSession {
     /// provider, tells the host "full, not charging".
     public var headsetPowerProvider: (() -> PowerState?)?
     /// The battery states the host was last told, by value id.
-    private var powerPublished: [UInt8: PowerState] = [:]
+    private var powerPublished: [UInt8: PowerNews] = [:]
 
     /// Tell the host a device's battery state if it has changed by a percent or more.
     private func publishPower(_ power: PowerState?, as id: UInt8) {
-        guard let power = power?.rounded, powerPublished[id] != power else { return }
-        powerPublished[id] = power
+        guard let power = powerPublished[id, default: PowerNews()].news(power) else { return }
         values.publish(id, DeviceProfile.powerProps(power, reportsBattery: true), force: true)
     }
     /// Resolves hand gestures and smooths aim rays across pose updates.
@@ -477,7 +478,7 @@ public final class StreamSession: StreamingSession {
                     onLog?("host asked for \(hz) Hz")
                     onRefreshRateRequested?(hz)
                 }
-                publishFrameTime(Float((1 / framePeriod).rounded()), again: false)
+                publishFrameTime(rate.hz, again: false)
             case DeviceProfile.ValueID.propRefresh:
                 values.republishAll()
             case DeviceProfile.ValueID.sceneApplicationRunning:
@@ -606,10 +607,9 @@ public final class StreamSession: StreamingSession {
                     lock.lock()
                     let refresh = nextRefresh, period = refreshPeriod
                     lock.unlock()
-                    if let period, abs(period - framePeriod) > framePeriod * 0.02 {
-                        framePeriod = period
-                        let hz = Float((1 / period).rounded())
-                        onLog?("display now refreshes at \(hz) Hz")
+                    if let period, let change = rate.follow(period) {
+                        let hz = change.to
+                        onLog?(change.note)
                         // Tell the host what the display runs at now; it
                         // switches the stream to match. What is offered stays
                         // as it was, so the host can still choose (and
