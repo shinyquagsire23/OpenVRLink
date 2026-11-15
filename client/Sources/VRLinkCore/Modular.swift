@@ -4,16 +4,15 @@
 
 import Foundation
 
-/// A whole number of any size, zero or more.
+/// Arbitrary-precision unsigned integer (`>= 0`).
 ///
-/// This and `Modulus` are here for one thing: proving to a host that the
-/// PIN typed is the PIN shown (WiVRn/WiVRnPairing.swift), which takes
-/// arithmetic on numbers of 1536 bits that no system library offers. They
-/// encrypt nothing. They take as long as the numbers are large, not a
-/// fixed time, which is of no use to anyone timing a check that is made
-/// once, on a PIN that is then thrown away.
+/// `Natural` and `Modulus` implement the 1536-bit modular arithmetic needed for
+/// PIN verification during WiVRn pairing (`WiVRn/WiVRnPairing.swift`), since
+/// Apple system frameworks do not expose general big-integer arithmetic.
+/// Operations are variable-time, which is acceptable here because pairing runs
+/// once with a single-use ephemeral PIN.
 struct Natural: Equatable, Comparable {
-    /// 64 bits each, the least significant first, with no zero at the top.
+    /// Little-endian 64-bit limbs with trailing zero limbs stripped.
     private(set) var limbs: [UInt64]
 
     static let zero = Natural(limbs: [])
@@ -25,7 +24,7 @@ struct Natural: Equatable, Comparable {
 
     init(_ small: UInt64) { self.init(limbs: [small]) }
 
-    /// From its bytes, the most significant first.
+    /// Initializes from big-endian bytes.
     init(bytes: Bytes) {
         var limbs = [UInt64](repeating: 0, count: (bytes.count + 7) / 8)
         for (index, byte) in bytes.reversed().enumerated() {
@@ -34,14 +33,14 @@ struct Natural: Equatable, Comparable {
         self.init(limbs: limbs)
     }
 
-    /// From hexadecimal digits; anything else in the text is skipped.
+    /// Parses hexadecimal digits, ignoring any non-hex characters.
     init(hex: String) {
         var digits = hex.compactMap { $0.hexDigitValue }.map { UInt8($0) }
         if digits.count % 2 == 1 { digits.insert(0, at: 0) }
         self.init(bytes: stride(from: 0, to: digits.count, by: 2).map { digits[$0] << 4 | digits[$0 + 1] })
     }
 
-    /// Its bytes, the most significant first, as few as hold it: none for zero.
+    /// Minimal big-endian byte representation (empty for zero).
     var bytes: Bytes {
         var out = Bytes()
         for limb in limbs.reversed() {
@@ -80,7 +79,7 @@ struct Natural: Equatable, Comparable {
         return Natural(limbs: out)
     }
 
-    /// `b` must not be the larger.
+    /// Subtracts `b` from `a`; requires `b <= a`.
     static func - (a: Natural, b: Natural) -> Natural {
         precondition(b <= a)
         var out = a.limbs, borrow = false
@@ -104,8 +103,8 @@ struct Natural: Equatable, Comparable {
         return Natural(limbs: out)
     }
 
-    /// What is left after dividing by `divisor`, found a bit at a time:
-    /// slow, and used only to bring a number within a modulus once.
+    /// Computes `self % divisor` via bitwise long division. Slow, but only needed
+    /// once when converting inputs into Montgomery form.
     func remainder(dividingBy divisor: Natural) -> Natural {
         precondition(divisor != .zero)
         var rest = Natural.zero
@@ -118,19 +117,18 @@ struct Natural: Equatable, Comparable {
     }
 }
 
-/// Arithmetic on the numbers below an odd number: products, powers, and
-/// (when the number is prime) inverses.
+/// Modular arithmetic modulo an odd integer: multiplication, exponentiation,
+/// subtraction, and (for prime moduli) multiplicative inverses.
 ///
-/// Products are Montgomery's: numbers are kept multiplied by a power of
-/// two R, so that taking the remainder of a product is a matter of
-/// shifts and no division.
+/// Uses Montgomery multiplication, representing values scaled by `R = 2^(64 * count)`
+/// so modular reduction replaces multi-precision division with shifts and additions.
 struct Modulus {
     let value: Natural
     private let count: Int
     private let limbs: [UInt64]
-    /// The number that times the lowest limb of the modulus gives -1 in 64 bits.
+    /// `-limbs[0]^(-1) mod 2^64`, used to cancel the low limb during Montgomery reduction.
     private let lowInverse: UInt64
-    /// R squared, which brings a number into Montgomery's form when multiplied by.
+    /// `R^2 mod value`, used to convert numbers into Montgomery form.
     private let squaredR: [UInt64]
 
     init(_ value: Natural) {
@@ -138,7 +136,7 @@ struct Modulus {
         self.value = value
         limbs = value.limbs
         count = limbs.count
-        // Each round doubles the number of bits that are right.
+        // Newton-Raphson iteration mod 2^64; each step doubles the number of accurate bits.
         var inverse = limbs[0]
         for _ in 0..<6 { inverse = inverse &* (2 &- limbs[0] &* inverse) }
         lowInverse = 0 &- inverse
@@ -155,10 +153,10 @@ struct Modulus {
         number < value ? number : number.remainder(dividingBy: value)
     }
 
-    /// a times b over R, all below the modulus.
+    /// Computes `a * b * R^(-1) mod value` using Montgomery reduction.
     private func montgomery(_ a: [UInt64], _ b: [UInt64]) -> [UInt64] {
-        // Through pointers: this is where all the time goes, and an
-        // unoptimised build checks every index otherwise.
+        // Use unsafe buffer pointers in this inner loop to avoid per-element
+        // bounds-checking overhead in unoptimized builds.
         var sum = [UInt64](repeating: 0, count: count + 2)
         let count = count, lowInverse = lowInverse
         sum.withUnsafeMutableBufferPointer { sum in
@@ -166,7 +164,7 @@ struct Modulus {
                 b.withUnsafeBufferPointer { b in
                     limbs.withUnsafeBufferPointer { limbs in
                         for i in 0..<count {
-                            // Add a's limb times b.
+                            // Multiply-accumulate `a[i] * b` into `sum`.
                             var carry: UInt64 = 0
                             for j in 0..<count {
                                 let (high, low) = a[i].multipliedFullWidth(by: b[j])
@@ -197,7 +195,7 @@ struct Modulus {
                 }
             }
         }
-        // Below twice the modulus now: one subtraction at most.
+        // `sum` is now in `0 ..< 2 * value`, so at most one conditional subtraction is needed.
         var aboveOrEqual = sum[count] != 0
         if !aboveOrEqual {
             aboveOrEqual = true
@@ -243,13 +241,14 @@ struct Modulus {
         return leaving(out)
     }
 
-    /// a less b, brought back within the modulus.
+    /// Computes `(a - b) mod value`.
     func subtract(_ a: Natural, _ b: Natural) -> Natural {
         let a = reduce(a), b = reduce(b)
         return b <= a ? a - b : a + value - b
     }
 
-    /// The number that times `a` gives one. Only when the modulus is prime, and `a` not a multiple of it.
+    /// Multiplicative inverse `a^(-1) mod value` via Fermat's little theorem
+    /// (requires prime `value` and `a != 0 mod value`).
     func inverse(_ a: Natural) -> Natural {
         power(a, value - Natural(2))
     }

@@ -1,13 +1,13 @@
 # Video packets
 
-All multi-byte fields are little-endian (arm64 native loads, no byte swaps
+All multi-byte fields are little-endian (arm64 native loads, with no byte swaps
 anywhere on this path - **static**).
 
 ## The `dataset` message header (8 bytes)
 
 Every SVL message above the transport is a `dataset`: an 8-byte header followed
 by `len` payload bytes. `GenSimpleDataset` (+0x155bc4) allocates `len + 8` and
-fills it exactly like this (**static**):
+fills it as follows (**static**):
 
 | Off | Type | Name | Notes |
 |---|---|---|---|
@@ -18,29 +18,32 @@ fills it exactly like this (**static**):
 | 6 | u16 | `index` | For video data: packet id. For a descriptor: group number |
 | 8 | ... | payload | |
 
-The client's byte accounting adds `len + 0xc` per message
-(`ByteLogger::LogBytes(..., len + 0xc)` in every caller), so 12 bytes of
-overhead per message are assumed: this 8-byte header plus 4 more. **inferred**:
-the other 4 belong to the transport framing - see docs/svl-transport/.
+`vrlink`'s byte accounting adds `len + 0xc` per message
+(`ByteLogger::LogBytes(..., len + 0xc)` in every caller), assuming 12 bytes of
+overhead per message: this 8-byte header plus 4 additional bytes. **inferred**:
+the extra 4 bytes are accounted to transport framing (see
+`docs/svl-transport/`).
 
-`kind` values seen in `SVLDataLink::ReceivedData` (**static**; only kinds 4 and
-5 are in scope here, the rest are listed so a capture can be sorted):
+`SVLDataLink::ReceivedData` switches on the following `kind` values (**static**;
+only kinds 4 and 5 belong to the video path, while the others are listed to
+help classify wire captures):
 
 | kind | Meaning | Handler |
 |---|---|---|
 | 1 | reliable-stream ack | removes the acked element |
 | 2 | reliable stream | `RXReliableStream`, then acked with kind 1 |
 | 3 | unreliable stream (types 0x01, 0x07 values, 0x0d VTE, 0x12, 0x14, 0x16 ...) | `RXUnreliableStream` |
-| 4 | video *reply* channel, client -> host | built by the client; see below |
+| 4 | video *reply* channel, client -> host | built by `vrlink`; see below |
 | 5 | video, host -> client | `SVLFEC::AcceptVideoPacket` |
 | 6, 0xb, 0xc | audio | `SVLAudio::TransportRXAudioFrames` |
 | 8 | debug message | `RXDebugMessage` |
 | 9 / 10 | broadcast / broadcast reply | |
 
-The note in Klepton's STEAMLINK.md section 3.1 that a header reads
-`kind=0x0d03` is this pair: `kind = 3`, `type = 0x0d` (a ValueTransportSystem
-message). **captured** (`vr3`): class 3 / type 0x0d elements do arrive from the
-host (6 of them, 12..216 bytes, all before the first video frame).
+Klepton's `STEAMLINK.md` (section 3.1) notes a 16-bit header field
+`kind=0x0d03`, which corresponds to these first two bytes read as a
+little-endian `u16`: `kind = 3`, `type = 0x0d` (a `ValueTransportSystem`
+message). **captured** (`vr3`): kind 3 / type `0x0d` elements arrive from the
+host (6 messages of `12..216` bytes, all before the first video frame).
 
 ## Video messages
 
@@ -51,18 +54,20 @@ host (6 of them, 12..216 bytes, all before the first video frame).
 | client -> host | 4 | 5 | retransmit request (`resend_fec_request`) | [retransmit.md](retransmit.md) |
 | client -> host | 4 | 0x0f | frame report (`LastVideoPacket_t`) | [retransmit.md](retransmit.md) |
 
-The two names are the client's own: `"SVST_VIDEO_TRANSPORT_DESCRIPTION:
-WARNING: Could not initialize frame on hardware."` is logged on the `type == 2`
-branch and `"SVST_VIDEO_TRANSPORT: WARNING: ..."` on the `type == 3` branch of
-`SVLFEC::AcceptVideoPacket` (+0x160684) - **static**. The header words the TX
-code writes are `0x0205` (descriptor), `0x0305` (data/parity) in
-`SVLFECRAID6TXFrame::InitializeAndSend` (+0x1617a4) / `PopulateFecBlocks`
-(+0x161518), and `0x0504`, `0x0f04` for the two client messages
+The `SVST_*` names come from `vrlink` log strings (**static**):
+`"SVST_VIDEO_TRANSPORT_DESCRIPTION: WARNING: Could not initialize frame on
+hardware."` is logged on the `type == 2` branch and `"SVST_VIDEO_TRANSPORT:
+WARNING: ..."` on the `type == 3` branch of `SVLFEC::AcceptVideoPacket`
+(+0x160684). The 16-bit header words written by the shared TX code are `0x0205`
+(descriptor) and `0x0305` (data/parity) in
+`SVLFECRAID6TXFrame::InitializeAndSend` (+0x1617a4) and `PopulateFecBlocks`
+(+0x161518), while the two client messages write `0x0504` and `0x0f04`
 (`SVLFECRXFrame::CheckRetry` +0x15f2cc, `SVLDataLink::SendLastRXID` +0x15c648).
 
 ## Data / parity packet (kind 5, type 3)
 
-**static** - `SVLFECRXFrame::AcceptVideoPacket` (+0x15edc8):
+`SVLFECRXFrame::AcceptVideoPacket` (+0x15edc8) parses data and parity packets
+with the following layout (**static**):
 
 | Off | Type | Name | Notes |
 |---|---|---|---|
@@ -74,20 +79,23 @@ code writes are `0x0205` (descriptor), `0x0305` (data/parity) in
 | 8 | u8[len] | payload | |
 
 - Data packet `n` carries bytes `[n*1024, n*1024 + len)` of the encoded frame.
-  The client `memcpy`s it to `m_pData + n*1024`, where `m_pData` is the
-  MediaCodec input buffer itself (see [decode-handoff.md](decode-handoff.md)).
+  `vrlink` copies it via `memcpy` to `m_pData + n*1024`, where `m_pData` points
+  directly into the MediaCodec input buffer (see
+  [decode-handoff.md](decode-handoff.md)).
 - Parity packet `0x800 + p` is stored in a per-slot 2 MiB side buffer at
-  `(p * 1024)`. Parity packets are always 1024 bytes on the TX side.
-- A duplicate (bit already set in the per-frame bitmap) is dropped silently.
-- **Frame length before the descriptor arrives:** if the slot has no descriptor
-  yet, any packet with `len != 0x400` sets `frame_size = packet_id * 1024 + len`.
-  So the short last packet doubles as an end-of-frame marker. A frame whose size
-  is an exact multiple of 1024 has no short packet and its size is only known
-  from the descriptor.
-- After storing, the per-FEC hook `ReceivedVideoPacket(packet_id, now)` runs
-  (see [fec.md](fec.md)), then, if the packet's *group* is higher than any seen
-  for this frame, `CheckRetry(group)` runs (see [retransmit.md](retransmit.md)).
-  Group = `packet_id / 64` for data, `(packet_id - 0x800) / 16` for parity.
+  `p * 1024`. Parity packets are always 1024 bytes on the TX side.
+- Duplicate packets (whose bit is already set in the per-frame bitmap) are
+  dropped silently.
+- **Frame length before the descriptor arrives:** if the slot has not yet
+  received a descriptor, any packet with `len != 0x400` sets `frame_size =
+  packet_id * 1024 + len`, so the short final packet also acts as an
+  end-of-frame marker. When a frame's byte length is an exact multiple of 1024,
+  there is no short packet and its size is known only from the descriptor.
+- After storing the payload, the per-FEC hook `ReceivedVideoPacket(packet_id,
+  now)` runs (see [fec.md](fec.md)); then, if the packet's *group* exceeds any
+  group previously seen for this frame, `CheckRetry(group)` runs (see
+  [retransmit.md](retransmit.md)). Group index is `packet_id / 64` for data
+  packets and `(packet_id - 0x800) / 16` for parity packets.
 
 ### Numbering
 
@@ -102,10 +110,11 @@ n_group  = ceil(n_data / 64)
 
 ## Send order for one frame
 
-**static** in the shared TX code - `SVLFECRAID6TXFrame::InitializeAndSend`
-(+0x1617a4) does this - and **captured**: 4,259 of the 4,260 frames of `vr3`
-arrived in exactly this order, element for element (the one exception lost
-its closing bookend on the wire; see "Captured"):
+`SVLFECRAID6TXFrame::InitializeAndSend` (+0x1617a4) transmits each frame in the
+order below (**static** in the shared TX code), and **captured** traffic
+matches: 4,259 of the 4,260 frames in `vr3` arrived in this exact
+element-by-element sequence (frame 8 lost its closing bookend on the wire; see
+"Captured" below):
 
 ```python
 send(descriptor, group=0, bookend=0)                 # see frame-descriptor.md
@@ -124,75 +133,79 @@ for g in range(n_group):
     send(descriptor, group=g+1, bookend=g+1)
 ```
 
-- The interleave means consecutive datagrams belong to different stripes, so a
-  burst loss of up to 8 consecutive data packets costs each stripe one packet.
-- `q_enabled` on the TX side is "the peer's `cRXpass` SVLRoot value was below
-  99.99 % at some point in the last 10 s" (**static**: `cRXpass` is read at the
-  top of `InitializeAndSend`; the flag is `this+0x4480`). So with a clean link
-  only the XOR parity (P) is sent and the stream carries 12.5 % FEC overhead;
-  with Q it is 25 %. **captured**: the host sends Q on every frame for the
-  first 8.64 s of a stream even though the client never reported a `cRXpass`
-  below 100, then P only - see "Captured".
-- The TX code refuses a frame with more than its allocated data/parity packets
-  with `"FAULT: Packet too big!!! Can't send!!! Dropping"`.
+- Column-major interleaving places consecutive datagrams into different
+  stripes, so a burst loss of up to 8 consecutive data packets drops at most
+  one packet per stripe.
+- In the shared TX code (**static**), `InitializeAndSend` reads the peer's
+  `cRXpass` `SVLRoot` value at the top of the function and sets `q_enabled`
+  (`this+0x4480`) if `cRXpass` fell below `99.99%` at any point within the last
+  10 s. On a clean link, only XOR parity (P) is sent (12.5% FEC overhead); with
+  Q enabled, FEC overhead is 25%. **captured**: the host sends Q on every frame
+  for the first 8.64 s of a stream even though `vrlink` never reported
+  `cRXpass` below `100`, then sends P only (see "Captured" below).
+- The TX code rejects any frame exceeding its allocated packet count with
+  `"FAULT: Packet too big!!! Can't send!!! Dropping"`.
 
 ## Captured
 
-One session, capture `vr3` (not in the repo; it holds live credentials): the
-real client on a wired-quality LAN, 39.33 s of video, 60,945 class-5 elements
-in 59,668 datagrams, none torn, each datagram with a receive timestamp
-(CLOCK_MONOTONIC, taken on the client). Everything in this section is
-**captured**. Times called "arrival" are those receive timestamps; times called
-"tx" are the host's own `tx_time` from the frame's descriptor
+Capture `vr3` (omitted from the repo because it contains live credentials)
+records `vrlink` on a wired-quality LAN over 39.33 s of video: 60,945 kind-5
+elements across 59,668 intact datagrams, each stamped with a client
+`CLOCK_MONOTONIC` receive timestamp. Everything in this section is
+**captured**. Below, "arrival" refers to those client receive timestamps and
+"tx" refers to the host's `tx_time` from the frame descriptor
 ([frame-descriptor.md](frame-descriptor.md)).
 
-An earlier capture, `vr1`, had a third of its datagrams torn; its counts were
-lower bounds and are replaced by the figures below.
+An earlier capture (`vr1`) had a third of its datagrams truncated; its lower
+bounds are superseded by the figures below.
 
 ### Header, lengths, reassembly
 
-- The 8-byte `dataset` header exactly as tabled above. 52,314 `05 03`
-  elements (43,910 data, 8,404 parity), `len` 1..1024; 8,631 `05 02`
-  elements, every one 1016 bytes of payload.
-- 4,260 frames, ids 0..4259 with no gap, never interleaved: every element of
-  frame `n` arrives before the first element of frame `n+1`, and datagram
-  sequence numbers rise monotonically inside every frame.
-- `len == 1024` on every data packet except the highest packet id of the
-  frame, and `packet_id * 1024 + len == frame_size` from the descriptor on that
-  one - in all 4,260 frames, no exception. No frame in the capture had a size
-  that is an exact multiple of 1024. Every parity packet is 1024 bytes.
-- No data packet was missing and none was duplicated: all 4,260 frames
-  reassemble from data packets alone. Concatenated in frame-id order, frames
-  0..4258 are **byte-identical to the elementary stream the client fed its
-  decoder** (`KL_VTDEC_DUMP`), from its first byte on.
-- The one frame "not found" in the dump, 4259, is the last frame of the
-  capture. The dump file is truncated; it ends
-  with the first 6,155 of that frame's 7,724 bytes. Its length is an exact
-  multiple of 4096, i.e. the client was killed with the last buffered write
-  unflushed. (The dump's index file is cut short the same way: 4,220 lines.)
-- A datagram normally carries one video element. 1,277 datagrams carry two:
-  the frame's short last data packet shares a datagram with the element sent
-  just before it (1,275 times, a full data packet) or just after it (twice, a
-  parity packet). That happens exactly when the short packet is 328 bytes or
-  less; every short packet of 329 bytes or more (2,983 of them) travels alone.
-  So the sender coalesces elements up to 1,368 bytes of elements per datagram.
-  Whether that is the video code or the transport is for docs/svl-transport/.
+- Every message uses the 8-byte `dataset` header tabled above: 52,314 `05 03`
+  elements (43,910 data and 8,404 parity, with `len` in `1..1024`) and 8,631
+  `05 02` descriptor elements (each with 1016 bytes of payload).
+- All 4,260 frames (`frame_id` `0..4259`, with no gaps) arrive sequentially
+  without interleaving: every element of frame `n` arrives before the first
+  element of frame `n+1`, and transport datagram sequence numbers rise
+  monotonically inside every frame.
+- Across all 4,260 frames without exception, `len == 1024` on every data packet
+  except the highest `packet_id` of the frame, where `packet_id * 1024 + len ==
+  frame_size` matches the descriptor. None of the captured frames had a byte
+  length that was an exact multiple of 1024. Every parity packet has `len ==
+  1024`.
+- Zero data packets were lost or duplicated, so all 4,260 frames reassemble
+  from data packets alone. Concatenated in `frame_id` order, frames `0..4258`
+  are **byte-identical to the elementary stream `vrlink` fed to its decoder**
+  (`KL_VTDEC_DUMP`) from byte 0 onward.
+- Frame 4259 (the final frame of the capture) is truncated in the dump file,
+  which ends after the first 6,155 of its 7,724 bytes. Because the dump file's
+  length is an exact multiple of 4096 bytes, `vrlink` was terminated before
+  flushing its final buffered write (the dump's index file is similarly cut
+  short at 4,220 lines).
+- Most datagrams carry a single video element, while 1,277 datagrams carry two:
+  the frame's short final data packet shares a datagram with the element sent
+  immediately before it (1,275 times, a full data packet) or immediately after
+  it (twice, a parity packet). Coalescing occurs whenever the short packet
+  payload is 328 bytes or smaller, whereas every short packet of 329 bytes or
+  more (2,983 frames) travels in its own datagram—capping coalesced element
+  bytes at 1,368 bytes per datagram. Whether coalescing lives in the video
+  layer or transport layer is covered in `docs/svl-transport/`.
 
 ### Send order
 
-- Element order inside a frame equals the pseudo-code in "Send order" in
-  4,259 of 4,260 frames: bookend 0, then per group the data packets
-  column-major, then the P packet of each stripe, then (when Q is on) the Q
-  packet of each stripe, then the bookend `g+1`. Example, frame 8 (9,863
-  bytes, 10 data packets): `B0 d0 d8 d1 d9 d2 d3 d4 d5 d6 d7 P0 P1 Q0 Q1`.
-- That frame 8 is the exception: its closing bookend never arrived, and the
-  inbound datagram sequence has its only gap of the capture (one datagram) at
-  exactly that position. So one datagram in 62,589 was lost on the way, and it
-  was a bookend. The client did nothing about it (nothing to do: the frame
-  was already complete), and the host did not resend it.
-- A complete multi-group frame, the largest of the capture - frame 64,
-  283,768 bytes, 278 data packets, 5 groups, 354 elements in 353 consecutive
-  datagrams, 13.75 ms from first to last arrival:
+- Within a frame, element arrival order matches the pseudocode in "Send order
+  for one frame" in 4,259 of 4,260 frames: bookend 0, followed for each group
+  by column-major data packets, P parity packets for each stripe, Q parity
+  packets for each stripe (when Q is active), and bookend `g+1`. For example,
+  frame 8 (9,863 bytes, 10 data packets) arrived as `B0 d0 d8 d1 d9 d2 d3 d4 d5
+  d6 d7 P0 P1 Q0 Q1`.
+- Frame 8 is the sole exception: its closing bookend never arrived, coinciding
+  with the single gap in inbound transport sequence numbers across all 62,589
+  datagrams. Because frame 8's data packets were already complete, `vrlink`
+  took no action and the host did not resend the bookend.
+- Frame 64—the largest frame in the capture (283,768 bytes, 278 data packets,
+  5 groups, 354 elements across 353 consecutive datagrams, spanning 13.75 ms
+  from first to last arrival)—illustrates a complete multi-group send sequence:
 
   | Elements | Count | Arrival, ms after bookend 0 |
   |---|---|---|
@@ -208,36 +221,39 @@ lower bounds and are replaced by the figures below.
   | P of stripes 32..34, then Q of stripes 32..34 | 3 + 3 | 13.549 .. 13.714 |
   | bookend, group 5, index 5 | 1 | 13.752 |
 
-  The last group shows the column-major order over a partly filled group:
-  the columns simply skip packet ids past the end of the frame. Groups are
-  not separated by a visible pause: 68 multi-group frames arrive at 19..34
-  elements per ms (median 25), about one group every 3 ms.
-- Bookends per frame are exactly `1 + n_group`; none is repeated. Counts by
-  group number: 0 x4260, 1 x4259, 2 x68, 3 x42, 4 x1, 5 x1.
+  Group 4's partial data run (`256..277`) shows how column-major ordering works
+  on a partially filled group: each column simply skips `packet_id` values at
+  or beyond `n_data`. Groups are transmitted back to back without a noticeable
+  pause: the 68 multi-group frames arrive at `19..34` elements/ms (median `25`),
+  or roughly one group every 3 ms.
+- Bookend count per frame is `1 + n_group` with no repeats; counts by group
+  number are `0` x4260, `1` x4259, `2` x68, `3` x42, `4` x1, and `5` x1.
 
 ### P and Q parity
 
-- **vr1 suggested "Q is sent under loss"; vr3 shows Q on a loss-free link.**
-  Frames 0..941 - the first 8.64 s of the stream by the host's clock - carry
-  both P and Q for every stripe (2,322 Q packets). Frames 942..4259 (the
-  other 30.7 s) carry P only. In total 6,082 P packets, one per stripe of
-  every frame, and no stripe ever has Q without P.
-- During those 8.64 s the client reported `cRXpass` = 100 in every sample it
-  sent (732 samples, the first 13 ms before the first video packet), sent no
-  retransmit request, and lost one datagram. So the Q period in this run
-  happened without any loss. **inferred**: the host starts a stream with
-  the "recent loss" flag already set (or reads `cRXpass` as below 99.99 until
-  the first value arrives) and the 10 s timer of the TX code runs out; the
-  timer would then have started about 1.36 s before the first video frame,
-  which is before the first SVL element of the capture. What is measured is
-  only: Q for the first 8.64 s, never afterwards.
-- A client must therefore expect Q from the first frame and must not treat an
-  odd parity id as a sign of trouble.
+- **`vr1` suggested Q parity was sent only under packet loss, whereas `vr3`
+  shows Q parity on a clean link at startup.** Frames `0..941`—the first 8.64 s
+  of video by the host's clock—carry both P and Q on every stripe (2,322 Q
+  packets). Frames `942..4259` (the remaining 30.7 s) carry P only. Across the
+  entire run there are 6,082 P packets (one per stripe of every frame), and no
+  stripe ever carries Q without P.
+- Throughout those initial 8.64 s, `vrlink` reported `cRXpass = 100` in every
+  sample (732 samples, starting 13 ms before the first video packet), sent zero
+  retransmit requests, and lost only frame 8's closing bookend. The initial Q
+  window therefore occurred without data loss. **inferred**: the host begins a
+  stream with its "recent loss" flag set (or treats `cRXpass` as below `99.99`
+  until the first client sample is processed) and lets the TX code's 10 s timer
+  expire—which would place timer start ~1.36 s before frame 0, prior to the
+  first captured SVL element. Directly measured on the wire, Q parity is sent
+  for the first 8.64 s and omitted afterward.
+- Clients should expect Q parity from frame 0 and should not treat odd parity
+  packet ids as an error indicator.
 
 ### Frame sizes and timing
 
-40 s of a mostly static SteamVR scene at 120 Hz nominal. These figures come from
-one run and are not a specification.
+The table below summarizes 40 s of a mostly static SteamVR dashboard scene at a
+120 Hz nominal target; these numbers reflect a single capture rather than
+protocol limits.
 
 | Quantity | Value |
 |---|---|
@@ -254,39 +270,41 @@ one run and are not a specification.
 | first-to-last arrival within a frame (frames 200..) | min 0.31, median 0.77, 90 % 0.95, 99 % 1.27, max 10.2 ms |
 | gap between consecutive elements of a small frame | median 49 us, 90 % 124 us |
 
-- The interval histogram has no single peak at 8.33 ms: rounded to 1 ms it
-  reads 8 ms x769, 9 ms x1707, 10 ms x1658, with 7 ms x54 and 11 ms x51. The
-  host paced this run at about 108 frames/s, not 120. Why is for
-  docs/svl-timing/.
-- The two long intervals are at the start: 31.4 ms before frame 15 and
-  40.8 ms before frame 23 by `tx_time`. After frame 140 every interval lies
-  between 6.5 and 12 ms.
-- The stream opens with small frames (frames 0..43: 536 bytes .. 62 kB), then
-  a burst of large ones (frames 44..112: 51..284 kB, 0.64 s at 116 Mbit/s),
-  decays (15 kB by frame 120) and settles at ~7.7 kB per frame. The largest
-  frame (64) is a P frame, not an
-  IDR; the two IDRs of the run are 2,512 and 2,378 bytes
-  ([retransmit.md](retransmit.md)).
-- Arrival times of the first twelve frames are not usable for pacing: the
-  client's receive thread stalled for 111 ms right after the first datagrams
-  of frame 0 (the host's `tx_time` shows frames 0..11 sent at a normal 7 ms
-  cadence; they were all read in a 24 ms burst afterwards, while the client's
-  pose packets kept going out on time). The stall begins when the last data
-  packet of frame 0 has been stored, i.e. when the first frame is handed to
-  the decoder. **inferred**: decoder start-up blocking the receive thread;
-  nothing on the wire.
+- Rounded to 1 ms, the inter-frame interval histogram has no sharp peak at
+  8.33 ms: `8 ms` x769, `9 ms` x1707, `10 ms` x1658, plus `7 ms` x54 and
+  `11 ms` x51. The host paced this run at roughly 108 frames/s rather than 120;
+  host frame pacing is analyzed in `docs/svl-timing/`.
+- The two long `tx_time` gaps occur near startup: `31.4 ms` before frame 15 and
+  `40.8 ms` before frame 23. After frame 140, every interval stays within
+  `6.5..12 ms`.
+- Frame sizes start small (`0..43`: `536 bytes .. 62 kB`), spike during a
+  0.64 s burst (`44..112`: `51..284 kB`, averaging 116 Mbit/s), decay (`15 kB`
+  by frame 120), and settle around `7.7 kB` per frame. The largest frame (frame
+  64) is a P frame rather than an IDR; the two IDRs in `vr3` are 2,512 and
+  2,378 bytes ([retransmit.md](retransmit.md)).
+- Client arrival timestamps on frames `0..11` do not reflect wire pacing
+  because `vrlink`'s receive thread stalled for 111 ms right after storing the
+  final data packet of frame 0 (when frame 0 was queued to the decoder). Host
+  `tx_time` values show frames `0..11` went out at a steady ~7 ms cadence and
+  were drained in a 24 ms burst once the thread resumed, while `vrlink`'s
+  outgoing pose thread kept sending on schedule. **inferred**: MediaCodec
+  startup blocked `vrlink`'s receive thread locally rather than any pause
+  occurring on the wire.
 
 ## Open questions / to confirm on the wire
 
-1. Where the extra 4 bytes of the client's `len + 0xc` accounting live (the
-   capture shows an 8-byte datagram prefix shared by all datasets in it, so
-   this is probably just the client's estimate).
-2. What exactly starts and ends the Q period: is it a fixed 10 s from stream
-   set-up, and does a `cRXpass` below 99.99 from the client bring Q back? Needs
-   a probe that reports a low `cRXpass` (or drops packets) mid-stream.
-3. Whether the host ever sends a frame over 2 MiB (packet ids would pass
-   0x7ff) - the client cannot receive it. The largest seen is 283,768 bytes.
-4. A frame whose size is an exact multiple of 1024 (no short packet; size
-   known only from the descriptor) - none among 4,260.
-5. Whether the 1,368-byte coalescing limit is fixed or follows a negotiated
-   MTU.
+1. Where the extra 4 bytes in `vrlink`'s `len + 0xc` byte logger come from
+   (wire datagrams carry a shared 8-byte transport prefix across all datasets
+   in the datagram, so `+ 0xc` is likely an approximation in `ByteLogger`).
+2. What starts and ends the Q-parity window: whether it is a fixed 10 s timer
+   from stream setup, and whether reporting `cRXpass < 99.99` from the client
+   re-enables Q parity mid-stream (testable with a probe that reports a low
+   `cRXpass` or drops packets).
+3. Whether a host ever attempts to send a frame larger than 2 MiB (where packet
+   ids would exceed `0x7ff`, which `vrlink` rejects); the largest frame seen in
+   `vr3` is 283,768 bytes.
+4. Observing a frame whose encoded size is an exact multiple of 1024 bytes (no
+   short final packet, so `frame_size` comes solely from the descriptor); none
+   occurred among the 4,260 frames in `vr3`.
+5. Whether the 1,368-byte datagram coalescing threshold is hardcoded or derived
+   from a negotiated MTU.

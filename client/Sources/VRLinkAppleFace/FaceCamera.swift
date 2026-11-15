@@ -8,7 +8,7 @@ import QuartzCore
 import VRLinkCore
 import Vision
 
-/// Face tracking from a camera that looks at the wearer's face.
+/// Face tracking from a camera pointed at the user's face.
 ///
 /// On visionOS this uses Spatial Persona. This class runs Apple's landmark detector on the feed
 /// and then hands the points to the core's `FaceEstimator`. 
@@ -57,17 +57,16 @@ public final class FaceCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDel
         lock.unlock()
     }
 
-    /// Start the camera, with a capture session made for the occasion; any
-    /// earlier one is thrown away.
+    /// Starts camera capture with a fresh `AVCaptureSession`, tearing down any
+    /// previous session first.
     ///
-    /// On visionOS, call this when an immersive space that carries the
-    /// Persona camera's anchor has just opened and the app's window is
-    /// still open (the system only starts the Persona's camera for an app
-    /// with a window), then close the window once `lastPictureTime` shows
-    /// pictures arriving: the camera moves to the space's anchor. A session
-    /// kept from one space to the next did not make that move again. (The
-    /// ALVR visionOS client makes its session inside its space's view, anew
-    /// every time, which comes to the same.)
+    /// On visionOS, call this right after opening an immersive space that hosts
+    /// the Spatial Persona camera anchor while the app's main window is still
+    /// open (visionOS only starts the Persona camera while a window is open).
+    /// Once `lastPictureTime` indicates frames are arriving, the window can be
+    /// closed and the camera will follow the immersive space's anchor. Reusing
+    /// an `AVCaptureSession` across spaces fails to rebind to the new anchor,
+    /// so we recreate it each time (matching the ALVR visionOS client).
     public func start() {
         lock.lock()
         running = true
@@ -130,7 +129,7 @@ public final class FaceCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDel
                     connection.isVideoMirrored = true
                 }
                 session.commitConfiguration()
-                // What the system does to the session, for the log.
+                // Log session interruptions and runtime errors from the OS.
                 let center = NotificationCenter.default
                 observers = [
                     center.addObserver(forName: AVCaptureSession.wasInterruptedNotification, object: session, queue: nil) { note in
@@ -155,7 +154,7 @@ public final class FaceCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDel
         }
     }
 
-    /// On the setup queue: stop and forget the current session.
+    /// Stops and releases the current capture session. Must be called on `setup`.
     private func tearDown() {
         observers.forEach { NotificationCenter.default.removeObserver($0) }
         observers = []
@@ -165,7 +164,7 @@ public final class FaceCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDel
         }
     }
 
-    /// When the newest picture arrived, on the `CACurrentMediaTime` clock; 0 before the first.
+    /// Timestamp of the most recent frame (`CACurrentMediaTime`), or 0 if no frame has arrived yet.
     public var lastPictureTime: TimeInterval {
         lock.lock()
         defer { lock.unlock() }
@@ -205,9 +204,9 @@ public final class FaceCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDel
         return wanted.count >= 5 ? FaceMeasures.average(wanted) : nil
     }
 
-    /// The eye features averaged over a stretch of time (on the
-    /// `CACurrentMediaTime` clock), leaving out blinks; nil if the face was
-    /// not seen with open eyes at least twice in it.
+    /// Averages eye features over `[start, end]` (in `CACurrentMediaTime`
+    /// seconds), excluding blinks. Returns nil if fewer than two non-blinking
+    /// samples were captured in that window.
     public func eyeFeatures(from start: TimeInterval, to end: TimeInterval) -> EyeFeatures? {
         lock.lock()
         let wanted = history.filter { $0.time >= start && $0.time <= end && !$0.blinking }.map(\.features)
@@ -264,7 +263,7 @@ public final class FaceCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDel
             if var estimate = estimator.estimate(landmarks, eyeSpacing: spacing) {
                 facesSeen += 1
                 lock.lock()
-                // The wearer's own ranges where there are any, then steadied.
+                // Apply user calibration ranges if available, then smooth the expression weights.
                 if let calibration, calibration.usable {
                     estimate.face.weights = calibration.weights(for: estimate.measures, fallback: estimate.face.weights)
                 }

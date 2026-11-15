@@ -3,8 +3,9 @@
 Sources: `QSVLClient::UpdateFrameVariables()` +0xf5248, the watch callback at
 +0xf8034 (anonymous `std::function` body; Ghidra `FUN_001f8034`),
 `QSVLClient::HandleEvent` +0xf4bec, `QSVLClient::OnTopOfFrame` +0xf6270.
-All **static** unless marked. The ValueTransportSystem wire format and the
-full id table are in docs/svl-values/; only the timing-relevant ids are here.
+All details below are **static** unless marked otherwise. The
+ValueTransportSystem wire format and the full id table are in docs/svl-values/;
+only the timing-relevant ids are covered here.
 
 | id | name (from log strings) | direction | payload |
 |---|---|---|---|
@@ -32,25 +33,26 @@ full id table are in docs/svl-values/; only the timing-relevant ids are here.
    `[SVLClient] VTE_REQ_FRAMETIME_US was set to %i`, and stops the 1 Hz
    re-advertisement (`QSVLClient+0x3eb9 = 1`).
 
-**captured (Klepton trace)**: one advertised rate of 72 Hz led to
-`VTE_REQ_FRAMETIME_US = 13888`. Klepton also records that a host given an
-empty rate list never sends video. **captured** (`vr3`): the whole exchange
-on the wire, below.
+**captured (Klepton trace)**: Advertising a single 72 Hz rate led to
+`VTE_REQ_FRAMETIME_US = 13888`. Klepton also records that a host given an empty
+rate list never sends video. The full wire exchange from `vr3` is shown below
+(**captured**).
 
-## Frame time the client actually paces with
+## Local pacing period versus `VTE_REQ_FRAMETIME_US`
 
 Independent of the negotiation, the pacing code uses the period OpenXR
 reports each frame (`OnTopOfFrame`'s second argument, accepted when within
-2000..20000 µs, else 11111), stored at `SVLRoot+0x178`. So the number in 0x0c
-is a statement to the host; the client's own schedule follows the real
-display.
+2000..20000 µs, else 11111), stored at `SVLRoot+0x178`. Thus 0x0c reports the
+negotiated frame time to the host, while the client's own schedule follows the
+display period reported by OpenXR.
 
-## Confirmed against capture `vr3`
+## Capture verification (`vr3`)
 
-`vr3`: real client under Klepton, display advertised as 120 Hz, every
-datagram timestamped. Times are from the client's first datagram. Each value
-is one ValueTransportSystem record: `0x80|version, id, u16 chunk, u32 total`,
-then the data (docs/svl-values/).
+Capture `vr3` records `vrlink` under Klepton with the display advertised as
+120 Hz and every datagram timestamped. Times below are measured from `vrlink`'s
+first datagram. Each value is a ValueTransportSystem record formatted as
+`0x80|version, id, u16 chunk, u32 total` followed by the payload
+(docs/svl-values/).
 
 | t (ms) | direction, carrier | bytes | meaning |
 |---|---|---|---|
@@ -62,65 +64,68 @@ then the data (docs/svl-values/).
 | 70.8 … 913.2 | client → host, pose packets | 0x20 **version 2**, same 20 bytes, 27 times, one every ~32 ms | a second publication of the same list, repeated because unacknowledged |
 | 926.2 | host → client, first frame descriptor | `02 20 00 00` in its tail | ack of 0x20 v2; first video |
 
-- **captured**: layout of all three values is as the table at the top says:
+- **captured**: The layout of all three values matches the table at the top:
   the 0x20 header's first u32 is 1 and its 8 reserved bytes are zero; 0x21 is
-  4 bytes (float32 Hz); 0x0c is 4 bytes (u32 µs). 8333 =
-  `(uint)(1000000.5 / 120)`.
-- **captured**: order and timing. The request (0x21) came 3.1 ms after the
-  list (0x20) left, the frame-time reply (0x0c) 5.0 ms after the request, and
-  the host acknowledged it 3.4 ms later. **Video started 884 ms after the
-  host had 0x0c** (926 ms into the session), so the negotiation is finished
-  long before the first frame. What the host waits for in between is in
-  docs/svl-values/startup-exchange.md; its probe-derived minimum set for a
-  cold host contains 0x20 but not 0x0c, so the host does not wait for the
-  frame-time reply.
-- **captured**: the client log has
+  4 bytes (float32 Hz); 0x0c is 4 bytes (u32 µs), with `8333 =
+  (uint)(1000000.5 / 120)`.
+- **captured**: The host's request (0x21) arrived 3.1 ms after `vrlink` sent
+  the list (0x20), the frame-time reply (0x0c) left 5.0 ms after the request,
+  and the host acknowledged 0x0c 3.4 ms later. **Video started 884 ms after the
+  host received 0x0c** (926 ms into the session), long after refresh-rate
+  negotiation completed. What the host waits for during that gap is covered in
+  docs/svl-values/startup-exchange.md; its probe-derived minimum startup set
+  for a cold host includes 0x20 and omits 0x0c, confirming that the host does
+  not wait for 0x0c.
+- **captured**: `vrlink`'s log records
   `[SVLClient] Sending Available Frequency (0/1) = 120.000000 Hz` three times
-  (init, after `Server requested prop refresh`, and once more), then
+  (at init, after `Server requested prop refresh`, and once more), followed by
   `Received display frequency request update`,
-  `[XRQ] XRQRequestRefreshRate: Set refresh rate to 120.0Hz` and
-  `VTE_REQ_FRAMETIME_US was set to 8333` once each. Three publications became
-  two wire versions because a new version is not started until the previous
-  one is acknowledged. After the request there was no further publication
-  (version 2 is the last), consistent with the "stop re-advertising" flag.
-- **captured**: the host could not acknowledge version 2 for 855 ms: it sent
-  no class-3 type-0x0d element between 41.7 ms and the first descriptor, and
-  descriptor tails are its only other carrier for acks (**inferred** for the
-  cause; the gap and the 27 repeats are measured).
-- **captured**: this host asked for **120.0 Hz**, the one rate offered. The
-  probe section below saw the same host ask for 90.0 Hz whatever was offered,
-  on the same day; the two are not reconciled (a host-side setting may have
-  changed between the runs).
-- **captured**: frames were then delivered at 108.4 per second (4,260 in
-  39.33 s; the host's own `tx_time` advances a median 9,203 µs per frame) —
-  below both 120 and 90, and equal to the rate of the client's frame loop
-  (108.3 pose groups per second, see [event-schedule.md](event-schedule.md)),
-  whose target-time field advances by the same ~9.2 ms per frame.
+  `[XRQ] XRQRequestRefreshRate: Set refresh rate to 120.0Hz`, and
+  `VTE_REQ_FRAMETIME_US was set to 8333` once each. Three local publications
+  produced two wire versions because a new wire version does not start until
+  the previous version is acknowledged. No further publication occurred after
+  the request (version 2 is final), matching the `QSVLClient+0x3eb9 = 1` flag
+  that stops the 1 Hz re-advertisement.
+- **captured**: The host did not acknowledge version 2 for 855 ms because it
+  sent no class-3 type-0x0d element between 41.7 ms and the first descriptor,
+  and descriptor tails are its only other carrier for acknowledgments
+  (**inferred** for the cause; the 855 ms gap and 27 repeats are **captured**).
+- **captured**: In `vr3`, the host requested **120.0 Hz**, matching the single
+  rate offered. On the same day, the initial probe runs below saw the same host
+  request 90.0 Hz regardless of what was offered; a host-side setting may have
+  changed between runs.
+- **captured**: Video frames were delivered at 108.4 fps (4,260 frames in
+  39.33 s, with the host's `tx_time` advancing a median 9,203 µs per frame) —
+  below both 120 and 90 Hz, and matching `vrlink`'s actual frame-loop rate
+  (108.3 pose groups/s; see [event-schedule.md](event-schedule.md)), whose
+  target-time field advances by the same ~9.2 ms per frame.
 
 ## Open questions
 
-- Whether the host re-requests when the client re-advertises a different
-  list (e.g. after the headset changes mode).
-- Why the request was 120.0 Hz in `vr3` and 90.0 Hz in the probe runs.
-- What sets the delivered frame rate. `vr3`: 120 Hz agreed, 108.4 delivered,
-  equal to the client's frame-loop rate. Probe: delivered rate followed the
-  agreed rate and not the pose cadence, provided the pose target time was
-  constant within a frame. One reading that fits both — the host renders
-  one frame per distinct pose target time up to the agreed rate — is
-  **inferred** and untested.
+- Check whether `vrlink` re-triggers host rate selection when a headset changes
+  its available refresh rates mid-session (see the probe test below).
+- Determine why the host requested 120.0 Hz in `vr3` versus 90.0 Hz in the
+  initial probe runs.
+- Clarify what governs the delivered frame rate: in `vr3`, 120 Hz was agreed
+  while 108.4 fps was delivered (matching `vrlink`'s frame-loop rate), whereas
+  in probe runs the delivered rate followed the agreed rate rather than pose
+  cadence as long as pose target time stayed constant within each frame. One
+  explanation consistent with both (**inferred**, untested) is that the host
+  renders at most one frame per distinct pose target time up to the agreed
+  refresh rate.
 
 ## Probe results (2026-11-10)
 
 See "Refresh rate and pacing (probe)" in
 [../svl-values/startup-exchange.md](../svl-values/startup-exchange.md): the
-host's 0x21 request was 90.0 Hz regardless of the offered list; delivered
-frame rate followed the offered rate (73 per second with only 72 Hz offered,
-90.0 with 90), and did not follow the client's pose cadence.
+host's 0x21 request was 90.0 Hz regardless of the offered list, while the
+delivered frame rate followed the offered rate (73 fps with only 72 Hz offered,
+and 90.0 fps with 90 Hz offered) rather than the client's pose cadence.
 
-## Changing the rate mid-session (probe, 2026-11-10)
+## Mid-session rate changes (probe, 2026-11-10)
 
-One session, six seconds per step, the probe's pose loop following each new
-rate. **Captured by probe**:
+In a single session, the probe stepped through six rate changes at six seconds
+per step, pacing its pose loop to match each new rate (**captured**):
 
 | step | host's reply | delivered |
 |---|---|---|
@@ -131,19 +136,21 @@ rate. **Captured by probe**:
 | publish 0x20 = [45] and 0x0c | (0x21 = 45) | 45.0 fps |
 | publish 0x20 = [96] and 0x0c | (0x21 = 96) | 95.6 fps |
 
-No frame was incomplete across any change, and the stream did not restart.
+No frame was incomplete across any rate change, and the stream continued
+without restarting.
 
-So:
+Key takeaways:
 
-- **A client changes the stream's rate by re-publishing 0x20 with the one rate
-  it now wants.** The host answers with a 0x21 request for that rate and
-  switches. This is the mechanism for a display whose refresh rate moves under
-  the client (visionOS between 45, 60, 90, 96 and 120 Hz).
-- **0x0c alone changes nothing.** It is only the acknowledgement of a 0x21.
-- Arbitrary rates are accepted: 45, 72, 90, 96 and 120 all worked.
-- This also explains the earlier warm-host observation that the delivered rate
-  followed the offered list while 0x21 did not appear to: those sessions did
-  not log the later 0x21.
+- **Re-publishing 0x20 with a single new rate changes the stream's frame rate
+  mid-session.** The host replies with a matching 0x21 request and switches
+  output rate. This supports displays whose refresh rate changes dynamically
+  (for example, visionOS switching among 45, 60, 90, 96, and 120 Hz).
+- **Publishing 0x0c alone has no effect**; 0x0c only acknowledges a 0x21
+  request.
+- Non-standard rates are accepted: 45, 72, 90, 96, and 120 Hz all worked.
+- This also explains earlier warm-host runs where the delivered rate followed
+  0x20 without an apparent 0x21 change: those runs did not log subsequent 0x21
+  updates.
 
-Not measured: how many frames the switch takes, whether the encoder is reset
-(`encResets`), and what the host does with a list of several rates.
+Transition time in frames, whether rate switches increment `encResets`, and how
+the host selects from a multi-rate 0x20 list were not measured.

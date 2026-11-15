@@ -8,10 +8,9 @@
 /// Because setting up a world-space renderer for XR is practically the default,
 /// this avoids a lot of headache regarding scaling or shader conventions.
 
-/// Where a part of a picture's transparency is kept, for a host that sends
-/// it apart from the colors: in which decoded picture, and where in it
-/// (0...1, origin top-left). That picture's brightness is how opaque the
-/// colors are, and the colors come already multiplied by it.
+/// UV region in a decoded picture that supplies alpha for premultiplied-alpha
+/// streams where opacity is packed separately from RGB. Coordinates are normalized
+/// (`0...1`, origin top-left), and the luma channel gives the opacity.
 public struct AlphaSource {
     public var picture: Int
     public var left, top, right, bottom: Float
@@ -22,21 +21,19 @@ public struct AlphaSource {
     }
 }
 
-/// A rectangle in world space showing part of the decoded frame.
+/// A world-space quad that renders a region of a decoded video frame (or a solid color).
 public struct Quad {
-    /// World space, meters: top-left, top-right, bottom-left, bottom-right.
+    /// Corner positions in world space (meters), ordered top-left, top-right, bottom-left, bottom-right.
     public var corners: [Vec3]
-    /// The part of the decoded frame it shows, in texture coordinates
-    /// (0...1, origin top-left): left, top, right, bottom.
+    /// Normalized texture coordinates (`0...1`, origin top-left) for the sampled region.
     public var atlasLeft, atlasTop, atlasRight, atlasBottom: Float
-    /// Soft border, as a fraction of the quad's width. 0 for a hard edge.
+    /// Edge feathering width as a fraction of the quad's width (`0` for a hard edge).
     public var feather: Float
-    /// When set, the quad is this flat color (red, green, blue, alpha in
-    /// linear light) instead of showing the decoded frame.
+    /// Optional solid linear RGBA fill color used instead of sampling a decoded picture.
     public var fill: [Float]?
-    /// Which of the frame's decoded pictures it shows.
+    /// Index of the decoded picture to sample.
     public var picture: Int
-    /// Where its transparency is, when the frame has any.
+    /// Separate alpha source when the stream carries transparency.
     public var alpha: AlphaSource?
 
     public init(corners: [Vec3], atlasLeft: Float = 0, atlasTop: Float = 0, atlasRight: Float = 0,
@@ -51,9 +48,8 @@ public struct Quad {
         self.fill = fill
     }
 
-    /// A flat-colored backdrop filling an eye's whole view, `distance`
-    /// meters away. It gives the compositor something with depth everywhere,
-    /// which it needs before it shows anything.
+    /// Creates a solid-color backdrop quad covering the eye's full field of view at `distance`
+    /// meters, ensuring every pixel has valid depth for the platform compositor.
     public static func backdrop(for view: EyeView, distance: Float, color: [Float]) -> Quad {
         let wide = Frustum(left: view.frustum.left * 1.5, right: view.frustum.right * 1.5,
                            down: view.frustum.down * 1.5, up: view.frustum.up * 1.5)
@@ -61,8 +57,8 @@ public struct Quad {
     }
 }
 
-/// Where one eye is and what it can see, for one displayed frame. Supplied by
-/// an XR runtime, or by a window standing in for one.
+/// Pose and projection frustum for a single eye on a given display frame,
+/// provided by the XR runtime (or a window renderer in flat-screen mode).
 public struct EyeView {
     public var eye: Pose
     public var frustum: Frustum
@@ -76,20 +72,19 @@ public enum Eye: Int, CaseIterable {
     case left = 0, right = 1
 }
 
-/// What a frame's pictures show, whichever protocol brought them: for each
-/// eye, where the host's eye was when it rendered, and the tiles that make
-/// up its view. A tile is a part of one decoded picture and the part of
-/// the eye's view it fills.
+/// Protocol-independent layout describing how a video frame's decoded pictures map
+/// to each eye's view. Each eye has the pose used by the host when rendering and an
+/// ordered list of tiles mapping UV regions of decoded pictures to view frusta.
 public struct FrameLayout {
     public struct Tile {
-        /// What the tile covers, seen from the rendering eye.
+        /// View frustum covered by this tile relative to the rendering eye pose.
         public var frustum: Frustum
-        /// Which decoded picture it is cut from, and where (0...1, origin top-left).
+        /// Decoded picture index and normalized UV bounds (`0...1`, origin top-left).
         public var picture: Int
         public var left, top, right, bottom: Float
-        /// Soft border, as a fraction of its width.
+        /// Edge feathering width as a fraction of the tile's width.
         public var feather: Float
-        /// Where its transparency is, when the frame has any.
+        /// Separate alpha source when the stream carries transparency.
         public var alpha: AlphaSource?
 
         public init(frustum: Frustum, picture: Int = 0, left: Float = 0, top: Float = 0, right: Float = 1,
@@ -103,9 +98,9 @@ public struct FrameLayout {
     }
 
     public struct View {
-        /// The eye the host rendered from, in world space.
+        /// World-space eye pose used by the host when rendering this view.
         public var eye: Pose
-        /// Back to front.
+        /// Tiles ordered back-to-front.
         public var tiles: [Tile]
 
         public init(eye: Pose, tiles: [Tile]) {
@@ -114,12 +109,11 @@ public struct FrameLayout {
         }
     }
 
-    /// Left, right.
+    /// Per-eye views ordered `[left, right]`.
     public var views: [View]
-    /// How many pictures a decoder must produce for one frame.
+    /// Number of decoded pictures required per frame.
     public var pictures: Int
-    /// One eye's whole view in pixels at the stream's finest detail: what a
-    /// renderer that flattens a view into a texture should size it from.
+    /// Effective per-eye resolution in pixels at peak stream density, used to size intermediate render targets.
     public var eyePixels: (width: Int, height: Int)
 
     public init(views: [View], pictures: Int = 1, eyePixels: (width: Int, height: Int)) {
@@ -128,22 +122,20 @@ public struct FrameLayout {
         self.eyePixels = eyePixels
     }
 
-    /// Whether what is behind the picture shows through any of it: the
-    /// room on a headset, then, and no black put behind the picture.
+    /// Whether any tile carries an alpha channel for passthrough compositing (skipping the opaque black backdrop).
     public var transparent: Bool { views.contains { $0.tiles.contains { $0.alpha != nil } } }
 
-    /// No picture at all; for tests and placeholders.
+    /// Empty layout used for tests and initial placeholders.
     public static let empty = FrameLayout(views: [], eyePixels: (0, 0))
 }
 
 public enum Composition {
-    /// How far in front of the rendering eye the picture is placed, in meters.
-    /// For a head that only turns, any distance looks the same. When the head
-    /// has also moved since the host rendered, the picture shifts as a surface
-    /// this far away would; far is the safe choice for a scene of unknown depth.
+    /// Projection distance in meters in front of the rendering eye. Pure rotation
+    /// is invariant to distance, while head translation since the frame was rendered
+    /// reprojects as a plane at this depth; 10 m is a comfortable default when scene depth is unknown.
     static let distance: Float = 10
 
-    /// The quads for one eye of a frame, back to front.
+    /// Builds world-space quads for `eye` ordered back-to-front.
     public static func quads(for eye: Eye, layout: FrameLayout) -> [Quad] {
         guard layout.views.indices.contains(eye.rawValue) else { return [] }
         let view = layout.views[eye.rawValue]

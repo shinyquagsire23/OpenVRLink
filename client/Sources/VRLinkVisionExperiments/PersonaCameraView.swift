@@ -11,20 +11,18 @@ import SwiftUI
 import VRLinkAppleFace
 import VRLinkCore
 
-/// The two SwiftUI attachments an immersive space needs for the Persona
-/// experiment, arranged as the ALVR visionOS client arranges them, which is
-/// the one arrangement known to make the Persona's camera follow its anchor:
+/// Manages the two SwiftUI attachments required to drive the Spatial Persona
+/// camera inside an immersive space, following the layout used by the ALVR
+/// visionOS client so visionOS tracks the camera anchor reliably:
 ///
-/// - "persona_camera": an empty view marked as the camera's anchor. Its
-///   entity sits at the top of the scene and is moved every frame
-///   (`placePersonaCameraEntity`).
-/// - "camera_view": the view that starts the camera, from inside the space,
-///   and shows its picture when that is asked for. Its entity stands two
-///   meters in front of where the space began.
+/// - `"persona_camera"`: an empty view with `.cameraAnchor(isActive: true)`
+///   placed at the scene root and updated every frame (`placePersonaCameraEntity`).
+/// - `"camera_view"`: starts capture from inside the space and optionally
+///   displays the annotated camera feed two meters in front of the initial origin.
 enum PersonaAttachments {
     static let anchor = "persona_camera", cameraView = "camera_view"
 
-    /// Put both attachments' entities into the scene; returns the anchor's, to be moved.
+    /// Adds both attachment entities to `content` and returns the camera anchor entity for per-frame updates.
     @MainActor
     static func add(to content: inout RealityViewContent, from attachments: RealityViewAttachments,
                     settings: VRLinkCore.Settings) -> Entity? {
@@ -44,11 +42,10 @@ enum PersonaAttachments {
     }
 }
 
-/// Put the Persona's camera entity one meter along the way the head faces,
-/// facing as the head does. With no other camera about, the Persona's
-/// camera lags behind its anchor instead of sitting on it; switching the
-/// anchor's entity off and on, two frames each, makes it jump to the newest
-/// place. (ALVR's method, unchanged.)
+/// Positions the Persona camera anchor one meter in front of the user's head
+/// with matching orientation. When no other camera is active, visionOS lets
+/// the Persona camera lag behind its anchor; toggling `isEnabled` every two
+/// frames forces it to snap to the latest pose (matching the ALVR workaround).
 @MainActor
 func placePersonaCameraEntity(_ entity: Entity, originFromDevice: simd_float4x4, tick: Int) {
     let ahead = originFromDevice.columns.3 - originFromDevice.columns.2
@@ -57,30 +54,29 @@ func placePersonaCameraEntity(_ entity: Entity, originFromDevice: simd_float4x4,
     entity.isEnabled = (tick / 2) % 2 == 1
 }
 
-/// The newest picture from the camera with its landmarks drawn in, for `PersonaCameraView`.
+/// Holds the latest landmark-annotated camera frame for `PersonaCameraView`.
 private final class PersonaPicture: ObservableObject {
     @Published var image: CGImage?
 }
 
-/// Starts the Persona's camera when it appears, inside the space; with
-/// `showPicture`, also shows what the camera sees, a dot on every landmark:
-/// eyes green, pupils red, brows blue, lips yellow, nose white, and a red
-/// border when no face was found.
+/// Starts the Persona camera when the view appears inside an immersive space.
+/// When `showPicture` is enabled, renders the live feed overlaid with colored
+/// landmark dots (green eyes, red pupils, blue brows, yellow lips, white nose)
+/// and a red border when no face is detected.
 struct PersonaCameraView: View {
     let persona: PersonaTracking
     let wanted: Bool
     let showPicture: Bool
-    /// The wearer's face calibration to use for this space, if any.
+    /// Optional user face calibration to apply in this space.
     let faceCalibration: FaceCalibration?
-    /// A face calibration in progress, whose instructions go above the picture.
+    /// Active face calibration state whose instructions are shown above the camera preview.
     var asking: FaceCalibrationRun? = nil
-    /// Asked at the moment the camera would be started: SwiftUI can make
-    /// this view afresh while its space is on the way out, and the camera
-    /// must not come on again then.
+    /// Checked right before starting capture. SwiftUI can recreate this view
+    /// while the immersive space is closing, and capture must not restart then.
     var mayStart: () -> Bool = { true }
     @StateObject private var picture = PersonaPicture()
 
-    /// Pictures shown per second; the camera gives 30.
+    /// Preview update rate in Hz (the camera captures at 30 fps).
     private static let rate = 10.0
 
     var body: some View {
@@ -112,7 +108,7 @@ struct PersonaCameraView: View {
         .onDisappear { persona.camera.onPicture = nil }
     }
 
-    /// The words of a face calibration: what to do, and how far along it is.
+    /// Displays the current prompt and progress status during face calibration.
     private struct Instructions: View {
         @ObservedObject var run: FaceCalibrationRun
         var body: some View {

@@ -8,19 +8,19 @@ import QuartzCore
 import VRLinkCore
 import simd
 
-/// Bare hands, from ARKit hand tracking, as the 26 joints the core wants.
+/// Tracks bare hands via ARKit and maps skeletons to the 26-joint layout expected by `VRLinkCore`.
 public final class HandJoints {
     public init() {}
 
     private let session = ARKitSession()
     private let provider = HandTrackingProvider()
     private let lock = NSLock()
-    /// The last hand seen on each side, shown a little longer when tracking drops out.
+    /// Most recent tracked skeleton per hand, held briefly if tracking drops out.
     private var last: [(hand: TrackedHand, time: TimeInterval)?] = [nil, nil]
 
-    /// How far ahead hands are predicted, in seconds
+    /// Prediction lookahead for hand anchors, in seconds.
     private static let lead: TimeInterval = 0.030
-    /// How long a hand that has stopped being tracked stays where it was.
+    /// Duration in seconds to hold the last known hand pose after tracking is lost.
     private static let holdAfterLoss: TimeInterval = 0.5
 
     public func start() {
@@ -34,8 +34,9 @@ public final class HandJoints {
         }
     }
 
-    /// ARKit's joints in the core's order: wrist, thumb, then four fingers
-    /// from the palm outwards. (The palm joint, which ARKit lacks, is added in front.)
+    /// ARKit joint names ordered to match `VRLinkCore`: wrist, thumb, and the
+    /// four fingers from metacarpal outward. The palm joint (not provided by
+    /// ARKit) is prepended separately.
     private static let names: [HandSkeleton.JointName] = [
         .wrist,
         .thumbKnuckle, .thumbIntermediateBase, .thumbIntermediateTip, .thumbTip,
@@ -53,30 +54,28 @@ public final class HandJoints {
         guard let anchor, anchor.isTracked, let skeleton = anchor.handSkeleton else { return nil }
         var joints: [Pose] = []
         for name in HandJoints.names {
-            // A joint hidden behind the rest of the hand is still given, as
-            // ARKit's best estimate; it is used as it is.
+            // Include occluded joints (`!joint.isTracked`) using ARKit's estimated transform.
             let joint = skeleton.joint(name)
             let m = anchor.originFromAnchorTransform * joint.anchorFromJointTransform
             func axis(_ column: SIMD4<Float>) -> Vec3 { Vec3(column.x, column.y, column.z) }
-            // ARKit's joint axes are mirrored between the hands. Its x axis
-            // runs along the finger: towards the tip on the left hand, away
-            // from it on the right. Its y axis comes out of the palm on the
-            // left hand and out of the back of the hand on the right. Its
-            // z axis points to the same side as the core's "right", reversed.
+            // ARKit mirrors joint basis axes between hands: +X runs along the
+            // bone toward the fingertip on the left hand and away from it on
+            // the right; +Y points out of the palm on the left hand and out of
+            // the back of the hand on the right; -Z matches VRLinkCore's right axis.
             let sign: Float = side == .left ? 1 : -1
             joints.append(Pose(position: axis(m.columns.3), right: axis(m.columns.2) * -1,
                                up: axis(m.columns.1) * -sign, forward: axis(m.columns.0) * sign))
         }
-        // A palm joint: halfway along the middle finger's first bone, facing as that bone does.
+        // Synthesize the palm joint at the midpoint of the middle metacarpal with the same orientation.
         var palm = joints[10]
         palm.position = (joints[10].position + joints[11].position) * 0.5
         return TrackedHand(joints: [palm] + joints)
     }
 
-    /// Both hands a moment from now: left then right, nil when not tracked.
+    /// Returns predicted `[left, right]` hand skeletons, or `nil` for any untracked hand past the hold timeout.
     public func hands() -> [TrackedHand?] {
         guard provider.state == .running else { return [nil, nil] }
-        // One caller at a time: ARKit's prediction calls must not overlap.
+        // Serialize queries because ARKit does not allow concurrent prediction calls.
         lock.lock()
         defer { lock.unlock() }
         let now = CACurrentMediaTime()

@@ -1,11 +1,12 @@
-# The SVLRoot key/value channel (`TransportValue_t`)
+# SVLRoot key/value channel (`TransportValue_t`)
 
 Separate from the VTS id table, `SVLRoot` keeps a `map<string, double>` that
-both peers mirror to each other: mostly statistics and tunables. Keys are short
-ASCII names whose first letter says who owns them (`c` client, `s` server,
-`g` global, plus a few unprefixed debug names).
+both peers mirror to each other for statistics and tunables. Keys are short
+ASCII names whose prefix indicates ownership (`c` for client, `s` for server,
+`g` for global, plus `d`/`n`/`ts`/`dbg` and unprefixed host/debug names).
 
-Binary: `libvrlink_scene.so`; offsets are file offsets. Little-endian.
+All offsets below are file offsets in `libvrlink_scene.so`, and all multi-byte
+fields are little-endian.
 
 ## 1. `TransportValue_t` — 32 bytes, packed
 
@@ -15,26 +16,26 @@ Binary: `libvrlink_scene.so`; offsets are file offsets. Little-endian.
 | 0x14 | float64 | value | unaligned |
 | 0x1c | int32 | timestamp | sender's SVL timestamp (µs, 32-bit, the transport clock) of the last `SetValue` |
 
-**static**: `SVLRoot::PopulatePeerValueSettings` +0x165684 (writer: `memcpy`
-of up to 20 key bytes, zero fill, 8-byte value at +0x14, 4-byte time at +0x1c),
-`SVLRoot::ParsePeerValueSettings` +0x164c28 (reader).
+The wire layout comes from `SVLRoot::PopulatePeerValueSettings` (+0x165684,
+writer: `memcpy` of up to 20 key bytes, zero-fill, 8-byte value at +0x14,
+4-byte time at +0x1c) and `SVLRoot::ParsePeerValueSettings` (+0x164c28, reader)
+(**static**).
 
-**captured** (capture `vr3`): e.g. the first client record is
-`63 50 68 61 73 65 4f 66 66 00…` (`cPhaseOff`), value `3500.0`, followed by a
-32-bit timestamp; all 17,444 client type-7 datasets are exactly 96 bytes and
-decode to sensible key/value pairs (52,332 records, 51 distinct keys, no
-empty slot). The timestamp is the sender's SVL clock: for `cPhaseOff`, which
-the client sets every frame, it is between 8 µs and 31 ms older than the
-"now" field of the pose packet in the same datagram, on the same 32-bit
-microsecond clock.
+In capture `vr3` (**captured**), the first client record is
+`63 50 68 61 73 65 4f 66 66 00…` (`cPhaseOff`) with value `3500.0`, followed by
+a 32-bit timestamp. All 17,444 client type-7 datasets are 96 bytes long and
+decode into 52,332 records across 51 distinct keys with no empty slots. The
+timestamp uses the sender's SVL clock: for `cPhaseOff`, which `vrlink` updates
+every frame, it is between 8 µs and 31 ms older than the "now" field of the
+pose packet in the same datagram, on the same 32-bit microsecond clock.
 
 ### String values
 
 `SetValue(key, const char*)` +0x1652e0 stores a string of at most 8 bytes *in
-the 8 bytes of the double* (zero padded) and marks the key by setting bit 7 of
+the 8 bytes of the double* (zero-padded) and marks the key by setting bit 7 of
 its first character (`key[0] |= 0x80`) (**static**). `GetValueS` +0x165108 is
-the reader. No caller of either function was found in the client's own code
-paths, so whether the host ever sends such entries is **unknown**; a parser
+the reader. No caller of either function was found in `vrlink`'s own code
+paths, so whether the host ever sends string entries is **unknown**; a parser
 should accept a key whose first byte is ≥ 0x80 and treat the value bytes as
 text.
 
@@ -46,26 +47,27 @@ text.
 | host → client | dataset type `0x07` | same; count = `len >> 5` | static: `SVLRoot::RXUnreliableStream` +0x164ae0 `case 7` |
 | host → client | video bookend trailer | count = `u8` at trailer +0x0d, entries start at trailer +0x10 (trailer version byte at +0x0c must be 3) | static: `QSVLClient::ReceivedBookend` +0xf6cf8 |
 
-The dataset header fields are the transport's (docs/svl-transport/); the
-`03 07` pair is the literal `0x0703` the client writes into the first two
+The dataset header fields belong to the transport layer (docs/svl-transport/);
+the `03 07` pair is the literal `0x0703` `vrlink` writes into the first two
 header bytes.
 
-**captured** (`vr3`): the client's type-7 dataset rides in the same UDP
-datagram as the pose dataset, directly before the frame report and the pose —
-in 17,444 of 17,446 datagrams; the two without are the session's first two,
-which client init sends before the tick that calls `SendValues`. The host
-sent no type-7 dataset in 40 s; all host values arrived in bookend trailers
-(8,632 bookends, always exactly 4 records each, cycling through the host's
-table: 34,528 records). So in practice the two directions use different
-carriers, the client 3 records 433 times a second and the host 4 records 217
-times a second.
+In `vr3` (**captured**), `vrlink`'s type-7 dataset rides in the same UDP
+datagram as the pose dataset, directly before the frame report and the pose,
+in 17,444 of 17,446 datagrams (the two datagrams without a type-7 dataset are
+the session's first two, sent during init before the first tick that calls
+`SendValues`). The host sent no type-7 datasets in 40 s; all host values
+arrived in bookend trailers (8,632 bookends, always 4 records each, cycling
+through the host's table for 34,528 total records). In practice the two
+directions use different carriers: `vrlink` sends 3 records 433 times per
+second and the host sends 4 records 217 times per second.
 
-The client sends one type-7 packet with **3 entries** on every pose tick:
-`QSVLClient::HandleEvent` +0xf4bec, posted event type 0, calls `SendValues(3)`
-and then `SendPoses`. (`SubmitMessage(ds, false, false)` — the two flags are
-the transport's; **inferred** unreliable, unacked.)
+`vrlink` sends one type-7 packet with **3 entries** on every pose tick:
+`QSVLClient::HandleEvent` (+0xf4bec, posted event type 0) calls `SendValues(3)`
+and then `SendPoses` via `SubmitMessage(ds, false, false)` (the two boolean
+flags belong to the transport layer and are **inferred** to mean unreliable and
+unacked).
 
-### Which entries go into a packet
+### Outgoing key selection
 
 ```python
 def populate(n):
@@ -84,35 +86,37 @@ def populate(n):
     return out
 ```
 
-**static**: +0x165684. So every key is eventually repeated (slot 0 cycles the
-whole map, including keys learned from the peer), and changed keys are pushed
-promptly through the other slots. There is no ack: loss is repaired by the
-cycle.
+This selection logic is in `SVLRoot::PopulatePeerValueSettings` (+0x165684,
+**static**). Every key is eventually repeated because slot 0 cycles through the
+entire map (including keys learned from the peer), while changed keys go out
+promptly through slots 1..n−1. There is no ack; packet loss is recovered on the
+next round-robin pass.
 
-**captured** (`vr3`): the slot statistics match. Keys that never change
-(`cFramePhase`, `cAudDrop`, `encResets`, every echoed host key) each appear
-about 720–800 times in 17,444 datasets — once per round-robin lap of the
-51-key map, roughly 18 times a second — and are spread over all three slots,
-as they are when nothing is dirty. Keys the client rewrites every frame are
-far more frequent and sit mostly in slots 1 and 2: `cPhaseOff` 5,020 times
-(4,089 of them in slot 1), `cPingAMS` 4,967, `cPingMS` 3,738, `cAudUnd` 3,613.
-A changed value therefore reaches the host within a pose tick or two, and an
-unchanged one is refreshed about every 55 ms.
+In `vr3` (**captured**), the slot counts match this schedule. Keys that never
+change (`cFramePhase`, `cAudDrop`, `encResets`, and every echoed host key) each
+appear 720–800 times across 17,444 datasets—once per round-robin pass over the
+51-key map (~18 times per second)—and are spread across all three slots when no
+keys are dirty. Keys that `vrlink` updates every frame appear much more often
+and land mostly in slots 1 and 2: `cPhaseOff` 5,020 times (4,089 in slot 1),
+`cPingAMS` 4,967, `cPingMS` 3,738, and `cAudUnd` 3,613. A modified value
+therefore reaches the host within one or two pose ticks, and an unchanged key
+is refreshed roughly every 55 ms.
 
 ### Receive rule
 
 For each non-empty entry: if the key is in the receiver's *locally-set* set
-(any key this side has ever passed to `SetValue`), the entry is **ignored** —
-local ownership wins. Otherwise `values[key] = value` and
-`timestamps[key] = peer_ts` converted to the local clock with the transport's
-clock-offset estimate (`ts + (A − B)/2` with `A = SVLRoot+0xc7c`,
-`B = SVLRoot+0xc84`; see the transport/timing docs for those two) (**static**
-+0x164c28). A received value does not mark the key dirty, but it does enter the
-round-robin, so each side echoes the other's keys back.
+(any key this side has ever passed to `SetValue`), the entry is **ignored** so
+that local ownership wins. Otherwise `values[key] = value` and
+`timestamps[key] = peer_ts` converted to the local clock using the transport's
+clock-offset estimate (`ts + (A − B)/2` with `A = SVLRoot+0xc7c` and
+`B = SVLRoot+0xc84`; see docs/svl-timing/ for those fields) (**static**,
++0x164c28). Receiving a value does not mark the key dirty, but the key enters
+the map and is visited by slot 0's round-robin, so each side echoes the other's
+keys back.
 
-`SetValue(key, double)` +0x164fec (**static**): stores the value, adds the key
-to the dirty set only if the value changed, adds it to the locally-set set, and
-stamps `GetCurrentTimestamp()`.
+`SetValue(key, double)` (+0x164fec, **static**) stores the value, adds the key
+to the dirty set only if the value changed, records it in the locally-set set,
+and stamps `GetCurrentTimestamp()`.
 
 ## 3. Key list
 
@@ -154,42 +158,42 @@ here: `gTfT`, `sRFTXRate`, `cTXerr`/`sTXerr`, `cRXFailFuzz`/`sRXFailFuzz`,
 injection), `dbgEncTimeMS`, `dbgStartEnc`, `dbgTXWaitMS` (host-side encoder
 debug names). Their meanings are **inferred from the names only**.
 
-Not keys of this channel, despite the prefix (they are JSON config keys or
-launch-option names): `sTrackingSystem`, `sSerialNumber`, `sManufacturerName`,
-`sModelNumber`, `sRenderModelName`, `sResourceRoot`, `sInputProfilePath`,
-`sControllerType`, `sDeviceType`, `sNetworkTest`, `sStartInfo`, `sTCPIp`,
-`sUDPIp`, `sDescription`, `sPermission`, `sText`, `sTitle`,
-`sOriginalPackage`, `sOriginalActivity`. The `cA9h`-style names in Klepton's
-SL-23 list are machine-code bytes that happen to be printable, not keys.
+Several other `c*`- and `s*`-prefixed strings in `libvrlink_scene.so` are JSON
+config keys or Android launch-option names rather than keys on this channel:
+`sTrackingSystem`, `sSerialNumber`, `sManufacturerName`, `sModelNumber`,
+`sRenderModelName`, `sResourceRoot`, `sInputProfilePath`, `sControllerType`,
+`sDeviceType`, `sNetworkTest`, `sStartInfo`, `sTCPIp`, `sUDPIp`,
+`sDescription`, `sPermission`, `sText`, `sTitle`, `sOriginalPackage`, and
+`sOriginalActivity`. Likewise, the `cA9h`-style strings in Klepton's SL-23 list
+are printable machine-code byte sequences rather than keys.
 
 ### Keys seen on the wire (**captured**, capture `vr3`)
 
-Client-owned keys observed in client packets, with the range of values over
-the 40 s session: `cPhaseOff` 3..8331, `cFramePhase` 0.3, `cStandoff`
-3490..3500, `cPingMS` −6.3..1.4 (negative while the clock estimate settles;
-docs/svl-transport/time-sync.md §3), `cPingAMS` −0.5..100, `cRXpps`
-6..11350 (1,128..1,738 after the startup burst), `cRXerr` 0, `cRXpass` 100,
-`dbgPhaFault` 0, and the eleven `cAud*` keys (`cAudUnd` climbing from 4,080
-to 1.47 million, `cAudBufAvg` 0..50, `cAudBufMax` 0..64; docs/svl-audio/).
-20 client keys in all. `rexmitReq` and
-`rexmitSent` never appear: `vr3` lost no datagram and the client asked for no
-retransmission (`vr1`, with real loss, showed `rexmitReq` 9..186, `cRXerr` up
-to 43 and `cRXpass` down to 91.7).
+Client-owned keys observed in `vrlink` packets over the 40 s session (20 keys
+in total), with their observed value ranges: `cPhaseOff` 3..8331, `cFramePhase`
+0.3, `cStandoff` 3490..3500, `cPingMS` −6.3..1.4 (negative while the clock
+estimate settles; docs/svl-transport/time-sync.md §3), `cPingAMS` −0.5..100,
+`cRXpps` 6..11350 (1,128..1,738 after the startup burst), `cRXerr` 0, `cRXpass`
+100, `dbgPhaFault` 0, and the eleven `cAud*` keys (`cAudUnd` climbing from
+4,080 to 1.47 million, `cAudBufAvg` 0..50, `cAudBufMax` 0..64; docs/svl-audio/).
+`rexmitReq` and `rexmitSent` never appear because `vr3` lost no datagrams and
+`vrlink` requested no retransmissions (`vr1`, which had packet loss, showed
+`rexmitReq` 9..186, `cRXerr` up to 43, and `cRXpass` down to 91.7).
 
-The client's keys start at once — `cPhaseOff` and `cFramePhase` are in its
-third datagram — except `cRXpps`, `cRXpass` and `cRXerr`, which first appear
-0.91 s in, when `CheckUpdateCounters` first has a second's worth to report.
-The host's keys first reach the client in the first bookend (0.926 s), and
-the client is echoing them back within 15 ms.
+`vrlink`'s keys start immediately—`cPhaseOff` and `cFramePhase` are in its
+third datagram—except for `cRXpps`, `cRXpass`, and `cRXerr`, which first appear
+at 0.91 s once `CheckUpdateCounters` finishes its first 1 s window. The host's
+keys first reach `vrlink` in the first bookend (0.926 s), and `vrlink` begins
+echoing them back within 15 ms.
 
-Host-owned keys. These were decoded both from bookend trailers and from the
-client's own packets, because the client's round-robin slot echoes every key
-it has learned from the host back to it (as the static reading predicts — and
-the host likewise echoes `c*` keys back in its bookends):
+The 31 host-owned keys observed in `vr3` are listed below. They were decoded
+both from bookend trailers and from `vrlink`'s outgoing packets, since
+`vrlink`'s round-robin slot echoes every key learned from the host (and the
+host likewise echoes `c*` keys back in its bookends):
 
 | key | values seen | meaning (**inferred** from the name unless noted) |
 |---|---|---|
-| `sRXpps`, `sRXerr`, `sRXpass` | 247 then 410..451; 0; 100 | host's receive counters (same code as the client's): `sRXpps` tracks the client's real 433 datagrams per second |
+| `sRXpps`, `sRXerr`, `sRXpass` | 247 then 410..451; 0; 100 | host's receive counters (same code as the client's): `sRXpps` tracks `vrlink`'s 433 datagrams per second |
 | `sPingMS` | −6.25..0.65 | host's round-trip estimate (negative for the same reason as `cPingMS`; `vr1`'s 2399..3727 was that capture's broken clock sync) |
 | `sTimeConf` | 387, then 400 from 1.39 s | time-sync confidence counter (`SVLRoot+0xc80` saturates at 400 in `SymmetricTimingUpdate`) |
 | `dCurBW`, `dTargetBW`, `dEstLinkBW`, `dProblemBW`, `dHitchMaxBW` | 0.06..208, 27.9..199, 120..199, 120..200, 27.6..347.5 | bitrate controller state, Mbit/s. `dTargetBW` starts at 198.7, drops to 67.5 within 35 ms of the first frame and then moves between about 28 and 153 |
@@ -202,34 +206,34 @@ the host likewise echoes `c*` keys back in its bookends):
 | `nFramesSkippedPS` | 1, 6, then 0 from 3.2 s | frames skipped per second |
 | `encResets` | 3 | encoder resets (constant through the session) |
 | `tsLastWGP` | 2.005e9..2.044e9, advancing 1e6 per second | a timestamp on the host's SVL microsecond clock |
-| `txTimeMS` | 0.017..0.156 | time to send a frame's packets, ms. Listed above among the keys the client's code can write (the FEC transmit path), but in `vr3` it first appears in the client's packets only after the host's bookends have delivered it: here it is the host's, echoed |
+| `txTimeMS` | 0.017..0.156 | time to send a frame's packets, ms. Listed above among the keys the client's code can write (the FEC transmit path), but in `vr3` it first appears in `vrlink`'s packets only after the host's bookends have delivered it, meaning it is echoed from the host |
 
-That is 31 host keys. The host's bookends carry all 51 keys — its own 31
-and the client's 20 echoed back — under the same selection rule as the
-client's: keys that change every frame are in about every second bookend
-(`dCurBW`, `dEstLinkBW`, `GetData`, `StartNvEnc` 4,200–4,400 times in 8,632;
-`dHitchMaxBW`, `dProblemBW` 3,200–3,700), while a constant such as
-`nLayerCount` or an echoed client key comes round about 170 times, four a
-second.
+The host's bookends carry all 51 keys—its own 31 plus `vrlink`'s 20 echoed
+back—using the same selection rule as `vrlink`: keys that change every frame
+appear in roughly every second bookend (`dCurBW`, `dEstLinkBW`, `GetData`, and
+`StartNvEnc` 4,200–4,400 times in 8,632 bookends; `dHitchMaxBW` and
+`dProblemBW` 3,200–3,700), while constant keys such as `nLayerCount` or echoed
+client keys repeat about 170 times (~4 times per second).
 
-Not seen in either capture: `sFramePhase`, `gLimitMBPS`, `sBWFECLim`, `gTfT`,
-`sRFTXRate`, any `*FailFuzz` key, and any string-valued entry (no key with
-bit 7 set in its first byte among 86,860 records).
+None of the following appeared in either capture: `sFramePhase`, `gLimitMBPS`,
+`sBWFECLim`, `gTfT`, `sRFTXRate`, any `*FailFuzz` key, or any string-valued
+entry (no key had bit 7 set in its first byte across 86,860 records).
 
-## Open questions / to confirm on the wire
+## Open questions
 
-Resolved by `vr3`: record layout, 3 records per pose tick, the round-robin +
-echo behavior and its cadence, the host key list above, and that the
-timestamp field is the sender's SVL clock.
+Capture `vr3` confirmed the 32-byte record layout, the 3-records-per-pose-tick
+send rate, the round-robin and echo behavior, the host key list above, and the
+use of the sender's SVL clock for the timestamp field.
 
-3. Whether the host needs any client key to keep streaming well. The probe
-   has shown none is needed to *start* (startup-exchange.md: video with only
-   pose, frame-report and three statistics keys). Klepton's SL-26 suspects
-   `cPhaseOff` drives the host's bitrate; a probe client can hold
-   `cRXpass = 100`, `cPhaseOff` constant and observe `dTargetBW`.
-4. Whether string-valued entries (key byte 0 ≥ 0x80) ever appear. None in
-   either capture.
-6. Whether the host ever uses a type-0x07 dataset (the client can parse one),
-   for instance before video when it has no bookend to put its keys in. In
-   `vr3` it sent none in the 0.93 s before the first frame.
-7. What the host does with the client keys it receives, beyond echoing them.
+1. Does the host require any client keys to maintain stream quality? The probe
+   showed none are needed to *start* video ([startup-exchange.md](startup-exchange.md):
+   video starts with only pose, frame-report, and three statistics keys).
+   Klepton's SL-26 suspects `cPhaseOff` drives the host's bitrate; a probe
+   client can test this by holding `cRXpass = 100` and `cPhaseOff` constant
+   while observing `dTargetBW`.
+2. Do string-valued entries (key byte 0 ≥ 0x80) ever appear on the wire? None
+   were seen in either capture.
+3. Does the host ever send a type-0x07 dataset (which `vrlink` can parse), for
+   instance before video starts when no bookends are flowing? In `vr3` it sent
+   none during the 0.93 s before the first frame.
+4. Which client keys does the host consume, beyond echoing them back?

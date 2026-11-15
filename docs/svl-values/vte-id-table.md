@@ -6,18 +6,19 @@ names are not in the binary as a table; a name is given below only where a log
 string next to the call site spells it. Everything else is labeled by what the
 code does with it.
 
-Wire format: [value-transport-wire-format.md](value-transport-wire-format.md).
-Offsets are file offsets in `libvrlink_scene.so`. Little-endian throughout.
+See [value-transport-wire-format.md](value-transport-wire-format.md) for the
+chunk and ack framing. All offsets below are file offsets in
+`libvrlink_scene.so`, and all multi-byte values are little-endian.
 
-Evidence: **static** = read from the binary; **captured** = decoded from the
-streaming capture `vr3` (Klepton `KL_TRACE_NET` trace of the real client
-against a real host: complete, untorn, timestamped; every value below was
-reassembled in full with `ovrlink/vts.py`); the "seen" column gives the size
-and first bytes observed there. Where `vr1` showed something `vr3` did not, it
-is named. **inferred** = guess.
+Claims are tagged **static** (read from `libvrlink_scene.so`), **captured**
+(decoded from streaming capture `vr3`, a complete, untorn, timestamped Klepton
+`KL_TRACE_NET` trace of `vrlink` against a SteamVR host, reassembled in full
+with `ovrlink/vts.py`), or **inferred**. The "seen in capture" column gives the
+byte size and initial bytes observed in `vr3`; `vr1` is cited only where it
+showed behavior absent from `vr3`.
 
-In `vr3` the client sent 17 ids and the host 19; ids present in the tables
-below and marked "not seen" did not occur in either capture.
+In `vr3`, `vrlink` sent 17 distinct ids and the host sent 19; ids listed in the
+tables below and marked "not seen" did not occur in either capture.
 
 ## Client → host
 
@@ -34,7 +35,7 @@ below and marked "not seen" did not occur in either capture.
 | 0x10 | *(power props, HMD)* | 12 | `VTE_PowerProps_t` | 1 Hz re-check, sent on change | static | `3f000000 1b000000 3333733f` (0.95) — captured |
 | 0x11 | *(power props, left)* | 12 | same | same | static | `3f000000 1a000000 00000000` — captured |
 | 0x12 | *(power props, right)* | 12 | same | same | static | same — captured |
-| 0x13 | *(dashboard / focus event)* | 52 | byte 0 = event code, rest zero. Client sends `4` on losing OpenXR focus, `5` on gaining it | `QSVLClientXR::OnUnFocused` +0xfb578 / `OnFocused` +0xfb600, as events | static | `05` + 51 zero bytes, once, 30 ms in; not repeated after the invalidation — captured |
+| 0x13 | *(dashboard / focus event)* | 52 | byte 0 = event code, rest zero. `vrlink` sends `4` on losing OpenXR focus and `5` on gaining it | `QSVLClientXR::OnUnFocused` +0xfb578 / `OnFocused` +0xfb600, as events | static | `05` + 51 zero bytes, once, 30 ms in; not repeated after the invalidation — captured |
 | 0x15 | `VTE_HOST_DEFAULTS` | 8 | constant `03 00 00 00 01 00 00 00` | init, prop refresh | static | identical — captured |
 | 0x18 | *(client audio FEC capabilities)* | 4 | `u32` = 3 | `SVLAudio` ctor +0x156c88 | static (docs/svl-audio/) | `03 00 00 00` — captured |
 | 0x1d | *(network test)* | variable | string from `AppPaths` entry 10; log `[SVLClient] Sending Network Test: %s` | init, prop refresh | static | **not on the wire**: the string was empty and a zero-length value is never transmitted — captured (log line present, no element) |
@@ -69,22 +70,23 @@ and the capture shows the client never sends them.
 | 0x26 | *(audio jitter-buffer settings)* | 47 | packed struct, docs/svl-audio/ | static | `01 01 01 32000000 19000000 0f000000 14000000 07000000 f4010000 f4010000 02000000 32000000 0a000000 05000000` — captured |
 | 0x27 | *(wireless timeout)* | 4 | `u32`; log `[SVLClientXR] Wireless timeout updated to: %i`; forwarded to the app shell | static: lambda +0xfbf7c | `1e 00 00 00` = 30, sent once as an event in the host's second datagram (3.9 ms); the client logged `Wireless timeout updated to: 30`. The probe found SteamVR exits about 30 s after the client goes away, so the unit is seconds — captured |
 | 0x28 | `VTE_COMPOSITION_LAYER_SETTINGS` | 8 | two `u32` flag words (one per stream layer): bit 0 quality sharpening, bit 1 normal sharpening, bit 2 quality super-sampling, bit 3 normal super-sampling (mapped onto `XR_FB_composition_layer_settings`) | static: lambda +0x10c654 | not seen |
-| 0x29 | *(QoS on/off)* | 4 | `u32` bool → `SVLDataLinkUDP::ChangeQoSState(bool)` +0x1685a0 | static: lambda +0x1665d8 | `01 00 00 00`, as an event in the host's second datagram (3.9 ms) and again as version 2 in bookend trailers at 1.051 s. On the first the client tore down its socket and re-created it on the same local port with `IP_TOS` 255 (log: `SVLDataLinkUDP::Disconnect()` … `Changing tos opt = 255`; docs/svl-transport/connection-lifecycle.md §1.1); the second, being no change, did nothing — captured |
-| 0x2b | *(prop refresh request)* | any | any update: `[SVLClient] Server requested prop refresh`; client marks 0x04, 0x05, 0x08, 0x0d–0x12, 0x15, 0x1d, 0x20, 0x22 dirty | static: lambda +0xf81d0 | `00 00 00 00` (the 4 zero bytes `SendEvent(id)` sends), once, in the host's second datagram (3.9 ms), i.e. before the host had received anything but the client's first two packets; the client logged the refresh and re-generated its chaperone — captured |
-| 0x2e | *(hand tracking enable)* | 1 | `u8` bool: create / destroy the OpenXR hand trackers; log `[XRQ] Hand tracking status updated: %s` | static: lambda +0xfc478 | `01`, first datagram; the client logged `Hand tracking status updated: On` — captured |
+| 0x29 | *(QoS on/off)* | 4 | `u32` bool → `SVLDataLinkUDP::ChangeQoSState(bool)` +0x1685a0 | static: lambda +0x1665d8 | `01 00 00 00`, as an event in the host's second datagram (3.9 ms) and again as version 2 in bookend trailers at 1.051 s. On the first event `vrlink` tore down its socket and recreated it on the same local port with `IP_TOS` 255 (log: `SVLDataLinkUDP::Disconnect()` … `Changing tos opt = 255`; docs/svl-transport/connection-lifecycle.md §1.1); the second event carried the same value and was a no-op — captured |
+| 0x2b | *(prop refresh request)* | any | any update: `[SVLClient] Server requested prop refresh`; `vrlink` marks 0x04, 0x05, 0x08, 0x0d–0x12, 0x15, 0x1d, 0x20, 0x22 dirty | static: lambda +0xf81d0 | `00 00 00 00` (the 4 zero bytes `SendEvent(id)` sends), once, in the host's second datagram (3.9 ms), i.e. before the host had received anything beyond `vrlink`'s first two packets; `vrlink` logged the refresh and regenerated its chaperone — captured |
+| 0x2e | *(hand tracking enable)* | 1 | `u8` bool: create / destroy the OpenXR hand trackers; log `[XRQ] Hand tracking status updated: %s` | static: lambda +0xfc478 | `01`, first datagram; `vrlink` logged `Hand tracking status updated: On` — captured |
 
-Ids with no reader and no writer in the client: 0x00, 0x03, 0x07, 0x09, 0x0a,
-0x0b, 0x2a, 0x2c, 0x2d, 0x2f–0x32. Id 0 cannot be used: `RXMessage` logs
+Ids with no reader and no writer in `vrlink`: 0x00, 0x03, 0x07, 0x09, 0x0a,
+0x0b, 0x2a, 0x2c, 0x2d, 0x2f–0x32. Id 0 cannot be used because `RXMessage` logs
 `Unknown VTE` for it.
 
-### Ids outside this client's table (**captured**)
+### Out-of-table host ids (**captured**)
 
-The host (bookend protocol version 14) sends values this client build has no
-slot for. They arrive in bookend trailers as ordinary single-chunk values —
-in `vr3` all five first appear at 1.052 s, in the bookend after the one that
-introduced 0x06, 0x17, 0x1c and 0x29, and are carried by 12 bookends in a
-row (18 ms) until the client's acks are processed — and the client acks them (it
-acks any data chunk before looking at the id) and never reads them:
+The host (bookend protocol version 14) sends values that this `vrlink` build
+has no enum slot for. They arrive in bookend trailers as ordinary single-chunk
+values—in `vr3` all five first appear at 1.052 s, in the bookend following the
+one that introduced 0x06, 0x17, 0x1c, and 0x29, and repeat across 12
+consecutive bookends (18 ms) until `vrlink`'s acks are processed—and `vrlink`
+acks them (it acks every valid data chunk before checking the id) and never
+reads them:
 
 | id | size | value seen |
 |---|---|---|
@@ -94,43 +96,44 @@ acks any data chunk before looking at the id) and never reads them:
 | 0x67 | 1 | `00` |
 | 0x72 | 1 | `00` |
 
-A compatible client must parse and ack them. What they mean is unknown apart
-from 0x35 (next section).
+A compatible client must parse and ack these ids. Their meanings are unknown
+apart from 0x35 (see below).
 
-### What the host tells a client about what is running (**captured**, 2026-11-11)
+### Host values during application launch (**captured**, 2026-11-11)
 
-Two sessions with the Swift client logging every host value and every
-message it does not act on, whenever the bytes changed (`OPENVRLINK_LOG_HOST=1`):
+Two sessions were recorded with the Swift client logging every host VTS value
+and unhandled message whenever payload bytes changed (`OPENVRLINK_LOG_HOST=1`):
 
-- Mac viewer, 190 s from a cold SteamVR start, nothing launched: every value
-  below was sent once and never changed, 0x06 included.
-- Vision Pro, about 3 minutes: bare hands, dashboard dismissed, two
-  controllers connected, dashboard opened, The Lab (`steam.app.450390`)
-  launched from it, The Lab quit from the dashboard about 12 s later.
+- Mac viewer, 190 s from a cold SteamVR start with no app launched: every value
+  below was sent once and never changed, including 0x06.
+- Vision Pro, ~3 minutes: bare hands, dashboard dismissed, two controllers
+  connected, dashboard opened, The Lab (`steam.app.450390`) launched from the
+  dashboard, and The Lab quit from the dashboard ~12 s later.
 
-| id | size | idle | while The Lab ran | reading |
+| id | size | idle | while The Lab ran | notes |
 |---|---|---|---|---|
-| 0x35 | 4 | `00 00 00 00` | `01 00 00 00` (version 2), back to `00 00 00 00` (version 3) as it quit | **inferred**: `u32`, non-zero while a scene application is running. The host's `vrserver.txt` has The Lab connecting and "Clearing application steam.app.450390" at times that fit the two changes (the client's log had no clock, so the fit is to the second, by counting its once-a-second lines) |
-| 0x06 | 32 | `6e cf bd fe 6f 2b 00 …` then zeros | unchanged | not tied to applications. The same six bytes in both sessions, which had different host instance ids (0x02), so it is not per session either; still unknown |
+| 0x35 | 4 | `00 00 00 00` | `01 00 00 00` (version 2), back to `00 00 00 00` (version 3) as it quit | **inferred**: `u32`, non-zero while a scene application is running. The host's `vrserver.txt` logs The Lab connecting and `"Clearing application steam.app.450390"` at timestamps matching both transitions (the client log lacked wall-clock timestamps, so alignment is within ~1 s via its 1 Hz status lines) |
+| 0x06 | 32 | `6e cf bd fe 6f 2b 00 …` then zeros | unchanged | unrelated to scene applications. Identical six non-zero bytes in both sessions despite different host instance ids (0x02), so it is not per-session either; still unknown |
 | 0x1b, 0x1f | 4 | `01 00 00 00` | unchanged | unknown |
 | 0x64, 0x65, 0x67, 0x72 | 1 | `00` | unchanged | unknown |
-| 0x17 | 104 | `03 00 00 00` then zeros | unchanged | color control was not in use by either scene |
-| 0x21 | 4 | 120.0, then 90.0 on the headset (version 5) | unchanged | follows the display, not the application |
+| 0x17 | 104 | `03 00 00 00` then zeros | unchanged | color control was unused in both scenes |
+| 0x21 | 4 | 120.0, then 90.0 on the headset (version 5) | unchanged | tracks display refresh rate rather than the running application |
 
-Opening and closing the dashboard, and connecting controllers, changed no
-value. The only message not acted on was the host address list (class 3 type
-0x18), identical every 2 s.
+Opening and closing the dashboard and connecting controllers changed no host
+values. The only unhandled transport message was the host address list (class 3
+type 0x18), repeated identically every 2 s.
 
-So a client is told **that** a scene application is running, and nothing
-about **which**: no app id, name or key in any value, in discovery
-(`games_running` is a single flag, docs/remoteplay/) or in either reference
-client build's strings. One title was tried; whether 0x35 ever takes a value
-other than 0 and 1 (a count, or a state such as loading) is not known.
-Deciding anything per title is not possible from the protocol as understood.
+Thus the host indicates **whether** a scene application is running (via 0x35),
+without identifying **which** application: no app ID, title, or key appears in
+any VTS value, in discovery packets (`games_running` is a single boolean flag;
+see docs/remoteplay/), or in strings from either `vrlink` build. Only one title
+was tested, so whether 0x35 ever takes values other than 0 and 1 (such as an
+app count or a loading state) is unknown. Per-title client behavior is
+therefore not supported by the protocol as currently understood.
 
-The Swift client uses 0x35 for one thing: with the setting `chromaKeyOffInGames`
-the chroma key applies in SteamVR's own grid and is dropped while 0x35 is not
-zero (`StreamSession.sceneApplicationRunning`).
+The Swift client uses 0x35 for `chromaKeyOffInGames`: chroma-key passthrough
+stays active in SteamVR's construct grid and turns off while 0x35 is non-zero
+(`StreamSession.sceneApplicationRunning`).
 
 ## Payload details
 
@@ -149,17 +152,17 @@ zero (`StreamSession.sceneApplicationRunning`).
 | 8 | mic volume maximum |
 | 9 | mic volume |
 
-**static**: the receive lambda +0xfbdfc logs
+In `libvrlink_scene.so` (**static**), the receive lambda (+0xfbdfc) logs
 `VTE_CLIENT_AUDIO_STATE %d(%d) %d/%d(%d) - %d(%d) %d/%d(%d)` with bytes
 `4(0) 7/6(2) - 5(1) 9/8(3)` and applies: byte 0 → `SetSystemVolumeMute(b4)`,
-byte 1 → `SetMicrophoneMute(b5)`, byte 2 → `SetSystemVolume(b7)`. The client
-sends `01 01 01 00, muted, micMuted, steps, volume, ff ff` (+0xfa6e0);
-**captured** `01 01 01 00 00 00 10 0f ff ff` (16 steps, volume 15).
+byte 1 → `SetMicrophoneMute(b5)`, byte 2 → `SetSystemVolume(b7)`. Outbound,
+`vrlink` sends `01 01 01 00, muted, micMuted, steps, volume, ff ff` (+0xfa6e0);
+`vr3` **captured** `01 01 01 00 00 00 10 0f ff ff` (16 steps, volume 15).
 
 ### `VTE_CLIENT_CHAPERONE` (0x05)
 
-**captured** (formatted; one universe; this run had no guardian so bounds are
-degenerate):
+Decoded from `vr3` (**captured**, formatted for readability; one universe; this
+run had no guardian configured, so the bounds are degenerate):
 
 ```json
 {"jsonid":"chaperone_info",
@@ -174,27 +177,33 @@ degenerate):
  "version":5}
 ```
 
-Each collision-bounds quad is a wall: two floor corners and the same two
-corners at height 2.43 m (**inferred** from the shape; SteamVR's
+Each collision-bounds quad represents one wall: two floor corners and the same
+two corners at height 2.43 m (**inferred** from the geometry; SteamVR's
 `chaperone_info.vrchap` uses the same layout). `play_area` is `[width, depth]`
-in meters. Key strings are **static** in `ChaperoneXR::Generate` +0x12ec58.
+in meters. Key strings come from `ChaperoneXR::Generate` (+0x12ec58,
+**static**).
 
-## Open questions / to confirm on the wire
+## Open questions
 
-1. Names and meaning of host ids 0x06 (32 bytes), 0x1b, 0x1f (4 bytes, value 1)
-   — only the host binary can say; the client ignores them.
-2. Meaning of the out-of-table ids 0x64/0x65/0x67/0x72, and whether 0x35
-   (scene application running, **inferred**) takes values besides 0 and 1.
-   The newest client build (2.0.25) was not searched for readers of them.
-3. The non-zero fields of 0x17 when color control is actually in use (both
-   captures: version word 3, the rest zero). The payloads of 0x27 and 0x2b
-   are now captured (30, and four zero bytes).
-7. Whether 0x20 really is re-sent once a second while no 0x21 has arrived
-   (static; in `vr3` the request came after 33 ms, so the timer never showed).
-8. What updates 0x06 (`vr3`: one version in 40 s; `vr1`: three; two sessions
-   on 2026-11-11, one with an application launched and quit: one version each).
-4. Whether the host reads 0x13 codes other than 4/5, and what other codes it
-   sends besides 2.
-5. Whether 0x1d / 0x25 matter to the host (both were empty, hence absent, in a
-   session that streamed fine — so they are not required).
-6. The 24-byte shader-push header's first `u32` and last 8 bytes.
+1. What are the names and meanings of host ids 0x06 (32 bytes), 0x1b, and 0x1f
+   (4 bytes, value 1)? `vrlink` ignores all three, so only the host binary can
+   answer this.
+2. What do out-of-table ids 0x64, 0x65, 0x67, and 0x72 represent, and does 0x35
+   (scene application running, **inferred**) ever take values besides 0 and 1?
+   The newer `vrlink` 2.0.25 build has not yet been searched for readers of
+   these ids.
+3. What are the non-zero fields of 0x17 (`VTE_PROP_COLOR_CONTROL`) when color
+   control is active? Both captures had version word 3 followed by zeros.
+   (Payloads for 0x27 and 0x2b are now captured: 30 and four zero bytes.)
+4. Is 0x20 actually re-sent once per second while waiting for 0x21 (**static**)?
+   In `vr3` the host replied after 33 ms, so the 1 s timer never fired.
+5. What triggers updates to 0x06? Capture `vr3` had one version in 40 s, `vr1`
+   had three, and both 2026-11-11 sessions (one of which launched and quit an
+   application) had a single version each.
+6. Does the host read 0x13 event codes other than 4 and 5, or send codes other
+   than 2?
+7. Do 0x1d (network test) and 0x25 (Wi-Fi BSSID) affect host behavior when
+   non-empty? Both were empty—and therefore omitted—in a session that streamed
+   normally, so neither is required.
+8. What are the first `u32` and trailing 8 bytes of the 24-byte shader-push
+   header (0x1e)?

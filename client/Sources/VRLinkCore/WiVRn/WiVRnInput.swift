@@ -4,18 +4,17 @@
 
 import Foundation
 
-/// What the hands hold, as a WiVRn host wants it (docs/wivrn/protocol.md):
-/// a controller is a Touch controller, as it is for a Steam host, and a
-/// bare hand is OpenXR's "hand interaction" device, whose inputs are a
-/// pinch, an aim-and-pinch and a grasp.
+/// Maps controller and hand state to WiVRn input IDs (docs/wivrn/protocol.md).
+/// Controllers map to Oculus Touch profiles (matching SteamVR), and tracked
+/// hands map to `XR_EXT_hand_interaction` with pinch, aim-activate, and grasp inputs.
 ///
-/// An input is a number with a place in WiVRn's list of them (release
-/// 26.9); the right hand's are in the same order as the left's, further on.
+/// Each input is identified by its index in WiVRn's input table (release 26.9).
+/// Right-hand input IDs follow the same layout as left-hand IDs at a higher base offset.
 extension ControllerState {
-    /// Where a Touch controller points from, relative to its grip pose:
-    /// the offset the Steam Link client sends for Touch
-    /// (docs/svl-tracking-input/controllers.md). Inferred to serve as
-    /// OpenXR's aim pose; a platform that knows the aim says so in `aim`.
+    /// Returns the OpenXR aim pose for a Touch controller. If the platform
+    /// provides a native aim pose in `aim`, that is used directly; otherwise
+    /// it is derived from the grip pose using the Touch offset from `vrlink`
+    /// (docs/svl-tracking-input/controllers.md).
     func aimPose(_ side: Side) -> Pose {
         if let aim { return aim }
         let offset = ControllerState.gripOffset(side, senseModel: false)
@@ -26,14 +25,14 @@ extension ControllerState {
         var out: [(id: UInt8, value: Float)] = []
         func add(_ id: UInt8, _ value: Float) { out.append((id, value)) }
         func add(_ id: UInt8, _ on: Bool) { out.append((id, on ? 1 : 0)) }
-        // Left: X and Y, then menu. Right: A and B (and system, never pressed here).
+        // Left hand sends X, Y, and menu; right hand sends A and B (system is unused).
         let face: UInt8 = side == .left ? 17 : 53
         add(face, lowerButton)
         add(face + 1, lowerButtonTouched)
         add(face + 2, upperButton)
         add(face + 3, upperButtonTouched)
         if side == .left { add(21, menuButton) }
-        // From the squeeze value on, both hands' lists run alike.
+        // Starting from squeeze, both hands use identical relative offsets.
         let base: UInt8 = side == .left ? 24 : 60
         add(base, squeeze)
         add(base + 2, trigger)
@@ -48,7 +47,7 @@ extension ControllerState {
 }
 
 extension HandGestures {
-    /// Pinch, aim-and-pinch and grasp, each a value and a "ready" beside it.
+    /// Encodes pinch, aim-activate, and grasp values along with their ready flags.
     func wivrnInputs(_ side: Side) -> [(id: UInt8, value: Float)] {
         let base: UInt8 = side == .left ? 46 : 82
         let pinching: Float = pinch[0] ? 1 : 0, grasping: Float = grip ? 1 : 0

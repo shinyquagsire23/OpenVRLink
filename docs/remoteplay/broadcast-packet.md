@@ -24,17 +24,17 @@ message CMsgRemoteClientBroadcastHeader {
 
 | field | client → host | host → client |
 |---|---|---|
-| `client_id` | the client's **device id**: a random non-zero u64 made once and persisted (`CServerManager::GetDeviceID`, +0xf9688c; file `device_id.txt`) — **static + captured** | the host's client id, stable across runs — **captured** |
+| `client_id` | the client's **device id**: a random non-zero u64 generated once and persisted (`CServerManager::GetDeviceID`, +0xf9688c; file `device_id.txt`) — **static + captured** | the host's client id, stable across runs — **captured** |
 | `msg_type` | always present | always present |
 | `instance_id` | absent — **captured** | present; changes when Steam restarts — **inferred** from the name, one value seen |
 | `device_token` | absent on direct LAN sends. Set only when the client has no address for the host and relays through Steam's servers (`SendMessage` falls through to `CRemoteClientSession::SendMessage`) — **static** | absent |
 
-A captured client header is 12 bytes (`client_id` + `msg_type`), a host header
-23 bytes (adds `instance_id`).
+In captures, client headers are 12 bytes (`client_id` + `msg_type`) and host
+headers are 23 bytes (adding `instance_id`).
 
 ## Message types
 
-`ERemoteClientBroadcastMsg`, with the body each carries:
+`ERemoteClientBroadcastMsg` values and their protobuf payload types:
 
 | value | name | body | direction |
 |---|---|---|---|
@@ -59,17 +59,18 @@ the handlers named `CServerManager::Handle*` / `Send*`).
 
 ## Sockets
 
-- **captured**: the client binds one UDP socket to `[::]:27036` (dual-stack)
-  and uses it for everything in this layer. Replies to unicast requests come
-  back to the sending port, so a client does not need port 27036 itself —
-  **captured by probe**: `ovrlink discover <host>` gets a Status from an
-  ephemeral port. Binding 27036 is only needed to hear other machines'
-  unsolicited broadcasts.
-- A machine that also runs Steam already owns 27036 (Klepton STEAMLINK.md §3.1);
-  another reason not to bind it.
+- **captured**: the Steam Link shell binds a single dual-stack UDP socket to
+  `[::]:27036` for all messages in this layer. Because hosts send unicast
+  replies back to the source port of the request, a client does not need to bind
+  port 27036 itself (**captured by probe**: `ovrlink discover <host>` receives
+  `MsgStatus` on an ephemeral port). Binding port 27036 is only required to
+  receive unsolicited broadcast announcements.
+- On a machine running Steam locally, Steam already binds port 27036 (Klepton
+  STEAMLINK.md §3.1), so using an ephemeral client port avoids port conflicts.
 
 ## Open questions
 
-- `MsgOffline` body and when a host sends it.
+- What payload `MsgOffline` carries and when a host sends it.
 - Whether a host rate-limits or ignores requests from a port other than 27036
-  for types 3 and 5 (only Discovery has been probed from an ephemeral port).
+  for types 3 and 5 (only Discovery had been probed from an ephemeral port when
+  this was written; see [pairing.md](pairing.md)).

@@ -5,22 +5,22 @@
 import Foundation
 import dnssd
 
-/// Finds services announced on the local network by Bonjour (mDNS), and
-/// where each is to be reached. A WiVRn host announces itself this way.
+/// Discovers Bonjour (mDNS) services on the local network and resolves their
+/// hostnames and ports. WiVRn servers advertise themselves via mDNS.
 ///
-/// The system ends a search when it suspends the app (taking the headset
-/// off, say) and says so only if asked again, so a search that reports an
-/// error starts over by itself, and `restart` is there for the moments
-/// the app comes back.
+/// visionOS suspends active mDNS browse operations when the app is backgrounded
+/// (such as when taking off the headset) without delivering an immediate
+/// callback. Any browse or resolve error triggers an automatic retry, and
+/// callers can invoke `restart()` when the app returns to the foreground.
 ///
-/// The system's own resolver is asked, so nothing is sent to a service to
-/// find out its address. On Apple's platforms other than macOS the app
-/// must list the service type under `NSBonjourServices` in its Info.plist.
+/// Uses the system DNS-SD daemon (`dnssd`) to resolve hostnames passively. On
+/// non-macOS Apple platforms, the browsed service type must be declared under
+/// `NSBonjourServices` in `Info.plist`.
 public final class ServiceBrowser {
     public struct Service: Equatable {
-        /// The name it announces: for WiVRn, the computer's.
+        /// Advertised service instance name (for WiVRn, the host's computer name).
         public let name: String
-        /// Its host name, ending in `.local`.
+        /// Resolved mDNS hostname (typically ending in `.local`).
         public let host: String
         public let port: UInt16
     }
@@ -32,7 +32,7 @@ public final class ServiceBrowser {
     private var found: [String: Service] = [:]
     private var onChange: (([Service]) -> Void)?
 
-    /// `type` as in "_wivrn._tcp".
+    /// Creates a browser for a Bonjour service type such as `"_wivrn._tcp"`.
     public init(type: String) { self.type = type }
 
     deinit {
@@ -40,8 +40,9 @@ public final class ServiceBrowser {
         if let browse { DNSServiceRefDeallocate(browse) }
     }
 
-    /// `onChange` is called, off the main thread, with every service
-    /// known each time one comes or goes.
+    /// Starts browsing and invokes `onChange` on an internal serial queue
+    /// with the full sorted list of resolved services whenever services are
+    /// added or removed.
     public func start(onChange: @escaping ([Service]) -> Void) {
         queue.async { [self] in
             self.onChange = onChange
@@ -49,7 +50,7 @@ public final class ServiceBrowser {
         }
     }
 
-    /// Forget what was found and search again.
+    /// Clears discovered services and restarts the mDNS browse session.
     public func restart() {
         queue.async { [self] in
             guard onChange != nil else { return }
@@ -69,7 +70,7 @@ public final class ServiceBrowser {
         }
     }
 
-    /// The search died: begin another, after a moment in case it dies at once again.
+    /// Tears down a failed browse session and retries after a 1-second delay.
     private func failed() {
         guard browse != nil else { return }
         stop()
@@ -129,7 +130,7 @@ public final class ServiceBrowser {
     }
 
     private func resolved(_ fullName: String, host: String, port: UInt16) {
-        // Which of the names being resolved this is: the full name begins with it, escaped.
+        // Match the escaped instance prefix of `fullName` back to its unescaped service name.
         guard let name = resolving.keys.first(where: { fullName.hasPrefix(ServiceBrowser.escaped($0) + ".") }) else { return }
         let service = Service(name: name, host: host.hasSuffix(".") ? String(host.dropLast()) : host, port: port)
         guard found[name] != service else { return }
@@ -137,7 +138,7 @@ public final class ServiceBrowser {
         publish()
     }
 
-    /// A name as it stands in a full service name: dots and backslashes escaped.
+    /// Escapes backslashes, dots, and spaces to match DNS-SD full service name formatting.
     private static func escaped(_ name: String) -> String {
         name.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: ".", with: "\\.")
             .replacingOccurrences(of: " ", with: "\\032")

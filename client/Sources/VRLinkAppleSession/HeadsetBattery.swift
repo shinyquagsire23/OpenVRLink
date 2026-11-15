@@ -8,15 +8,16 @@ import VRLinkCore
 import UIKit
 #endif
 
-/// The battery of the device the app runs on, for the host to show.
+/// Tracks headset battery level and charging state for reporting to the host.
 ///
-/// UIKit only answers on the main thread and the session asks from its own,
-/// so the state is kept here and brought up to date when UIKit says it changed.
+/// `UIDevice` battery properties must be read on the main thread, while the
+/// streaming session polls from its own thread, so we cache updates from UIKit
+/// battery notifications behind a lock.
 public final class HeadsetBattery: @unchecked Sendable {
     private let lock = NSLock()
     private var latest: PowerState?
 
-    /// Nil where the system does not say (macOS, or before the first reading).
+    /// Latest battery reading, or nil when unavailable (on macOS or before the initial read).
     public var state: PowerState? {
         lock.lock()
         defer { lock.unlock() }

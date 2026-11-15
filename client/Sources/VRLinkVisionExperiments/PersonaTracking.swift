@@ -10,13 +10,13 @@ import SwiftUI
 import VRLinkAppleFace
 import VRLinkCore
 
-/// Experiment: face expressions and gaze from the wearer's Spatial Persona.
+/// Experimental face expression and eye-gaze tracking driven by the user's Spatial Persona.
 ///
-/// visionOS gives apps neither face nor eye tracking, but it will give an
-/// app a camera picture of the wearer's Persona, whose face and eyes move
-/// as the wearer's do. `FaceCamera` reads expressions and pupil positions
-/// off that picture; a calibration (`GazeCalibration`) turns the pupil
-/// positions into a gaze direction.
+/// visionOS does not expose direct face or eye tracking APIs to apps, but it
+/// does provide a virtual camera feed of the user's Spatial Persona mirroring
+/// their facial expressions and eye movements. `FaceCamera` extracts blendshape
+/// estimates and pupil positions from that feed, and `GazeCalibration` maps
+/// those pupil positions to a gaze direction.
 public final class PersonaTracking {
     public init() {}
 
@@ -24,14 +24,13 @@ public final class PersonaTracking {
     private let lock = NSLock()
     private var gazeMaker = GazeFromFeatures()
 
-    /// The space has gone: the camera is only kept running inside one.
+    /// Stops the Persona camera when leaving an immersive space.
     func leave() {
         camera.stop()
     }
 
-    /// The expressions for the host. Where the eyes look comes from the
-    /// calibrated gaze when there is one, which is far better than the
-    /// rules of thumb at it.
+    /// Returns facial expressions for the host, overriding uncalibrated eye
+    /// look directions with the calibrated gaze vector when available.
     func face(_ settings: VRLinkCore.Settings) -> FaceExpressions? {
         guard settings.faceFromCamera, var face = camera.estimate()?.face else { return nil }
         lock.lock()
@@ -41,20 +40,20 @@ public final class PersonaTracking {
         return face
     }
 
-    /// The gaze last given to the host, while it is fresh.
+    /// Most recent calibrated gaze vector sent to the host, or `nil` when stale or unavailable.
     private var lastGaze: Vec3?
 
-    /// Continuous calibration: the saved calibration as tuned by this
-    /// stream's pinches so far. Kept here and saved when the stream ends
-    /// (`takeTunedCalibration`), not at each pinch: a change to the settings
-    /// makes SwiftUI look at the stream's view again, which can cost the
-    /// Persona's camera its place (see `GazeCalibrationView`).
+    /// In-memory gaze calibration refined by indirect pinches during the
+    /// current stream. Flushed to settings only when the stream ends
+    /// (`takeTunedCalibration`), because mutating settings mid-stream triggers
+    /// a SwiftUI view update that can detach the Persona camera anchor (see
+    /// `GazeCalibrationView`).
     private var tuned: GazeCalibration?
 
-    /// A pinch made while streaming: its ray is where the eyes looked, in
-    /// world space, and `head` is where the head was. Paired with what the
-    /// camera saw of the eyes just before, exactly as in the calibration
-    /// space, it tunes the calibration in use.
+    /// Refines the active gaze calibration using an indirect pinch made while
+    /// streaming. Pairs the world-space pinch gaze `direction` and `head` pose
+    /// with the pupil features captured from the Persona camera just prior,
+    /// matching the sampling used in `GazeCalibrationSpace`.
     func learn(fromPinchLooking direction: Vec3, head: Pose?, settings: VRLinkCore.Settings) {
         guard settings.faceFromCamera, settings.continuousGazeCalibration, let saved = settings.gazeCalibration,
               let head, let looked = GazeCalibrator.tangents(ofRay: direction, head: head)
@@ -75,8 +74,8 @@ public final class PersonaTracking {
                         looked.across, looked.up, guessed.across, guessed.up, better.typicalErrorDegrees))
     }
 
-    /// The stream has ended: the calibration as this stream tuned it, to be
-    /// saved, or nil if no pinch tuned it.
+    /// Consumes and returns the gaze calibration refined during the stream so
+    /// it can be persisted, or `nil` if no pinches updated it.
     func takeTunedCalibration() -> GazeCalibration? {
         lock.lock()
         defer { lock.unlock() }
@@ -84,11 +83,12 @@ public final class PersonaTracking {
         return tuned
     }
 
-    /// The gaze for the host, when the experiment is on, calibrated, and the face is in view.
+    /// Computes the current gaze vector for the host when Persona tracking is
+    /// enabled, calibrated, and a face is visible.
     func gaze(_ settings: VRLinkCore.Settings) -> Vec3? {
         lock.lock()
         defer { lock.unlock() }
-        // Forgetting the calibration, or turning the tuning off, mid-stream also drops what was tuned.
+        // Discard any in-memory refinements if calibration is cleared or continuous tuning is disabled mid-stream.
         if settings.gazeCalibration == nil || !settings.continuousGazeCalibration { tuned = nil }
         guard settings.faceFromCamera, let calibration = tuned ?? settings.gazeCalibration, calibration.usable,
               let estimate = camera.estimate()

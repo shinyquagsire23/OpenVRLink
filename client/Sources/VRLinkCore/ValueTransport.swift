@@ -2,10 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-/// The value-transport system (docs/svl-values/value-transport-wire-format.md).
-/// Each side publishes values by id in 128-byte chunks and repeats every chunk
-/// until the peer ACKs it. Its bytes ride alongside the pose message going up and
-/// inside type-0x0d messages and frame descriptors coming down.
+/// Reliable key-value transport channel (docs/svl-values/value-transport-wire-format.md).
+/// Each side publishes values by ID in 128-byte chunks, retransmitting each chunk
+/// until the peer acknowledges it. Client-to-host data piggybacks on pose messages,
+/// while host-to-client data arrives in type `0x0D` elements and frame descriptors.
 
 public final class ValueTransport {
     static let chunkSize = 128
@@ -41,14 +41,14 @@ public final class ValueTransport {
         staged[id] = data
     }
 
-    /// Send every value again under a new version. The reference client does
-    /// this when the host's instance id changes or the host asks for a refresh.
+    /// Re-queues all published values under new version numbers. `vrlink` does
+    /// this when the host's instance ID changes or the host requests a property refresh.
     public func republishAll() {
         for (id, outgoing) in local where staged[id] == nil { staged[id] = outgoing.data }
     }
 
-    /// Bytes to attach to the next pose message: acks first, then every
-    /// unacked chunk that fits.
+    /// Serializes up to `budget` bytes for the next pose message, prioritizing
+    /// outgoing ACKs before unacknowledged data chunks.
     public func tick(budget: Int) -> Bytes {
         for (id, data) in staged {
             if let current = local[id], !current.unacked.isEmpty { continue }   // previous value still in flight
@@ -105,9 +105,8 @@ public final class ValueTransport {
             // the host repeats it forever.
             acksOwed.append((version, id, UInt16(chunk)))
             var incoming: Incoming
-            // Taken out of the table while it is written to, so that its
-            // bytes have one owner and the chunk goes in without a copy
-            // of the whole value.
+            // Remove the entry before mutating so `incoming.data` stays uniquely
+            // referenced and updates in place without copy-on-write.
             if let current = inProgress[id], current.version == version {
                 incoming = current
                 inProgress[id] = nil

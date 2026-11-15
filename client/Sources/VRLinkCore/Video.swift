@@ -11,8 +11,8 @@ public struct FrameMetadata {
     public let renderPose: Pose
     public let displayTime: UInt32          // host clock, microseconds
     public let atlasWidth, atlasHeight, tileWidth, tileHeight: Int
-    /// Per eye (left, right): where the foveal tile sits in a virtual image of
-    /// the base frustum drawn at foveal pixel density.
+    /// Per-eye (`[left, right]`) bounds placing the foveal tile inside a virtual
+    /// image of the base frustum rendered at foveal pixel density.
     public let insets: [(x: Float, y: Float, virtualWidth: Float, virtualHeight: Float)]
 
     public init(_ m: Bytes) {
@@ -37,8 +37,8 @@ public struct FrameMetadata {
     /// frustum (docs/svl-video/frame-layout.md).
     public func foveaFrustum(eye: Int, base: Frustum) -> Frustum {
         let inset = insets[eye]
-        // Rows from the top of the virtual image down to the optical centre,
-        // and columns from the optical centre to its right edge.
+        // Rows from the top of the virtual image down to the optical center,
+        // and columns from the optical center to its right edge.
         let rowsAboveCentre = base.up * inset.virtualHeight / (base.up - base.down)
         let columnsRightOfCentre = base.right * inset.virtualWidth / (base.right - base.left)
         let leftColumn = inset.x - inset.virtualWidth + columnsRightOfCentre
@@ -52,9 +52,10 @@ public struct FrameMetadata {
     /// Feathered border of the foveal tile, as a fraction of its width.
     static let foveaFeather: Float = 0.06
 
-    /// The frame as tiles: per eye the base tile, then the sharper foveal
-    /// tile over its middle. The atlas holds them top to bottom: left
-    /// fovea, left base, right fovea, right base.
+    /// Builds the compositing tile layout for this frame: each eye draws its
+    /// full-FOV base tile followed by the sharper foveal tile blended on top.
+    /// Tiles are stacked vertically in the decoded atlas from top to bottom:
+    /// left fovea, left base, right fovea, right base.
     public func layout(profile: DeviceProfile) -> FrameLayout {
         let tiles = Float(atlasHeight / max(1, tileHeight))
         // Rows are pulled in half a texel so that linear filtering does not
@@ -66,7 +67,7 @@ public struct FrameMetadata {
         }
         let views = Eye.allCases.map { eye -> FrameLayout.View in
             let base = profile.eyeFrusta[eye.rawValue]
-            // The eye the host rendered from: the head it rendered for, then the eye's place on that head.
+            // Compute the world-space eye pose the host rendered from by applying the eye-in-head offset to `renderPose`.
             return FrameLayout.View(eye: renderPose.placing(profile.eyesInHead[eye.rawValue]), tiles: [
                 tile(eye.rawValue * 2 + 1, base, feather: 0),
                 tile(eye.rawValue * 2, foveaFrustum(eye: eye.rawValue, base: base), feather: FrameMetadata.foveaFeather),
@@ -82,14 +83,14 @@ struct FrameDescriptor {
     let hostClockOffset: Int32  // the host's estimate of (its clock - ours), plus the delay to it
     let frameSize: Int
     let hostVersion: UInt32
-    /// Which error correction the packets carry; 0x20 is the only one known.
+    /// Forward error correction mode for the frame's packets (`0x20` is the only mode implemented).
     let fecMode: UInt8
     let metadata: FrameMetadata
-    /// After the metadata: haptics, statistics records, timing events, value-transport bytes.
+    /// Value-transport payload extracted from the descriptor trailer (which follows haptics, stats records, and timing events).
     let valueTransportBytes: Bytes
 
     init(_ element: SVLElement) {
-        // A part of the datagram: `byte` and `integer(at:)` count from its start.
+        // `element.value` is a slice of the datagram; `byte` and `integer(at:)` index relative to `startIndex`.
         let value = element.value
         func byte(_ offset: Int) -> UInt8 { value[value.startIndex + offset] }
         frameID = element.id
@@ -101,7 +102,7 @@ struct FrameDescriptor {
         hostVersion = value.integer(at: 0x18)
         fecMode = value.count > 0x0D ? byte(0x0D) : 0
         metadata = FrameMetadata(Bytes(value.dropFirst(0x20).prefix(metadataSize)))
-        // The trailer's counted sections; what follows them is stale host memory.
+        // Parse the counted sections in the trailer; any trailing bytes beyond them are uninitialized host memory.
         let trailer = 0x20 + metadataSize
         if value.count >= trailer + 16, byte(trailer + 0x0C) == 3 {
             let records = Int(byte(trailer + 0x0D)), events = Int(byte(trailer + 0x0E))
@@ -114,20 +115,20 @@ struct FrameDescriptor {
     }
 }
 
-/// One encoded frame's bytes, in memory from `malloc` that a decoder can
-/// take over without copying.
+/// Holds an encoded video frame in a `malloc`-allocated buffer so the
+/// decoder can take ownership without copying.
 ///
-/// The frame is megabytes a second of data that every stage would otherwise
-/// copy, so it lives in one block from the moment its packets arrive: the
-/// assembler writes each packet straight into place, and the decoder takes
-/// the block for itself (`takeMemory`) and frees it with `free` when done.
+/// Video streams run at tens of megabytes per second. Allocating a single
+/// buffer up front lets `FrameAssembler` write incoming packets directly
+/// into place, after which the decoder claims the pointer via `takeMemory()`
+/// and calls `free` when finished.
 public final class FrameBuffer {
     private var memory: UnsafeMutablePointer<UInt8>?
-    /// The frame's length in bytes. The block may be a little larger.
+    /// Valid frame length in bytes (the underlying allocation may have extra trailing capacity).
     public private(set) var count: Int
 
-    /// A block with room for `capacity` bytes, holding a frame of `count`.
-    /// The room past the frame's end is zeros.
+    /// Allocates at least `capacity` bytes for a frame of length `count`,
+    /// zero-filling any trailing bytes past `count`.
     init(count: Int, capacity: Int) {
         let size = max(capacity, count, 1)
         memory = UnsafeMutableRawPointer(malloc(size)!).assumingMemoryBound(to: UInt8.self)
@@ -135,7 +136,7 @@ public final class FrameBuffer {
         if size > count { (memory! + count).update(repeating: 0, count: size - count) }
     }
 
-    /// A copy of `bytes`; for tests and for frames that do not come from the network.
+    /// Allocates a buffer initialized with a copy of `bytes` (used by tests and non-SVL transports).
     public convenience init(copying bytes: Bytes) {
         self.init(count: bytes.count, capacity: bytes.count)
         bytes.withUnsafeBufferPointer { source in
@@ -145,7 +146,7 @@ public final class FrameBuffer {
 
     deinit { free(memory) }
 
-    /// The frame, to read or to change in place. Empty once ownership has changed.
+    /// Mutable view of the frame bytes, or empty after ownership has been transferred via `takeMemory()`.
     public var bytes: UnsafeMutableBufferPointer<UInt8> {
         UnsafeMutableBufferPointer(start: memory, count: memory == nil ? 0 : count)
     }
@@ -164,7 +165,7 @@ public final class FrameBuffer {
 /// A complete encoded frame, ready for the decoder.
 public struct EncodedFrame {
     public let frameID: UInt16
-    /// Which of the frame's pictures this is, for a host that encodes each on its own.
+    /// Sub-picture index within the frame, for protocols that encode multiple streams per frame.
     public let picture: Int
     public let data: FrameBuffer
     public let layout: FrameLayout
@@ -177,46 +178,46 @@ public struct EncodedFrame {
     }
 }
 
-/// A frame as the assembler finishes it: whole, with the host's metadata.
+/// Completed frame payload paired with its parsed `FrameMetadata`.
 struct AssembledFrame {
     let frameID: UInt16
     let data: FrameBuffer
     let metadata: FrameMetadata
 }
 
-/// Turns video packets into frames for a decoder, in order.
+/// Reassembles incoming video packets into complete frames in strict frame-ID order.
 ///
-/// A hole in a frame is filled by FEC when the stripe's parity allows, and
-/// otherwise asked for again (docs/svl-video/retransmit.md). Frames are
-/// released strictly in frame-id order, because each one is predicted from
-/// the one before.
+/// Missing packets in a frame are recovered via FEC when the stripe's parity
+/// allows, or requested via retransmission otherwise (docs/svl-video/retransmit.md).
+/// Frames are released strictly in frame-ID order because each frame predicts
+/// from the previous one.
 ///
-/// If a frame cannot be completed, the assembler gives up on it, asks the host 
-/// for a keyframe through the pose message's reset counter, and releases nothing 
-/// until that keyframe arrives.
+/// If a frame cannot be completed, the assembler abandons it, increments the
+/// pose message's reset counter to request a keyframe from the host, and holds
+/// output until that keyframe arrives.
 final class FrameAssembler {
     static let packetSize = FEC.packetSize
     private static let zeroPacket = Bytes(repeating: 0, count: FEC.packetSize)
     static let firstParityID = 0x800
-    /// In a retransmit request, in place of a packet id: "resend the descriptor".
+    /// Sentinel packet ID used in retransmit requests to ask the host to resend the frame descriptor.
     static let descriptorRequestID: UInt16 = 0xFFFF
     static let dataPerGroup = 64
     static let parityPerGroup = 16
-    /// The host keeps a frame for resending only while it is among its last 16.
+    /// Number of recent frames the host retains in its retransmit ring buffer.
     static let frameWindow = 16
-    /// Microseconds of silence on an incomplete frame before asking again.
+    /// Idle time in microseconds before re-requesting missing packets on an incomplete frame.
     static let retryInterval: Int32 = 4000
     static let maxEntriesPerUnpromptedRequest = 20
-    /// Microseconds the host takes per packet when sending a frame.
+    /// Expected host pacing interval per video packet, in microseconds.
     static let packetInterval = 104
-    /// How long a finished frame may wait for an earlier one before the
-    /// earlier one is abandoned.
+    /// Maximum time in microseconds a completed frame will wait for an earlier
+    /// incomplete frame before giving up.
     static let giveUpAfter: Int32 = 100_000
 
     private struct Frame {
-        var size = 0                         // 0 until the descriptor or the short last packet says
+        var size = 0                         // 0 until known from the descriptor or final short packet
         var metadata: FrameMetadata?
-        /// The frame's bytes. Made once the size is known.
+        /// Allocated once `size` is known.
         var buffer: FrameBuffer?
         /// Which data packets are in the buffer.
         var have: Set<Int> = []
@@ -246,10 +247,10 @@ final class FrameAssembler {
             have.insert(index)
         }
 
-        /// A data packet where it lies in the buffer, at full length: the
-        /// short last packet runs on into the zeros after the frame, which
-        /// is how the host encoded it. Nil if it has not arrived yet.
-        /// Good only while the frame's buffer is.
+        /// Returns a `packetSize` slice for data packet `index` directly from `buffer`
+        /// (for a short final packet, this includes the trailing zero padding matching
+        /// how the host computed FEC), or nil if the packet has not arrived. Valid only
+        /// for the lifetime of `buffer`.
         func packet(_ index: Int) -> UnsafeBufferPointer<UInt8>? {
             guard have.contains(index), let buffer else { return nil }
             return UnsafeBufferPointer(start: buffer.bytes.baseAddress! + index * packetSize, count: packetSize)
@@ -307,14 +308,13 @@ final class FrameAssembler {
         progress(element.id, group: group, now: now)
     }
 
-    /// Checkup tick, asks again for the tail of frames that have gone quiet,
-    /// and abandons frames that are holding up later ones for too long.
+    /// Periodic maintenance tick: re-requests missing packets on stalled frames
+    /// and abandons frames that block newer ones past `giveUpAfter`.
     func tick(now: Int32) {
         for (id, frame) in frames where !frame.complete && now &- frame.lastActivity >= FrameAssembler.retryInterval {
-            // While nothing can be decoded until a keyframe arrives, only the
-            // newest few frames can be that keyframe in time to matter.
-            // Chasing every old frame as well floods the host with requests
-            // it answers by resending, which crowds out the keyframe itself.
+            // While waiting for a keyframe, only request retransmits for the
+            // newest few frames. Asking for older frames floods the link with
+            // useless resends that delay the incoming keyframe.
             if waitingForKeyframeSince != nil, Int16(bitPattern: newest &- id) > 2 { continue }
             request(id, upToGroup: nil, now: now)
         }
@@ -323,9 +323,9 @@ final class FrameAssembler {
 
     // MARK: Per-frame work
 
-    /// Makes sure the frame has a slot.
-    /// Returns False for a frame the decoder has already been given 
-    /// (its parity keeps arriving after its data) or has been abandoned
+    /// Ensures a tracking entry exists for frame `id`, returning false if the
+    /// frame was already delivered to the decoder (for example, trailing parity
+    /// packets) or abandoned.
     private func touch(_ id: UInt16, _ now: Int32) -> Bool {
         if let next, Int16(bitPattern: id &- next) < 0 { return false }
         if frames[id] == nil {
@@ -340,8 +340,8 @@ final class FrameAssembler {
     }
 
     private func progress(_ id: UInt16, group: Int, now: Int32) {
-        // The frame is taken out of the table while it is worked on, so that
-        // its buffer has one owner and is written in place, never copied.
+        // Remove the frame from the dictionary while mutating it so its state
+        // stays uniquely referenced.
         guard var frame = frames.removeValue(forKey: id) else { return }
         guard !frame.complete else {
             frames[id] = frame
@@ -374,9 +374,8 @@ final class FrameAssembler {
             let missing = ids.filter { $0 < frame.dataCount && !frame.have.contains($0) }
             let p = frame.parity[stripe * 2], q = frame.parity[stripe * 2 + 1]
             guard !missing.isEmpty, missing.count <= (p == nil ? 0 : 1) + (q == nil ? 0 : 1) else { continue }
-            // The packets that arrived are read where they lie in the frame.
-            // Packets past the end of the frame are known zeros, exactly as
-            // the host encoded them.
+            // Read arrived packets directly from the frame buffer; slots past
+            // `dataCount` use `zeroPacket` to match the host's FEC padding.
             let rebuilt: [Int: Bytes]? = FrameAssembler.zeroPacket.withUnsafeBufferPointer { zeros in
                 FEC.repair(data: ids.map { $0 >= frame.dataCount ? zeros : frame.packet($0) }, p: p, q: q)
             }
@@ -397,10 +396,9 @@ final class FrameAssembler {
         if frame.size > 0 {
             var limit = group.map { min($0 * FrameAssembler.dataPerGroup, frame.dataCount) } ?? frame.dataCount
             if group == nil {
-                // A frame that has gone quiet: ask only for as many of its
-                // missing packets as the host should have sent by now, at
-                // its pace of one packet every 104 microseconds counted from
-                // the end of the quiet interval
+                // On an unprompted timeout, only request missing packets the host
+                // should have transmitted by now (paced at one packet per 104 us
+                // after `retryInterval`).
                 let overdue = Int(now &- frame.lastPacket &- FrameAssembler.retryInterval)
                 let budget = max(0, overdue / FrameAssembler.packetInterval)
                 let firstMissing = (0..<frame.dataCount).first { !frame.have.contains($0) } ?? frame.dataCount
@@ -441,9 +439,9 @@ final class FrameAssembler {
             expected &+= 1
         }
         next = expected
-        // If later frames are finished and have waited too long for this one,
-        // or the host can no longer resend it, then it is not coming.
-        // (A plain loop: this runs for every packet.)
+        // Abandon the expected frame if completed newer frames have waited past
+        // `giveUpAfter`, or if the host's retransmit window has moved past it.
+        // (Uses a simple loop since this runs on every packet.)
         var oldestWait: Int32 = 0
         for (id, frame) in frames where frame.complete && Int16(bitPattern: id &- expected) > 0 {
             oldestWait = max(oldestWait, now &- frame.completedAt)
@@ -453,8 +451,8 @@ final class FrameAssembler {
             framesAbandoned += 1
             resetCounter &+= 1
             waitingForKeyframeSince = now
-            // Everything received so far depends on the lost frame.
-            // Only frames newer than the newest seen can belong to the fresh keyframe
+            // Buffered delta frames depend on the abandoned frame, so drop
+            // everything up to `newest` and wait for the requested keyframe.
             frames = [:]
             next = newest &+ 1
         }

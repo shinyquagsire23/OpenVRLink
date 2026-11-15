@@ -4,17 +4,14 @@
 
 import Foundation
 
-/// The "1 euro" filter (Casiez, Roussel and Vogel, 2012): a low-pass filter
-/// that smooths hard when the value is nearly still, which hides jitter, and
-/// lightly when it moves fast, which avoids lag.
-///
-/// This one filters a Vec3 (a position in meters, a direction), taking the
-/// speed that sets the smoothing from the length of its change. The filter
-/// itself works the same on a vector of any size.
+/// Adaptive 1-euro low-pass filter (Casiez, Roussel, and Vogel, 2012) for `Vec3`
+/// positions or directions. Applies heavy smoothing at low speeds to suppress
+/// jitter and raises the cutoff frequency at high speeds to minimize lag, using
+/// the Euclidean magnitude of the derivative vector to drive the cutoff.
 struct OneEuroFilterVec3 {
-    /// Smoothing when still: lower is steadier. Hz.
+    /// Minimum cutoff frequency at rest, in Hz (lower values increase smoothing).
     var slowestCutoff: Float
-    /// How quickly smoothing lets go as speed rises: Hz per unit of speed.
+    /// Cutoff slope (beta), in Hz per unit of speed.
     var speedGain: Float
     private var value: Vec3?
     private var rate = Vec3(0, 0, 0)
@@ -24,7 +21,7 @@ struct OneEuroFilterVec3 {
         self.speedGain = speedGain
     }
 
-    /// How much of a new sample to take, for a cutoff frequency and a time step.
+    /// Computes the exponential smoothing factor alpha for `cutoff` (Hz) and `seconds` (dt).
     private static func share(cutoff: Float, seconds: Float) -> Float {
         let tau = 1 / (2 * Float.pi * cutoff)
         return 1 / (1 + tau / seconds)
@@ -35,7 +32,7 @@ struct OneEuroFilterVec3 {
             value = sample
             return sample
         }
-        // The speed is itself smoothed, at 1 Hz, before it sets the cutoff.
+        // Low-pass filter the derivative at 1 Hz before computing the adaptive cutoff.
         let newRate = (sample - last) * (1 / seconds)
         let rateShare = OneEuroFilterVec3.share(cutoff: 1, seconds: seconds)
         rate = rate + (newRate - rate) * rateShare

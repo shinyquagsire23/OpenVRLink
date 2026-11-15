@@ -8,45 +8,44 @@ import Spatial
 import SwiftUI
 import VRLinkCore
 
-/// Pinches as visionOS reports them to an app: a "spatial event" for each
-/// pinch of a hand that is not touching anything, which carries a ray from
-/// the eyes to what they were looking at. The system reports where the eyes
-/// look only at these pinches. This class keeps the newest pinch of each hand
-/// and gives it out as the core's `SystemPinch`.
+/// Tracks indirect spatial pinch events from visionOS and converts them to `SystemPinch`.
+///
+/// For each pinch made at a distance, visionOS delivers a spatial event
+/// carrying an eye-gaze selection ray (the only time the OS exposes where the
+/// user is looking). `PinchRays` tracks the latest pinch per hand and formats
+/// its ray and press timing for `VRLinkCore`.
 public final class PinchRays {
     public init() {}
 
     private struct Pinch {
         var id: SpatialEventCollection.Event.ID
-        /// The ray from the eyes, world space.
+        /// World-space gaze selection ray origin and unit direction.
         var origin = Vec3(0, 0, 0), direction = Vec3(0, 0, -1)
-        /// Where the pinching fingers were when the pinch began, and are now.
+        /// World-space hand position at pinch start and on the latest update.
         var handAtStart: Vec3?, handNow: Vec3?
         var began: TimeInterval
         var ended: TimeInterval?
         var rayGivenOut = false
     }
 
-    /// Called once for each pinch, when its ray is first known, with the
-    /// ray's direction in world space: the one moment the system says where
-    /// the eyes look. Called on the thread that brought the events.
+    /// Invoked once per pinch when its selection ray is first received, passing
+    /// the world-space gaze unit vector on the event delivery thread.
     public var onGaze: ((_ direction: Vec3) -> Void)?
 
     private let lock = NSLock()
     private var pinches: [Pinch?] = [nil, nil]
 
-    /// The host is shown the ray this long before the press, so that the
-    /// press lands where the ray points and not where the hand ray was.
+    /// Lead time (seconds) to send the gaze ray before asserting the pinch press,
+    /// giving the host time to aim at the target before the click registers.
     private static let rayLeadsPress: TimeInterval = 0.05
-    /// A press lasts at least this long, however quick the pinch.
+    /// Minimum press duration in seconds so brief taps still register on the host.
     private static let shortestPress: TimeInterval = 0.05
-    /// The ray stays this long after the press is let go, so that the
-    /// release also lands on it.
+    /// Hold time (seconds) to keep the gaze ray active after release so the button-up event lands on target.
     private static let rayOutlastsPress: TimeInterval = 0.08
 
-    /// Take in the events the system gave. A compositor layer is given them
-    /// in world space already; a RealityKit view is given them in SwiftUI's
-    /// coordinates and supplies `toWorld` to convert a point.
+    /// Ingests spatial pinch events from visionOS. CompositorServices delivers
+    /// coordinates directly in world space (`toWorld == nil`), whereas RealityKit
+    /// delivers SwiftUI gesture coordinates and provides `toWorld` to convert points.
     public func handle(_ events: SpatialEventCollection, toWorld: ((Point3D) -> SIMD3<Float>)? = nil) {
         func world(_ point: Point3D) -> Vec3 {
             let p = toWorld?(point) ?? SIMD3(Float(point.x), Float(point.y), Float(point.z))
@@ -63,8 +62,8 @@ public final class PinchRays {
             var side = pinches.firstIndex { $0?.id == event.id }
             if side == nil {
                 guard event.phase == .active else { continue }
-                // A new pinch: the system usually says which hand. When it
-                // does not, it is given to the first hand without a pinch.
+                // Assign a new pinch to its reported hand chirality, or fall back
+                // to the first idle hand slot when chirality is unspecified.
                 switch event.chirality {
                 case .left: side = Side.left.rawValue
                 case .right: side = Side.right.rawValue
@@ -76,9 +75,8 @@ public final class PinchRays {
             guard let side, var pinch = pinches[side] else { continue }
             if let ray = event.selectionRay {
                 pinch.origin = world(ray.origin)
-                // A direction is the difference of two converted points.
-                // In SwiftUI's coordinates that difference is under a
-                // millimeter long, so it is made a unit vector again.
+                // Convert the direction by transforming two points along the ray,
+                // then re-normalize because SwiftUI point units are sub-millimeter.
                 let pointing = world(ray.origin + ray.direction) - pinch.origin
                 let size = pointing.dot(pointing).squareRoot()
                 if size > 0 { pinch.direction = pointing * (1 / size) }
@@ -97,7 +95,7 @@ public final class PinchRays {
         }
     }
 
-    /// What `side`'s hand is doing right now.
+    /// Returns the current `SystemPinch` state for `side`.
     public func pinch(_ side: Side) -> SystemPinch {
         let now = CACurrentMediaTime()
         lock.lock()

@@ -15,11 +15,11 @@ import VRLinkVideoToolbox
 ///
 ///     swift run OpenVRLink [host address]
 ///
-/// Drag to look around, W A S D to move, X to swap between the left and
-/// right eye. A pretend controller is held in front of the head on the right
-/// (the space bar pulls its trigger) and a pretend open hand on the left.
+/// Drag to look around, use WASD to move, and press X to swap between the left
+/// and right eye. Sends a simulated right controller (Space pulls the trigger)
+/// and a simulated open left hand positioned in front of the head.
 
-/// The pretend controllers, handed from the main thread to the session's.
+/// Thread-safe hand and controller state shared between the main thread and the session thread.
 final class HeldControllers {
     private let lock = NSLock()
     private var states: [HandInput?] = [nil, nil]
@@ -57,18 +57,18 @@ final class ViewerView: MTKView {
     }
     override func keyUp(with event: NSEvent) { keysDown.remove(event.charactersIgnoringModifiers ?? "") }
 
-    /// Called at a steady rate: walk along the floor in the direction the
-    /// head faces, and measure how fast the head is moving and turning.
+    /// Updates head position from WASD input along the horizontal plane and
+    /// computes smoothed linear and angular velocities.
     func stepMovement() {
         let now = Date()
         let seconds = Float(now.timeIntervalSince(lastStep))
         lastStep = now
         guard seconds > 0 else { return }
         if swaying {
-            // Testing aid: look left and right by itself, a turn every eight seconds.
+            // Automatically yaw left and right with an 8-second period for testing.
             head.yaw = 0.6 * Float(sin(now.timeIntervalSince(started) * .pi / 4))
         }
-        let facing = HeadPose(position: head.position, yaw: head.yaw).pose   // level: ignores pitch
+        let facing = HeadPose(position: head.position, yaw: head.yaw).pose   // horizontal plane (ignores pitch)
         var ahead: Float = 0, sideways: Float = 0
         if keysDown.contains("w") { ahead += 1 }
         if keysDown.contains("s") { ahead -= 1 }
@@ -90,8 +90,8 @@ final class ViewerView: MTKView {
             return .controller(state)
         })
 
-        // Velocities from the change since the last step, smoothed because
-        // mouse movement arrives in bursts.
+        // Compute velocities from the pose delta, smoothing to filter out
+        // bursty mouse events.
         let blend: Float = 0.3
         func smooth(_ old: Float, _ new: Float) -> Float { old + (new - old) * blend }
         let moved = (head.position - previous.position) * (1 / seconds)
@@ -105,7 +105,7 @@ final class ViewerView: MTKView {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    /// Nil means "find one on the local network".
+    /// Target host IP or hostname, or nil to auto-discover on the local network.
     let hostAddress: String?
     var window: NSWindow!
     var view: ViewerView!
@@ -119,7 +119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let simulatedLoss: Double
     var audioOutput: AudioOutput?
 
-    /// Whether the host is a WiVRn one, as against Steam.
+    /// Whether to connect to a WiVRn host rather than Steam.
     let wivrn: Bool
 
     init(hostAddress: String?, simulatedLoss: Double, wivrn: Bool) {
@@ -129,13 +129,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Stream at the display's own refresh rate, so frames and refreshes pair up.
+        // Match the stream framerate to the display's refresh rate.
         let refreshHz = NSScreen.main?.maximumFramesPerSecond ?? 60
         var profile = DeviceProfile()
         profile.systemName = SystemVersion.name
         profile.clientVersion = SystemVersion.client
         profile.refreshHz = Float(refreshHz)
-        // The settings this viewer has a use for: the field of view asked of the host, and the chroma key.
+        // Apply the subset of user settings supported by the macOS viewer (FOV scale, camera face tracking, and chroma key).
         let settings = Settings.load()
         profile.tracksEyesOrFace = settings.faceFromCamera
         profile.eyeFrusta = profile.eyeFrusta.map {
@@ -236,7 +236,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             var connector = HostConnector(deviceName: HostConnector.name(of: Host.current().localizedName ?? "Mac"),
                                           deviceModel: SystemVersion.model, systemVersion: SystemVersion.named)
             connector.microphone = useMicrophone
-            // Talk to the host over a cable if there is one that reaches it.
+            // Prefer wired Ethernet interfaces when available.
             connector.preferredInterfaces = { WiredInterfaces.names() }
             // Fail immediately if the host is unreachable instead of retrying like the headset app does.
             connector.keepLooking = false
@@ -258,7 +258,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
             session.handsProvider = { [controllers = view.controllers] in controllers.get() }
-            // The face experiment, with this Mac's camera standing in for a Persona.
+            // If enabled, run experimental face tracking using the Mac's webcam.
             if Settings.load().faceFromCamera {
                 faceCamera.faceCalibration = Settings.load().faceCalibration
                 faceCamera.start()
@@ -290,7 +290,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 setvbuf(stdout, nil, _IOLBF, 0) 
-// Quit properly when asked to from a terminal, so the host is told goodbye
+// Terminate cleanly on SIGINT/SIGTERM so applicationWillTerminate can notify the host.
 signal(SIGTERM, SIG_IGN)
 signal(SIGINT, SIG_IGN)
 let quitSignals = [SIGTERM, SIGINT].map { number -> DispatchSourceSignal in
@@ -299,13 +299,13 @@ let quitSignals = [SIGTERM, SIGINT].map { number -> DispatchSourceSignal in
     source.resume()
     return source
 }
-// Arguments: an optional host address; `--mic` to send this Mac's microphone
-// to the host; `--loss <percent>`, a testing aid that throws away that
-// share of incoming video and audio to exercise loss recovery on a clean
-// network; `--wivrn`, for a host that runs WiVRn and not Steam; and
-// `--sway`, a testing aid that turns the head left and right by itself;
-// `--pin <digits>`, the PIN a WiVRn host shows when it pairs (asked for
-// on the terminal when not given).
+// Supported CLI options:
+//   [host address]    Optional host IP or hostname (with optional :port for WiVRn)
+//   --mic             Stream microphone audio to the host
+//   --loss <percent>  Drop a percentage of incoming video/audio packets to test loss recovery
+//   --wivrn           Connect to a WiVRn host instead of Steam
+//   --sway            Continuously yaw the head left and right for testing
+//   --pin <digits>    WiVRn pairing PIN (prompts on stdin if omitted)
 var hostAddress: String?
 var simulatedLoss = 0.0
 var useMicrophone = false

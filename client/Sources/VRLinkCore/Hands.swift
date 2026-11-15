@@ -4,20 +4,17 @@
 
 import Foundation
 
-/// A tracked bare hand, and other hand-relative bits
-/// (docs/svl-tracking-input/skeleton.md and controllers.md).
+/// Hand tracking data, gesture recognition, and SteamVR skeleton packing
+/// (see `docs/svl-tracking-input/skeleton.md` and `controllers.md`).
 ///
-/// The host wants three things for a hand: the wrist as if it were a
-/// controller, a few gestures as that controller's buttons, and the finger
-/// joints as SteamVR's 31-bone hand skeleton.
+/// For each tracked hand, the host expects a controller-like wrist pose, basic
+/// pinch/grip gestures mapped to button inputs, and SteamVR's 31-bone hand skeleton.
 
-/// The joints of one hand in world space, in OpenXR's order and convention:
-/// each joint's `forward` points towards the fingertip and its `up` points
-/// out of the back of the hand.
+/// World-space hand joints in OpenXR order and axis convention (`forward` points
+/// toward the fingertip and `up` points out of the back of the hand).
 public struct TrackedHand {
     public var joints: [Pose]
-    /// Set when the platform itself says when this hand pinches (see
-    /// `SystemPinch`): the pinch is then no longer read off the joints.
+    /// Optional platform-provided pinch state (see `SystemPinch`); overrides joint-based index pinch detection when set.
     public var systemPinch: SystemPinch?
 
     /// 26 joints: palm, wrist, then metacarpal-to-tip for thumb (4 joints)
@@ -27,12 +24,12 @@ public struct TrackedHand {
         self.joints = joints
     }
 
-    /// A flat, open hand with its fingers together, for viewers and tests
-    /// that have no hand tracking: every joint faces the way the wrist does.
+    /// Synthesizes a flat, open hand with all joints aligned to `wrist`, used for
+    /// tests and viewers without hand tracking.
     public static func flat(wrist: Pose, side: Side) -> TrackedHand {
         func joint(across: Float, ahead: Float) -> Pose {
             var pose = wrist
-            // Palm down, the thumb is on the inner side: to the right for a left hand.
+            // With palm facing down, the thumb is on the inner side (+right for the left hand).
             pose.position = wrist.position + wrist.right * (side == .left ? across : -across) + wrist.forward * ahead
             return pose
         }
@@ -51,25 +48,22 @@ public struct TrackedHand {
     static func tip(_ finger: Int) -> Int { 10 + 5 * finger }
 }
 
-/// A hand's pinching as the platform reports it, for platforms where a pinch
-/// selects what the eyes are looking at (visionOS). Such a platform says
-/// where the eyes look only while a pinch lasts.
+/// Platform-reported pinch and gaze-aim state for systems like visionOS where
+/// pinching targets whatever the user is looking at and eye gaze is only exposed
+/// during an active pinch.
 public enum SystemPinch {
     case notPinching
-    /// - ray: from the eyes through what they looked at when the pinch
-    ///   began, moved since by the hand's own movement. World space;
-    ///   `forward` is where it points.
-    /// - pressed: whether the host should see the pinch as held yet (it
-    ///   is told the ray a moment before, so that the press lands on it).
+    /// - `ray`: World-space interaction ray starting at the eyes toward the initial
+    ///   gaze target and translated by subsequent hand movement (`forward` is the ray direction).
+    /// - `pressed`: Whether the pinch click is active yet (the ray is sent slightly
+    ///   before the click so the cursor settles on target before pressing).
     case pinching(ray: Pose, pressed: Bool)
 
-    /// How much further the ray's start moves than the hand does, so that a
-    /// small movement of a pinching hand drags a long way. ALVR's figure.
+    /// Multiplier applied to hand translation while pinching so small hand motions drag comfortably (matches ALVR).
     public static let handTravelGain: Float = 3.5
 
-    /// The ray for a pinch that began with the eyes at `origin` looking
-    /// along `direction`, after the pinching hand has moved by `handTravel`.
-    /// All in world space, meters.
+    /// Constructs the world-space interaction ray (in meters) for a pinch that started
+    /// at `origin` along `direction` after the hand has translated by `handTravel`.
     public static func ray(origin: Vec3, direction: Vec3, handTravel: Vec3) -> Pose {
         let forward = direction * (1 / max(length(direction), 0.001))
         var sideways = forward.cross(Vec3(0, 1, 0))
@@ -79,13 +73,13 @@ public enum SystemPinch {
     }
 }
 
-/// What one hand is: something held, or the hand itself.
+/// Input source for a single hand: either a physical controller or bare-hand tracking.
 public enum HandInput {
     case controller(ControllerState)
     case hand(TrackedHand)
 }
 
-/// The gestures the host treats as OpenXR button inputs.
+/// Discrete hand gestures mapped to OpenXR button inputs on the host.
 struct HandGestures {
     /// Thumb tip against the tip of the index, middle, ring and little finger.
     var pinch = [false, false, false, false]
@@ -94,17 +88,15 @@ struct HandGestures {
     /// Index finger straight, the other three curled.
     var point = false
 
-    /// Thumb and fingertip closer than `pinchStart` begin a pinch; it lasts
-    /// until they are further apart than `pinchEnd`. Meters. The reference
-    /// client takes pinches from its headset's runtime, so these are ours.
+    /// Hysteresis thresholds in meters between thumb tip and fingertip to enter
+    /// (`pinchStart`) and exit (`pinchEnd`) a pinch. `vrlink` relies on the headset
+    /// runtime for pinch detection, so we define our own thresholds here.
     static let pinchStart: Float = 0.02, pinchEnd: Float = 0.035
 
-    /// Read the gestures off a hand. `previous` makes each one a little
-    /// harder to leave than to enter, so it does not flicker at the edge.
+    /// Evaluates gestures from joint poses, using `previous` for hysteresis to prevent flickering near thresholds.
     init(_ hand: TrackedHand, previous: HandGestures?) {
         let thumb = hand.joints[TrackedHand.thumbTip].position
-        // How far each finger is bent, in degrees: the angle between where
-        // its first joint points and where its tip points.
+        // Finger curl in degrees, measured between the proximal phalanx and fingertip forward vectors.
         var curl: [Float] = []
         for finger in 0..<4 {
             let tip = hand.joints[TrackedHand.tip(finger)]
@@ -114,12 +106,12 @@ struct HandGestures {
             let cosine = hand.joints[TrackedHand.proximal(finger)].forward.dot(tip.forward)
             curl.append(acos(max(-1, min(1, cosine))) * 180 / .pi)
         }
-        // The reference client's thresholds.
+        // Curl angle thresholds (with hysteresis) matching vrlink.
         func curled(_ finger: Int, alreadyOn: Bool) -> Bool { curl[finger] > (alreadyOn ? 80 : 120) }
         let wasGripping = previous?.grip == true, wasPointing = previous?.point == true
         grip = (0..<4).allSatisfy { curled($0, alreadyOn: wasGripping) }
         point = curl[0] < (wasPointing ? 40 : 18) && (1..<4).allSatisfy { curled($0, alreadyOn: wasPointing) }
-        // A platform that reports pinches itself decides the index pinch.
+        // Override index-finger pinch when the platform provides system pinch state.
         switch hand.systemPinch {
         case .notPinching: pinch[0] = false
         case .pinching(_, let pressed): pinch[0] = pressed
@@ -127,15 +119,14 @@ struct HandGestures {
         }
     }
 
-    /// For the log: what is being done, in words.
+    /// Human-readable summary of active gestures for logging.
     var description: String {
         let names = ["index pinch", "middle pinch", "ring pinch", "little pinch"]
         let active = (0..<4).filter { pinch[$0] }.map { names[$0] } + (grip ? ["grip"] : []) + (point ? ["point"] : [])
         return active.isEmpty ? "nothing" : active.joined(separator: ", ")
     }
 
-    /// The 28-byte input block of the pose message for a hand: the index
-    /// pinch and the grip as two buttons and two analog values.
+    /// Encodes the 28-byte pose-message input block mapping index pinch and grip to buttons and analog channels.
     func inputBlock() -> Bytes {
         var out = Bytes()
         out.append(integer: UInt64((pinch[0] ? 1 : 0) | (grip ? 2 : 0)))
@@ -155,7 +146,7 @@ struct HandGestures {
     }
 }
 
-/// Quaternions as (w, x, y, z), as the wire has them.
+/// Quaternion ordered `(w, x, y, z)` to match the wire format.
 private typealias Quaternion = [Float]
 
 private func multiply(_ a: Quaternion, _ b: Quaternion) -> Quaternion {
@@ -175,12 +166,12 @@ private func rotate(_ v: Vec3, by q: Quaternion) -> Vec3 {
 func length(_ v: Vec3) -> Float { v.dot(v).squareRoot() }
 
 extension Pose {
-    /// `point`, given in this pose's own x, y, z (right, up, backward), in world space.
+    /// Converts local `(right, up, backward)` coordinates into a world-space point.
     fileprivate func world(x: Float, y: Float, z: Float) -> Vec3 {
         position + right * x + up * y + forward * -z
     }
 
-    /// A world-space point in this pose's own x, y, z (right, up, backward).
+    /// Converts a world-space point into local `(right, up, backward)` coordinates.
     fileprivate func ownAxes(_ point: Vec3) -> Vec3 {
         let p = local(point)
         return Vec3(p.x, p.y, -p.z)
@@ -188,35 +179,34 @@ extension Pose {
 }
 
 extension TrackedHand {
-    /// Where the host should put its hand device relative to the wrist joint,
-    /// as the pose message carries it: position, then quaternion w first.
-    /// The reference client's constants: 9 cm across and 15 cm forward of the
-    /// wrist, rolled a quarter turn and pitched 45 degrees.
+    /// Offset from the wrist joint to the SteamVR hand device pose, as `(position, quaternion)`
+    /// with `w` first. Uses `vrlink`'s constants: 9 cm inward and 15 cm forward of
+    /// the wrist, rolled 90 degrees and pitched 45 degrees.
     static func wristOffset(_ side: Side) -> (position: Vec3, orientation: [Float]) {
         let sign: Float = side == .left ? 1 : -1
         return (Vec3(0.09 * sign, -0.02, -0.15), [0.65328, 0.27060, -0.27060 * sign, -0.65328 * sign])
     }
 
-    /// The skeleton's wrist bone relative to the hand device. vrlink does this oddly,
-    /// so the constants are taken from it.
+    /// Offset of the skeleton's wrist bone relative to the hand device, using `vrlink`'s empirical constants.
     static func wristBone(_ side: Side) -> (position: Vec3, orientation: [Float]) {
         side == .left ? (Vec3(-0.034038, 0.036503, 0.164722), [-0.055147, -0.078608, -0.920279, 0.379296])
                       : (Vec3(0.034038, 0.036503, 0.164722), [-0.055147, -0.078608, 0.920279, -0.379296])
     }
 
-    /// SteamVR's hand skeleton: 31 bones, each a position and orientation
-    /// relative to its parent bone. Bone 0 is the root, 1 the wrist, 2...25
-    /// follow the joints of the same number, and 26...30 are one "auxiliary"
-    /// bone per finger, placed from the wrist.
+    /// Computes SteamVR's 31-bone hand skeleton, where each bone is a `(position, orientation)`
+    /// transform relative to its parent. Bone 0 is the root, bone 1 is the wrist,
+    /// bones 2...25 correspond to the OpenXR joints at the same indices, and bones
+    /// 26...30 are per-finger auxiliary bones relative to the wrist.
     ///
-    /// SteamVR's bone axes differ from the joints' and are mirrored between
-    /// the hands, so each formula is vrlink's change of axes around a plain "this joint relative to that one".
+    /// SteamVR's bone axes differ from OpenXR's joint axes and mirror across left
+    /// and right hands, so each bone applies `vrlink`'s basis change to the parent-relative
+    /// joint transform.
     func bones(_ side: Side) -> [(position: Vec3, orientation: [Float])] {
         let left = side == .left
         let s: Float = 0.70710678
         let wrist = joints[TrackedHand.wrist], wristQ = wrist.quaternion
 
-        /// A joint placed along its parent's bone: only the distance and the bend matter.
+        /// Computes a child bone transform along its parent bone from joint distance and relative rotation.
         func along(_ joint: Pose, from parent: Pose) -> (Vec3, [Float]) {
             let bend = multiply(conjugate(parent.quaternion), joint.quaternion)
             let distance = length(joint.position - parent.position)
@@ -226,12 +216,12 @@ extension TrackedHand {
 
         var bones: [(Vec3, [Float])] = [
             (Vec3(0, 0, 0), [1, 0, 0, 0]),
-            // The wrist bone is a constant: the hand's place is the wrist pose sent beside it.
+            // The wrist bone uses a fixed local offset because overall hand tracking is carried by the wrist pose.
             TrackedHand.wristBone(side),
         ]
         for joint in 2..<TrackedHand.jointCount {
             if [2, 6, 11, 16, 21].contains(joint) {
-                // The first bone of each finger hangs off the wrist.
+                // Each finger's metacarpal is parented directly to the wrist.
                 let relative = multiply(conjugate(wristQ), joints[joint].quaternion)
                 let d = wrist.ownAxes(joints[joint].position)
                 bones.append(left
@@ -241,14 +231,14 @@ extension TrackedHand {
                 bones.append(along(joints[joint], from: joints[joint - 1]))
             }
         }
-        // Auxiliary bones: each finger's last knuckle, as seen from the wrist.
+        // Append the five auxiliary bones (each finger's distal joint relative to the wrist).
         for joint in [4, 9, 14, 19, 24] { bones.append(along(joints[joint], from: wrist)) }
         return bones
     }
 
-    /// The skeleton packed into 8 bytes per bone: three 10-bit position axes
-    /// covering +-17.5 cm, then the orientation as its largest component's
-    /// index and the other three in 10 bits each.
+    /// Packs the 31-bone skeleton into 8 bytes per bone: three 10-bit quantized
+    /// position coordinates (+-17.5 cm) followed by smallest-three quaternion
+    /// compression (2-bit largest-component index plus three 10-bit components).
     func compressedSkeleton(_ side: Side) -> Bytes {
         func axis(_ meters: Float) -> UInt32 {
             UInt32(max(0, min(1023, Int(((meters + 0.175) * 5.714286 + 0.0019550342) * 511.5))))
@@ -261,7 +251,7 @@ extension TrackedHand {
             if abs(q[3]) > abs(q[largest]) { largest = 3 }
             var word = UInt32(largest)
             for index in 0..<4 where index != largest {
-                // Each of the others: a "sign differs from the largest's" bit and a 9-bit size.
+                // Pack each remaining quaternion component as a sign-difference bit (relative to the largest component) and a 9-bit magnitude.
                 let differs: UInt32 = (q[index] < 0) != (q[largest] < 0) ? 0x200 : 0
                 let size = min(511, UInt32(abs(q[index]) / 0.70710677 * 511 + 0.5))
                 word = word << 10 | differs | size
@@ -271,11 +261,11 @@ extension TrackedHand {
         return out
     }
 
-    /// A pointing ray for this hand, which vrlink gets from its headset's runtime and we have to make up
-    /// for platforms which are missing it.
+    /// Synthesizes a hand-aim ray for platforms whose runtime does not provide one
+    /// (unlike Quest, where `vrlink` reads the runtime's aim pose directly).
     ///
-    /// The point rests in the opening between the index and thumb, and is stabilized using a ray going from
-    /// the predicted shoulder pose  to the middle metacarpal tip.
+    /// The ray starts between the thumb and index finger and blends the direction
+    /// from an estimated shoulder point through the middle knuckle with the palm normal.
     func aim(_ side: Side, head: Pose) -> Pose {
         let gap = (joints[TrackedHand.proximal(0) + 1].position + joints[TrackedHand.thumbTip - 1].position) * 0.5
         let worldUp = Vec3(0, 1, 0)
@@ -293,19 +283,19 @@ extension TrackedHand {
         return Pose(position: gap + forward * 0.02, right: right, up: right.cross(forward), forward: forward)
     }
 
-    /// How much of the pointing direction comes from where the palm faces.
+    /// Weight given to the palm normal when blending the synthesized aim direction.
     static let palmShare: Float = 0.25
 
-    /// The hand message (class 3, type 0x17): the skeleton, which hand,
-    /// its gestures, the pointing ray relative to the hand device, and the
-    /// way back from the hand device to the wrist.
-    /// In the hand message's byte after the skeleton: bit 0 is which hand, bit 1 says it is tracked.
+    /// Bit 1 of the flags byte following the skeleton (bit 0 encodes `Side`), indicating active tracking.
     static let messageFlagTracked: UInt8 = 0x02
 
+    /// Builds the SVL hand tracking element (class 3, type 0x17) containing the
+    /// compressed skeleton, handedness/tracking flags, gesture bitmask, hand-device-relative
+    /// aim pose, and inverse wrist offset.
     func message(_ side: Side, gestures: HandGestures, aim: Pose) -> SVLElement {
         let offset = TrackedHand.wristOffset(side)
         let wrist = joints[TrackedHand.wrist]
-        // The hand device: the wrist, moved and turned by the offset.
+        // Compute the hand device pose in world space by applying wristOffset to the wrist joint.
         let deviceQ = multiply(wrist.quaternion, offset.orientation)
         let devicePosition = wrist.world(x: offset.position.x, y: offset.position.y, z: offset.position.z)
         let aimPosition = rotate(aim.position - devicePosition, by: conjugate(deviceQ))
@@ -323,15 +313,15 @@ extension TrackedHand {
     }
 }
 
-/// A hand's pointing ray, smoothed: where it starts (meters) and which way
-/// it points (a unit vector) each go through their own 1 euro filter.
+/// Smooths a hand's aim ray by filtering its world-space origin and forward
+/// vector with separate 1-euro filters.
 struct AimFilter {
     private var origin = OneEuroFilterVec3(slowestCutoff: 1.5, speedGain: 20)      // free by about 0.5 m/s
     private var direction = OneEuroFilterVec3(slowestCutoff: 1.0, speedGain: 6)    // free by about 2 rad/s
     private var lastTime: Double?
 
     mutating func smooth(_ aim: Pose, seconds time: Double) -> Pose {
-        // After a gap the hand may be anywhere: start again.
+        // Reset the filters after a tracking gap so the ray snaps immediately to the new hand pose.
         var step = Float(time - (lastTime ?? time))
         if step < 0 || step > 0.2 {
             self = AimFilter()

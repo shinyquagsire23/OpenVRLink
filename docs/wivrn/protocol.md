@@ -1,185 +1,202 @@
-# WiVRn: what this client speaks of it
+# WiVRn protocol
 
 [WiVRn](https://github.com/WiVRn/WiVRn) streams OpenXR applications from a Linux
-computer. Its protocol is open; everything here was read from its source at
-release **26.9** (`common/wivrn_packets.h`, `wivrn_serialization.h`,
-`wivrn_sockets.cpp`, `server/driver/wivrn_connection.cpp`) and is marked
-**source**, or was seen working against a 26.9 host on 2026-11-13 and is marked
-**measured**. WiVRn is GPL-3; none of its code is in this repository, only a
-description of what goes over the wire and an implementation written from it
-(`client/Sources/VRLinkCore/WiVRn/`).
+host. Its wire protocol is open source; everything documented here was read from
+the WiVRn **26.9** source tree (`common/wivrn_packets.h`,
+`wivrn_serialization.h`, `wivrn_sockets.cpp`,
+`server/driver/wivrn_connection.cpp`, tagged **source**) or verified against a
+live 26.9 host on 2026-11-13 (tagged **measured**). Because WiVRn is licensed
+under GPL-3, this repository contains no WiVRn code—only this wire-protocol
+description and a clean-room Swift implementation in
+`client/Sources/VRLinkCore/WiVRn/`.
 
-Not done yet: encryption and pairing (the host must be started with
-`--no-encrypt`), the host's list of applications.
+Encryption, PIN pairing (the host must currently be started with
+`--no-encrypt`), and querying the host's application list are not implemented
+yet.
 
-## One release, one protocol
+## Protocol versioning
 
-The first packet a client sends carries a 64-bit number that the host compares
-with its own and refuses on any difference (**source**). The number is an FNV-1a
-hash of a description of every packet in both directions: each field's type,
-and for enumerations each name and value. Adding a button to the list of
-controller inputs changes it. So a client speaks to exactly one release, and
-`WiVRnPackets.swift` is written again for each.
+The first packet sent by a client carries a 64-bit protocol ID that the host
+compares against its own, rejecting the connection on any mismatch (**source**).
+The ID is an FNV-1a hash of the type definitions of every packet in both
+directions, including each field's type and each enum's member names and values.
+Adding even a single controller input enum entry changes the hash. Consequently,
+a client build speaks to a specific WiVRn release, and `WiVRnPackets.swift` must
+be updated whenever the packet definitions change.
 
-| release | number | how it was had |
+| release | protocol ID | verification |
 |---|---|---|
-| 26.9 | `fc26e619b7ab80f8` | **measured**: what a 26.9 host announces |
+| 26.9 | `fc26e619b7ab80f8` | **measured**: advertised by a 26.9 host |
 
-A host announces itself by mDNS as `_wivrn._tcp` with TXT records `version`,
-`protocol` (the number above, in hex) and `cookie` (**measured**). The port is
-9757 unless configured otherwise (**source**).
+A host advertises itself via mDNS as `_wivrn._tcp` with TXT records `version`,
+`protocol` (the 64-bit protocol ID in hex), and `cookie` (**measured**). The
+default port is 9757 unless configured otherwise (**source**).
 
-## Wire format (**source**; the packets this client uses, **measured**)
+## Wire format (**source**; packets used by this client **measured**)
 
-A packet is one byte saying which packet it is (its place in the list of all
-packets of that direction), then its fields in order with no padding, numbers
-little-endian.
+Each packet begins with a 1-byte packet type index (its zero-based position in
+the packet list for that direction), followed by its fields serialized in
+declaration order with no alignment padding and little-endian byte order for
+multi-byte scalars.
 
-| type | on the wire |
+| type | wire encoding |
 |---|---|
-| integer, float, enumeration | its bytes; an enumeration with no stated size is 32 bits |
-| `bool` | one byte |
-| string, list, byte run | a length, then the elements |
-| length | 16 bits when under `0x7fff`; otherwise the low 15 bits with the top bit set, then the rest in 16 more |
-| optional | one byte 0 or 1, then the value if 1 |
-| one of several types | one byte saying which, then that type |
-| `XrPosef` | orientation x, y, z, w, then position x, y, z (28 bytes) |
-| `XrFovf` | angles to the left, right, upper and lower edges, radians (16 bytes) |
-| time | signed 64 bits, nanoseconds on the headset's clock |
+| integer, float, enum | little-endian bytes; an enum with no explicit underlying size is 32 bits |
+| `bool` | 1 byte (`0` or `1`) |
+| string, list, byte array | length prefix followed by the elements |
+| length prefix | 16 bits when `< 0x7fff`; otherwise the low 15 bits with the top bit set, followed by the upper bits in a second 16-bit word |
+| optional (`std::optional`) | 1-byte presence flag (`0` or `1`), followed by the value when `1` |
+| variant (`std::variant`) | 1-byte alternative index, followed by the selected type |
+| `XrPosef` | orientation quaternion `x, y, z, w` followed by position `x, y, z` as float32 (28 bytes) |
+| `XrFovf` | left, right, upper, and lower half-angles in radians as float32 (16 bytes) |
+| timestamp / duration | signed 64-bit integer, nanoseconds on the headset's clock |
 
-Two sockets to the same port:
+A session uses two sockets connected to the same host port:
 
-- **control**, TCP: each packet has its length in front as 32 bits.
-- **stream**, UDP: one packet to a datagram.
+- **Control (TCP)**: Each packet is prefixed with a 32-bit byte length.
+- **Stream (UDP)**: Each datagram carries a single packet with no length prefix.
 
-Either packet may arrive on either socket; the host sends video, audio and
-time queries on the stream and the rest on control.
+Any packet type can travel over either socket; in practice, the host sends video
+shards, audio frames, and clock-sync queries over the UDP stream socket and
+sends control messages over TCP.
 
-## Connecting (**source**, **measured** with encryption off)
+## Connecting (**source**; **measured** with encryption disabled)
 
 | | headset | host |
 |---|---|---|
-| 1 | control: `crypto_handshake` (the number, a public key in PEM, the headset's name) | |
-| 2 | | control: `crypto_handshake` (its key, and a state: 0 encryption off, 1 PIN needed, 2 already paired, 3 no new headsets, 4 wrong number) |
-| 3 | control: `crypto_handshake` with nothing in it | |
-| 4 | | control: `handshake` (its UDP port) |
-| 5 | stream: `handshake`, repeated until answered | |
-| 6 | | control: `handshake` again |
+| 1 | control: `crypto_handshake` (protocol ID, client public key in PEM format, headset name) | |
+| 2 | | control: `crypto_handshake` (host public key, state: `0` encryption disabled, `1` PIN needed, `2` already paired, `3` pairing disabled, `4` incompatible protocol ID) |
+| 3 | control: empty `crypto_handshake` | |
+| 4 | | control: `handshake` (host UDP port) |
+| 5 | stream: `handshake`, repeated over UDP until acknowledged | |
+| 6 | | control: `handshake` confirmation |
 | 7 | control: `headset_info_packet` | |
 
-With encryption off the host still reads the key in step 1 and refuses the
-connection if it is not one; any key will do (this client sends an X25519 one
-made up on the spot).
+Even when encryption is disabled (`--no-encrypt`), the host parses the PEM
+public key in step 1 and rejects the connection if it is missing or invalid. Any
+valid PEM public key is accepted; this client sends an ephemeral X25519 public
+key generated at connection time.
 
-`headset_info_packet` says what one eye is rendered at and what it is encoded
-at, the refresh rates, the bitrate, a speaker and microphone format, the eyes'
-frusta, what tracking there is, and the codecs the headset decodes in order of
-preference. Asked for 2048 x 2048 rendered and 1536 x 1536 encoded with HEVC
-first, a host with NVENC chose 10-bit HEVC for both eyes at 24.6 Mbit/s each of
-the 50 asked for (**measured**).
+`headset_info_packet` declares the per-eye render resolution, per-eye encoded
+video resolution, supported and preferred refresh rates, target bitrate, speaker
+and microphone audio formats, per-eye FOV frusta, supported tracking features,
+and supported video codecs in preference order. When this client requested
+2048 x 2048 rendered and 1536 x 1536 encoded with HEVC first and a 50 Mbit/s
+total bitrate, a host with NVENC selected 10-bit HEVC for both eyes at
+24.6 Mbit/s per eye (**measured**).
 
-An encoder asked for more pixels than it can do says nothing and delivers
-fewer frames. NVENC on an NVIDIA GB10, two HEVC streams, 120 Hz asked for
-(**measured**, 2026-11-13; 8-bit and 10-bit alike):
+If the requested encoded pixel rate exceeds hardware encoder capacity, the host
+reports no error and simply delivers fewer frames per second. Throughput on an
+NVIDIA GB10 (NVENC, two HEVC streams, 120 Hz requested; **measured** 2026-11-13,
+identical for 8-bit and 10-bit):
 
-| one eye encoded | frames/s | megapixels/s, both eyes |
+| per-eye encoded resolution | frames/s | megapixels/s, both eyes |
 |---|---|---|
 | 2560 x 2048 | 66 | 692 |
 | 2208 x 1792 | 84 | 665 |
 | 2048 x 1632 | 98 | 655 |
-| 1536 x 1536 | 120 | 566 (not the limit) |
+| 1536 x 1536 | 120 | 566 (below encoder limit) |
 
-So the client sizes the encoded picture from a budget of pixels a second
-(`WiVRnSession.encodedPixelsPerSecond`), not from a fixed share of the
-rendered one.
+Accordingly, the client computes its encoded video resolution from a pixel-rate
+budget (`WiVRnSession.encodedPixelsPerSecond`) rather than using a fixed ratio
+of the render resolution.
 
 A host withdraws its mDNS announcement while a headset is connected and
-announces again when the control connection closes (**source**, `server/main.cpp`).
+re-announces itself when the TCP control connection closes (**source**,
+`server/main.cpp`).
 
-The host streams nothing until an OpenXR application has a session
-(**measured**). A `session_state_changed` of 5 (focused) tells it the headset is
-being looked through.
+The host streams no media until an OpenXR application opens a session
+(**measured**). Sending `session_state_changed` with state `5` (focused) tells
+the host that the headset is actively worn.
 
 ## Video (**source**, **measured**)
 
-Each eye is a video stream of its own (stream 0 left, 1 right; 2, at half size,
-carries transparency for passthrough). `video_stream_description` gives one
-eye's encoded size and the codec of each.
+Each eye uses its own video stream (stream 0 for the left eye, stream 1 for the
+right eye, and stream 2 at half dimensions for passthrough alpha).
+`video_stream_description` gives the per-eye encoded dimensions and the codec
+selected for each stream.
 
-A frame of one stream arrives as numbered **shards** of at most 1400 bytes of
-Annex B. The first shard of a frame carries, for both eyes:
+Each encoded frame arrives as indexed UDP **shards** carrying up to 1400 bytes
+of Annex B bitstream data. The first shard of a frame includes metadata covering
+both eyes:
 
-- when the frame is meant to be seen
-- the pose each eye was rendered from, in the space the headset reports its head in
-- each eye's frustum
-- how each eye's picture was squeezed (below)
+- target display time
+- rendered eye poses in the headset's head-tracking space
+- per-eye FOV frusta
+- per-eye foveation band parameters (described below)
 
-and the last carries four times of the host's own (encoding and sending begun
-and ended). Nothing is sent twice and there is no parity. The headset reports
-on every frame of every stream with `feedback`: when its first and last shards
-came, when it went to the decoder and came out, when it was drawn and shown.
-A report without "went to the decoder" tells the host the frame was lost, and
-its next frame of that stream is a keyframe.
+The final shard carries four host timestamps (encode start/end and send
+start/end). WiVRn uses neither retransmission nor FEC parity. For every frame on
+every stream, the headset sends a `feedback` packet reporting timestamps for
+first-shard arrival, last-shard arrival, decode submission, decode completion,
+drawing, and display. Omitting the decode-submission timestamp tells the host
+that the frame was lost, causing the next frame on that stream to be encoded as
+a keyframe.
 
 ### Foveation
 
-The host squeezes each eye's picture along both axes in bands. For one axis it
-sends a list of an odd number of counts: how many encoded pixels each band has.
-The middle band is one source pixel to an encoded pixel, the bands either side
-two to one, the next three to one, and so on. A band of one axis crossed with a
-band of the other is a rectangle at one scale, so the client draws each as a
-quad (`WiVRnSession.layout`): its share of the unsqueezed picture is its share
-of the frustum, the picture being linear in the tangent of the angle.
+The host compresses each eye's image along both X and Y in rectilinear scale
+bands. For each axis, it sends an odd-length list of encoded pixel counts per
+band: the center band runs at 1:1 (one source pixel per encoded pixel), the
+adjacent bands on either side at 2:1, the next pair at 3:1, and so on outward.
+Crossing the horizontal bands with the vertical bands produces a grid of
+constant-scale rectangular tiles, each drawn by the client as a world-space quad
+(`WiVRnSession.layout`). Because rectilinear projection is linear in FOV tangent
+space, each band's fraction of the unscaled image equals its fraction of the
+tangent frustum.
 
-2048 x 2048 squeezed into 1536 x 1536 came as five bands each way
-(**measured**); drawn as 25 quads per eye, hello_xr's cubes are square and no
-seams show.
+A 2048 x 2048 render target compressed into 1536 x 1536 used five bands per axis
+(**measured**); rendered as 25 quads per eye, `hello_xr`'s cubes appear square
+with no visible seams.
 
-The bands change while streaming, and the two eyes' need not match: one eye
-came in 11 bands across while the other came in 17 (**measured**, 2026-11-14,
-with no gaze sent). A band of no pixels is left out, so the eyes do not have
-the same number of quads.
+Foveation bands can change mid-stream and do not need to match between eyes: in
+one capture without eye gaze (**measured**, 2026-11-14), one eye used 11
+horizontal bands while the other used 17. Zero-pixel bands are omitted, so the
+two eyes can produce different quad counts.
 
-### Transparency (**source**, **measured** with WayVR's see-through mode)
+### Alpha passthrough (**source**; **measured** with WayVR see-through mode)
 
-A headset that declares passthrough lets applications ask for a picture with
-transparent parts. The first shard of each frame says whether this frame has
-any; when it has, a frame of stream 2 comes with it: one picture, as wide as
-an eye's and half as tall, whose brightness is how opaque the colors are. The
-left eye's is in its left half and the right eye's in its right, each squeezed
-by the same bands as the colors (so a point at `(u, v)` of an eye's picture is
-at `((u + eye) / 2, v)` of this one, in fractions). The colors come already
-multiplied by the opacity.
+When a headset advertises alpha-blend passthrough support, OpenXR applications
+can submit frames with transparent regions. A flag in the first shard indicates
+whether the frame includes alpha; when set, stream 2 delivers a companion frame
+as wide as one eye's image and half as tall, where luma encodes opacity. The
+left eye's alpha occupies the left half and the right eye's alpha occupies the
+right half, compressed with the same foveation bands as the color streams (so
+normalized coordinates `(u, v)` in an eye's color image map to
+`((u + eye) / 2, v)` in the alpha image). RGB color streams arrive premultiplied
+by alpha.
 
-The third stream is encoded like the others and counts against the encoder:
-1600 x 1600 per eye for a 120 Hz display fell to 97 frames a second when
-WayVR's transparent background brought it in (**measured**), so the client's
-budget counts it from the start.
+Stream 2 runs on the hardware encoder alongside the color streams and shares the
+same throughput budget: streaming 1600 x 1600 per eye for a 120 Hz display
+dropped to 97 fps when WayVR enabled its transparent background (**measured**),
+so the client reserves encoder pixel budget for stream 2 from the start.
 
-## Tracking (**source**, **measured** for the head)
+## Tracking (**source**; head tracking **measured**)
 
-The host says which devices it wants located and how far ahead of the asking
-(`tracking_control`: a list of device and nanoseconds, retuned about once a
-second as it measures the delay; 20 to 25 ms for the head on a wired LAN). The
-headset answers with `tracking` packets on the stream, each saying when it was
-made and what time its poses are for: the head, with velocities along the
-world's axes, and each eye's pose on the head and its frustum. Eye geometry can
-therefore change while streaming.
+The host sends `tracking_control` packets (~1 Hz) listing the device IDs to
+report and how many nanoseconds ahead to predict poses (retuned continuously
+from measured latency; typically 20–25 ms for the head over wired Ethernet). The
+headset replies over UDP with `tracking` packets containing a production
+timestamp, the target pose timestamp, the head pose with world-space velocities,
+and per-eye head-relative poses and frusta (allowing eye geometry to update
+mid-stream).
 
-This client sends the head's last known pose carried forward by its velocities
-(`TrackedPose.predicted`); a platform that can be asked for the pose at a time
-should be asked instead. Controllers are carried forward the same way, with
-half their turning rate (`ControllerState.spinSent`, the figure settled on for
-Steam hosts), and the host is told that reduced rate too: with all of it,
-small movements overshot badly on the headset (2026-11-14), and asking ARKit
-for the controller at the later time was no better.
+This client extrapolates the latest known head pose forward using its velocities
+(`TrackedPose.predicted`); platforms whose tracking API supports querying a
+future timestamp directly should do so instead. Controller poses are
+extrapolated the same way, but using half of their angular velocity
+(`ControllerState.spinSent`, matching the scale used for Steam hosts) and
+reporting that halved angular velocity to the host. Using the full angular
+velocity caused small controller motions to overshoot noticeably on the headset
+(2026-11-14), and querying ARKit at the future timestamp showed the same
+overshoot.
 
-### What the hands hold (**source**; poses **measured**, inputs and haptics not yet seen to act)
+### Controllers and hand input (**source**; poses **measured**, button inputs and haptics unverified)
 
-Every tracking packet says what each hand holds (`interaction_profile`: 0
-nothing, 2 a bare hand as OpenXR's hand-interaction device, 17 a Touch
-controller, and two dozen other controllers), and carries poses for it by
-device number:
+Every `tracking` packet declares each hand's active `interaction_profile` (`0`
+none, `2` bare hand as OpenXR's hand-interaction profile, `17` Oculus Touch
+controller, among roughly two dozen supported controller profiles) and carries
+poses keyed by device ID:
 
 | | left | right |
 |---|---|---|
@@ -188,77 +205,84 @@ device number:
 | pinch pose (bare hand) | 45 | 81 |
 | poke pose (bare hand) | 48 | 84 |
 
-With a pretend Touch controller in one hand and a pretend bare hand in the
-other, hello_xr drew its cube at each grip, and the host's list of what to
-locate grew by six poses (**measured**).
+Testing with a simulated Touch controller in one hand and a simulated bare hand
+in the other caused `hello_xr` to render a cube at each grip and added six pose
+IDs to the host's `tracking_control` list (**measured**).
 
-Buttons, triggers and sticks go in `inputs`: a list of input number, value
-and the time the value last changed. This client sends every input with every
-tracking packet, so one lost is made good by the next. The numbers used are
-in `WiVRnInput.swift`; the right hand's follow the left's in the same order.
-For a bare hand the inputs are pinch, aim-and-pinch and grasp, each a value
-and a "ready".
+Buttons, triggers, and thumbsticks are sent in `inputs` packets as a list of
+`(input_id, value, last_change_time)` entries. This client includes every active
+input in each tracking update so a dropped UDP packet is recovered by the next
+packet. Input ID definitions live in `WiVRnInput.swift`, with right-hand IDs
+following left-hand IDs in the same order. For bare hands, the reported inputs
+are pinch, aim-and-pinch, and grasp, each paired with a `ready` boolean.
 
-A hand's 26 joints go in `hand_tracking`, once a frame, for the hands the
-host's list asks for (devices 90 and 91): position, rotation packed into 32
-bits (two bits name the largest of x, y, z, w; the other three follow at ten
-bits each), velocities, a radius, flags.
+Skeletal hand tracking sends 26 joints per hand once per frame in
+`hand_tracking` packets whenever requested by the host (device IDs 90 and 91).
+Each joint carries position, a 32-bit smallest-three quaternion (2 bits naming
+the largest component among `x, y, z, w`, followed by the remaining three
+components at 10 bits each), linear and angular velocities, joint radius, and
+tracking flags.
 
-The host asks for vibration with `haptics`: a device (1 and 2 the
-controllers, 3 to 6 their triggers and thumb rests), a duration in
-nanoseconds, a frequency, an amplitude. The headset's battery goes in
-`battery`.
+The host triggers vibration with `haptics` packets specifying a target actuator
+ID (`1` and `2` for the left and right controllers, `3`–`6` for trigger and
+thumbrest actuators), duration in nanoseconds, frequency, and amplitude. Headset
+battery state is sent in `battery` packets.
 
-### Coming back to a session
+### Reconnecting to an existing session
 
-The host keeps a session while an application is attached to it, and takes a
-headset back into it only if the headset describes itself as before
-(**source**, `wivrn_session.cpp`): the same system name, the same list of
-refresh rates, the same palm, presence, passthrough and body-tracking
-answers, and frusta equal to the bit. Otherwise it sends a message,
-"Headset incompatible with session: headset features changed", and closes
-(**measured**, on reconnecting with hand tracking newly declared; hand, eye
-and face tracking only earn a warning in the source). A display measured
-twice does not give the same frusta twice, so the client keeps what it told
-each host and tells it the same again while the display measures about the
-same (`WiVRnDisplayMemory`), and sends its refresh rates in one order.
+The host keeps an OpenXR session alive while an application remains attached,
+and allows a reconnecting headset to rejoin only if its `headset_info_packet`
+matches the original session (**source**, `wivrn_session.cpp`): identical system
+name, identical refresh-rate list, identical palm-pose, user-presence,
+passthrough, and body-tracking flags, and bitwise-equal eye FOV frusta. On any
+mismatch, the host sends `"Headset incompatible with session: headset features
+changed"` and closes the connection (**measured** when reconnecting with hand
+tracking newly enabled, although hand, eye, and face tracking changes only log a
+warning in upstream source). Because querying display geometry across runs can
+return slightly different floating-point frusta, `WiVRnDisplayMemory` caches the
+frusta previously reported to each host, reuses them while newly measured values
+stay within tolerance, and sends refresh rates in a deterministic order.
 
-### The rate asked for
+### Refresh rate selection
 
-The headset names the rate it wants in `headset_info_packet`, and the host
-streams at it until told the display runs at another (`refresh_rate_changed`).
-A WiVRn host does not ask for rates itself. This client asks for the lowest
-rate the display offers, and asks the display for the same: the encoder's
-budget (above) then buys the most pixels a frame.
+The headset specifies its target refresh rate in `headset_info_packet`, and the
+host streams at that rate until the client sends `refresh_rate_changed`; WiVRn
+hosts never initiate refresh-rate changes on their own. This client requests the
+lowest refresh rate supported by the display (and configures the display to
+match) so the encoder's pixel-per-second budget yields the highest spatial
+resolution per frame.
 
-### Eyes and face (**source**; not yet seen to act)
+### Eye gaze and face tracking (**source**; unverified end-to-end)
 
-Where the eyes look is one more pose in the tracking packet, device 89: on
-the head, at its origin, facing the point looked at. The face goes at the end
-of the tracking packet as one of several forms; this client sends
-XR_FB_face_tracking2's (form 2): a sample time, 70 weights, the confidence in
-the lower and the upper face, and two flags. `headset_info_packet` says
-whether either will come.
+Eye gaze is carried as device ID 89 in the `tracking` packet: a head-relative
+pose at the head origin oriented toward the gazed point. Face tracking data is
+appended to the end of the `tracking` packet as a variant payload; this client
+sends variant 2 (`XR_FB_face_tracking2`), carrying a sample timestamp, 70
+blendshape weights, lower- and upper-face confidence values, and two flags.
+Support for both features is declared in `headset_info_packet`.
 
-## Clock
+## Clock synchronization
 
-All times are the headset's. The host sends `timesync_query` with a time of its
-own and the headset returns it with its own time beside it; from those the host
-works out the offset. The headset estimates nothing.
+All protocol timestamps use the headset's monotonic clock. The host periodically
+sends `timesync_query` carrying a host timestamp, and the headset echoes that
+timestamp alongside its current local time so the host can compute the clock
+offset; the client does not maintain a clock offset estimate of its own.
 
-## Audio (**source**; the speaker **measured**, the microphone not yet heard)
+## Audio (**source**; speaker output **measured**, microphone uplink unverified)
 
-Raw interleaved 16-bit PCM at the format the headset offered, in `audio_data`
-packets on the stream, with no parity.
+Speaker audio arrives over UDP in `audio_data` packets as raw interleaved 16-bit
+PCM matching the format advertised by the headset, with no FEC parity.
 
-The microphone goes the other way in the same packet, at the format offered
-for it (one channel at 48 kHz here), but only while the host wants it: it
-sends `feature_control` (feature 1) on and off as something on the host
-starts and stops listening.
+Microphone audio travels from headset to host in the same `audio_data` packet
+format (configured here as 48 kHz mono), gated by the host: the host sends
+`feature_control` (feature `1`) to enable and disable microphone capture as host
+applications start and stop recording.
 
-## Loss
+## Frame loss
 
-A picture given up for want of a shard is reported to the host, which makes
-that eye's next frame a keyframe. What arrives for that eye before the
-keyframe builds on the missing picture: the client reports those as lost
-too and gives none of them to the decoder.
+When a video frame cannot be reassembled due to a missing UDP shard, the client
+sends a `feedback` report omitting the decode-submission timestamp, which
+prompts the host to emit a keyframe on the next frame for that eye stream. Any
+frames arriving on that stream prior to the recovery keyframe depend on the
+missing reference frame, so the client reports them as lost as well and does not
+submit them to the decoder.

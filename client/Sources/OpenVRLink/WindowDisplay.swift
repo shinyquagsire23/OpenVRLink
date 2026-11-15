@@ -7,17 +7,18 @@ import VRLinkCore
 import VRLinkMetal
 import VRLinkVideoToolbox
 
-/// The window's side of the display seam: at each refresh it picks the frame
-/// to show, says where the (one) eye is, and tells the session what it did.
-/// On a headset an XR runtime does this job for two eyes.
+/// Renders decoded frames into a macOS `MTKView`. On each display refresh, it
+/// selects the next frame, computes a single-eye view from the simulated head
+/// pose, and reports frame timing back to the session (standing in for an XR
+/// compositor).
 final class WindowDisplay: NSObject, MTKViewDelegate {
-    /// Decoded frames waiting for a refresh.
+    /// Decoded frames queued for the next display refresh.
     let frames = DisplayQueue<DecodedFrame>()
-    /// Told when frames are shown and when the display will next refresh.
+    /// Receives frame presentation and vsync timing callbacks.
     var session: (any StreamingSession)?
     /// Which eye the window shows.
     var eye = Eye.left
-    /// Seconds between this display's refreshes.
+    /// Display refresh interval in seconds.
     var refreshPeriod = 1.0 / 60
 
     private let queue: MTLCommandQueue
@@ -28,7 +29,7 @@ final class WindowDisplay: NSObject, MTKViewDelegate {
 
     private let settings: Settings
 
-    /// `settings`: for the chroma key, a color of the picture to leave out; the window's background shows there.
+    /// Creates a window renderer using `settings` to configure chroma-key passthrough.
     init?(view: MTKView, profile: DeviceProfile, settings: Settings) {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else { return nil }
         view.device = device
@@ -58,7 +59,7 @@ final class WindowDisplay: NSObject, MTKViewDelegate {
         let picked = frames.next()
         renderer.chromaKey = settings.chromaKeying(inGame: session?.sceneApplicationRunning ?? false)
         if let session {
-            // Drawn now, seen a refresh later.
+            // Estimate presentation one refresh interval from now.
             let period = UInt64(refreshPeriod * 1e9)
             let seen = Uptime.nanoseconds + period
             session.displayRefreshes(at: seen + period, period: refreshPeriod)
@@ -70,9 +71,8 @@ final class WindowDisplay: NSObject, MTKViewDelegate {
         else { return }
         if let frame = picked?.frame {
             let size = view.drawableSize
-            // The window is the eye's view: the viewer's eye, at its place to
-            // one side of the head, looking where the head looks through a
-            // frustum shaped like the window.
+            // Offset the eye from the head pose by IPD and build a symmetric
+            // frustum matching the window's aspect ratio.
             let window = EyeView(eye: head.pose.shifted(right: profile.eyesInHead[eye.rawValue].position.x),
                                  frustum: .symmetric(halfAngleDegrees: 45, aspect: Float(size.width / max(1, size.height))))
             renderer.draw(Composition.quads(for: eye, layout: frame.layout),

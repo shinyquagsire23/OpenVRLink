@@ -1,23 +1,24 @@
 # Remote Play broadcast protocol (UDP 27036)
 
-This layer handles everything before the VR stream: a client finds a host,
-pairs with it and asks it to start a SteamVR streaming session. It is Steam's
-long-lived "In-Home Streaming" discovery protocol, and VR Link adds two enum
-values and reuses one response field. The Steam Link shell (`libshell_arm64-v8a.so`,
-`CServerManager`) is vrlink.
+The Remote Play broadcast layer handles host discovery, PIN pairing, and session
+initiation before the VR stream begins. It uses Steam's In-Home Streaming
+discovery protocol on UDP port 27036, adding two VR Link enum values and
+repurposing one response field. In Valve's Android APK, the 2D Steam Link shell
+(`libshell_arm64-v8a.so`, `CServerManager`) implements this layer before
+launching `vrlink`.
 
 | file | topic |
 |---|---|
-| [broadcast-packet.md](broadcast-packet.md) | datagram framing, the header, message types |
-| [discovery.md](discovery.md) | probe and Status reply |
-| [crypto.md](crypto.md) | the symmetric scheme, the PIN-masked key exchange, the RSA ticket |
-| [pairing.md](pairing.md) | first-time authorization by PIN |
-| [session-request.md](session-request.md) | starting a session; where `sArgs` comes from |
-| [vr-vs-flat.md](vr-vs-flat.md) | where flat Steam Link and VR Link diverge |
-| [messages.md](messages.md) | the protobuf messages and fields the VR path uses, by number and type |
+| [broadcast-packet.md](broadcast-packet.md) | datagram framing, header fields, and message types |
+| [discovery.md](discovery.md) | discovery probes and `MsgStatus` replies |
+| [crypto.md](crypto.md) | symmetric encryption, PIN-masked key exchange, and RSA escrow tickets |
+| [pairing.md](pairing.md) | first-time device authorization via 4-digit PIN |
+| [session-request.md](session-request.md) | starting a session and obtaining `sArgs` |
+| [vr-vs-flat.md](vr-vs-flat.md) | differences between flat Steam Link and VR Link |
+| [messages.md](messages.md) | protobuf message and enum schemas used by the VR path |
 
-The output of this layer is one string, `sArgs`, which names the host, the UDP
-port and a per-session key for the SVL transport
+This layer produces a single session string, `sArgs`, which provides the host
+address, UDP port, and per-session key to the SVL transport
 ([../svl-transport/](../svl-transport/)).
 
 ```
@@ -25,9 +26,9 @@ client                                   host (Steam, UDP 27036)
   | Discovery ------------------------->  |
   | <------------------------- Status     |   vr_link_caps, client_id
   |                                       |
-  | StreamingRequest ------------------>  |   device_token proves nothing yet
+  | StreamingRequest ------------------>  |   unrecognized device_token
   | <------------- StreamingResponse(Unauthorized)      (first time only)
-  | AuthorizationRequest (PIN-masked key) |   person types the PIN on the host
+  | AuthorizationRequest (PIN-masked key) |   user enters PIN on the host
   | <------------ AuthorizationResponse   |   host's masked key -> shared secret
   | AuthorizationConfirmed ------------>  |
   |                                       |
@@ -42,9 +43,9 @@ client                                   host (Steam, UDP 27036)
 
 ## Notation
 
-- **captured** -> seen in a Klepton `KL_TRACE_NET` trace of the real vrlink client against a Windows host (Steam build 1793235415, broadcast protocol version 8);
-- **static** -> static analysis, read from `libshell_arm64-v8a.so` (addresses are file offsets; add 0x100000 for Ghidra)
-- **inferred** -> a guesstimate
+- **captured** — observed in a Klepton `KL_TRACE_NET` trace of `vrlink` against a Windows host (Steam build 1793235415, broadcast protocol version 8).
+- **static** — read from `libshell_arm64-v8a.so` via static analysis (addresses are file offsets; add `0x100000` for Ghidra).
+- **inferred** — an unverified estimate based on surrounding behavior or names.
 
-`prototype/minimal/ovrlink/{broadcast,steamcrypto,pairing}.py` implement this
-layer.
+`prototype/minimal/ovrlink/broadcast.py`, `steamcrypto.py`, and `pairing.py`
+implement this layer.

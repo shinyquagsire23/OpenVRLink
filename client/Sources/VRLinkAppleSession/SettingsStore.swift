@@ -6,9 +6,9 @@ import Combine
 import Foundation
 import VRLinkCore
 
-/// The user's settings while the app runs: shown and changed by the
-/// window, read by the display and session threads, and written to
-/// `settings.json` every time one changes.
+/// Observable wrapper around `Settings` used by the SwiftUI settings views,
+/// providing thread-safe snapshots for the render and session threads and
+/// persisting changes to `settings.json`.
 public final class SettingsStore: ObservableObject {
     @Published public var settings: Settings {
         didSet {
@@ -17,7 +17,7 @@ public final class SettingsStore: ObservableObject {
             snapshot = settings.tidied()
             let toSave = snapshot
             lock.unlock()
-            // Off the main thread: a slider changes its setting many times a second.
+            // Write to disk on a background queue since UI sliders can update many times per second.
             saving.async { toSave.save() }
         }
     }
@@ -32,7 +32,7 @@ public final class SettingsStore: ObservableObject {
         snapshot = loaded
     }
 
-    /// The settings as they are now. Safe from any thread.
+    /// Returns the latest validated settings snapshot. Safe to call from any thread.
     public var current: Settings {
         lock.lock()
         defer { lock.unlock() }

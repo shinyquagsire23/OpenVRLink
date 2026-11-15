@@ -4,14 +4,13 @@
 
 import Foundation
 
-/// Face expressions and eye features worked out from the outline of a face
-/// in a camera picture: the points a face-landmark detector gives for the
-/// eyes, pupils, brows, lips and nose.
+/// Estimates facial expressions and eye features from 2D facial landmarks
+/// (eyes, pupils, brows, lips, and nose) detected in a camera feed.
 ///
-/// This is for platforms with no face tracking of their own but provide a
-/// "camera" of the wearer's face (on visionOS, Spatial Persona)
+/// Used on platforms that do not expose native face-tracking weights but provide
+/// a virtual camera view of the user's face (such as Spatial Persona on visionOS).
 
-/// The 70 expressions of OpenXR's `XR_FB_face_tracking2`, in its order.
+/// The 70 facial expressions defined by OpenXR's `XR_FB_face_tracking2`, in specification order.
 public enum FaceExpression: Int, CaseIterable {
     case browLowererL, browLowererR, cheekPuffL, cheekPuffR, cheekRaiserL, cheekRaiserR, cheekSuckL, cheekSuckR
     case chinRaiserB, chinRaiserT, dimplerL, dimplerR, eyesClosedL, eyesClosedR
@@ -31,11 +30,11 @@ public struct LandmarkPoint {
     public init(_ x: Float, _ y: Float) { self.x = x; self.y = y }
 }
 
-/// One face's landmarks, as Apple's Vision framework gives them: every
-/// point inside the face's bounding box, 0 ... 1 across and 0 ... 1 up from
-/// its bottom-left corner. "Left" is the left of the picture.
+/// 2D facial landmarks matching Apple Vision's coordinate convention: points are normalized
+/// to `0...1` within the face bounding box with the origin at the bottom-left corner, and
+/// `left`/`right` refer to image-left and image-right.
 public struct FaceLandmarks {
-    /// The bounding box's size as a fraction of the picture's width and height.
+    /// Face bounding box dimensions normalized to the full image width and height.
     public var boxWidth: Float = 0, boxHeight: Float = 0
     public var leftEye: [LandmarkPoint] = [], rightEye: [LandmarkPoint] = []
     public var leftPupil: [LandmarkPoint] = [], rightPupil: [LandmarkPoint] = []
@@ -45,19 +44,16 @@ public struct FaceLandmarks {
     public init() {}
 }
 
-/// Where each pupil sits within its eye's outline: what a gaze calibration
-/// turns into a direction (`GazeCalibration`).
+/// Normalized pupil and eyelid features extracted from eye landmarks, used by
+/// `GazeCalibration` to estimate gaze direction.
 public struct EyeFeatures: Codable, Equatable {
-    /// For the picture's left and right eye: `across` is the pupil's place
-    /// between the eye's corners, -0.5 ... 0.5; `down` is how far the pupil
-    /// is below the middle of the outline, in eye widths.
+    /// Horizontal pupil offset between the eye corners (`-0.5...0.5`) and vertical pupil
+    /// offset below the eye contour centroid (in eye widths), for image-left and image-right eyes.
     public var leftAcross: Float, leftDown: Float, rightAcross: Float, rightDown: Float
-    /// Two more signs of looking up or down. The eyelids follow the eye,
-    /// so the outline moves with the pupil and `down` alone says little:
-    /// `belowCorners` is how far the pupil is below the line through the
-    /// eye's two corners, which stay put (in eye widths), and `open` is how
-    /// open the lids are (the outline's area over its width squared), which
-    /// falls as the eye looks down.
+    /// Additional vertical gaze cues. Because the eyelids track vertical eye motion, the eye
+    /// contour centroid shifts with the pupil and `down` alone has limited range. `belowCorners`
+    /// measures pupil offset below the fixed eye-corner line (in eye widths), and `open` measures
+    /// eyelid openness (contour area divided by width squared), which decreases on downward gaze.
     public var leftBelowCorners: Float, rightBelowCorners: Float
     public var leftOpen: Float, rightOpen: Float
 
@@ -69,7 +65,7 @@ public struct EyeFeatures: Codable, Equatable {
         self.leftOpen = leftOpen; self.rightOpen = rightOpen
     }
 
-    /// The two eyes averaged: they look at the same thing.
+    /// Bilateral averages across both eyes.
     public var across: Float { (leftAcross + rightAcross) / 2 }
     public var down: Float { (leftDown + rightDown) / 2 }
     public var belowCorners: Float { (leftBelowCorners + rightBelowCorners) / 2 }
@@ -88,22 +84,22 @@ public struct EyeFeatures: Codable, Equatable {
 public struct FaceEstimate {
     public var face: FaceExpressions
     public var eyes: EyeFeatures
-    /// Both eyes shut: there are then no pupils to go by. (Lids half
-    /// lowered, as when looking down, do not count.)
+    /// True when both eyes are closed (excluding partially lowered lids during downward gaze),
+    /// indicating pupil positions are unusable for gaze estimation.
     public var blinking: Bool
-    /// The measurements a `FaceCalibration` works from.
+    /// Normalized facial measurements consumed by `FaceCalibration`.
     public var measures = FaceMeasures()
 }
 
-/// Turns landmarks into expressions, one picture at a time. It learns the
-/// face's resting proportions from the first pictures and its extremes as
-/// it goes, so make one and keep it for as long as the same face is seen.
+/// Heuristic estimator that converts per-frame `FaceLandmarks` into expression weights and
+/// eye features. Learns neutral proportions over the initial frames and tracks min/max eye
+/// bounds over time, so keep a single instance for the duration of a tracking session.
 public struct FaceEstimator {
-    // The neutral face, sampled over the first pictures.
+    // Neutral mouth widths sampled over the initial frames.
     private var restMouthWidth: Float = 0.35, restMouthWidthL: Float = 0.175, restMouthWidthR: Float = 0.175
-    // The widest and tallest each eye has been seen.
+    // Maximum observed width of each eye.
     private var widestEyeL: Float = 0.35, widestEyeR: Float = 0.35
-    // How open each eye's outline is at its most shut and its most open.
+    // Minimum observed eye openness and observed openness range for each eye.
     private var mostShutL: Float = 1, mostShutR: Float = 1
     private var openRangeL: Float = -100000, openRangeR: Float = -100000
     private var picturesSeen = 0
@@ -119,7 +115,7 @@ public struct FaceEstimator {
     }
     private static func unit(_ value: Float) -> Float { max(0, min(1, value)) }
 
-    /// The area of an eye's outline over the square of its width: 0 for a shut eye.
+    /// Eye contour area divided by width squared (`0` when closed).
     private static func openness(_ outline: [P]) -> Float {
         guard outline.count > 2 else { return 1 }
         var area: Float = 0
@@ -131,8 +127,7 @@ public struct FaceEstimator {
         return unit(abs(area) * 0.5 / max(width * width, 1e-6))
     }
 
-    /// - eyeSpacing: the wearer's real distance between pupils, in meters;
-    ///   it gives the picture a scale.
+    /// - Parameter eyeSpacing: The user's interpupillary distance in meters, used to scale image coordinates.
     public mutating func estimate(_ lm: FaceLandmarks, eyeSpacing: Float) -> FaceEstimate? {
         guard !lm.leftEye.isEmpty, !lm.rightEye.isEmpty, !lm.leftPupil.isEmpty, !lm.rightPupil.isEmpty,
               !lm.innerLips.isEmpty, lm.outerLips.count >= 8, lm.boxWidth > 0, lm.boxHeight > 0
@@ -141,7 +136,7 @@ public struct FaceEstimator {
         var weights = [Float](repeating: 0, count: FaceExpressions.weightCount)
         func set(_ expression: FaceExpression, _ value: Float) { weights[expression.rawValue] = unit(value) }
 
-        // A tilted head: turn every point back about the nose until the eyes are level.
+        // Remove head roll by rotating all landmarks around the nose until the eyes are level.
         let eyeToEye = P(average(lm.rightEye).x - average(lm.leftEye).x, average(lm.rightEye).y - average(lm.leftEye).y)
         let roll = Float(atan2(Double(eyeToEye.y), Double(eyeToEye.x)))
         let pivot = lm.noseCrest.isEmpty ? average(lm.medianLine.isEmpty ? lm.leftEye + lm.rightEye : lm.medianLine)
@@ -153,8 +148,8 @@ public struct FaceEstimator {
                 return P(cosine * x + sine * y + pivot.x, -sine * x + cosine * y + pivot.y)
             }
         }
-        // From the bounding box to the picture, y now running downwards, and
-        // scaled so that the eyes are their real distance apart.
+        // Convert from normalized bounding-box coordinates to image space (+Y downward),
+        // scaled to match `eyeSpacing`.
         func inPicture(_ points: [P], scale: Float) -> [P] {
             points.map { P($0.x * lm.boxWidth * scale, (1 - $0.y * lm.boxHeight) * scale) }
         }
@@ -167,7 +162,7 @@ public struct FaceEstimator {
         let lEye = inPicture(levelLeftEye, scale: scale), rEye = inPicture(levelRightEye, scale: scale)
         let lPupil = inPicture(levelled(lm.leftPupil), scale: scale), rPupil = inPicture(levelled(lm.rightPupil), scale: scale)
         let lBrow = inPicture(levelled(lm.leftBrow), scale: scale), rBrow = inPicture(levelled(lm.rightBrow), scale: scale)
-        // The two halves of the outer lip line (the detector's points run round the mouth in a fixed order).
+        // Left and right halves of the outer lip contour (Vision orders outer-lip points around the perimeter).
         let outerL = inPicture(Array(lm.outerLips.dropFirst(3).dropLast(3)), scale: scale)
         let outerR = inPicture(Array(lm.outerLips.prefix(4) + lm.outerLips.suffix(4)), scale: scale)
 
@@ -182,7 +177,7 @@ public struct FaceEstimator {
         let mouthWidthL = width(outerL), mouthWidthR = width(outerR)
         let mouthMiddle = average(outer)
 
-        // Jaw.
+        // Jaw drop.
         let jawDrop = unit(mouthHeight / faceH * 4)
         set(.jawDrop, jawDrop)
 
@@ -194,7 +189,7 @@ public struct FaceEstimator {
         set(.lipCornerDepressorL, depressorL)
         set(.lipCornerDepressorR, depressorR)
 
-        // Smiling: the mouth wider than at rest, each side by its own half.
+        // Smile weights from mouth widening relative to rest on each side.
         if mouthWidth > 0 {
             let smile = max(0, mouthWidth / faceW - restMouthWidth) / max(0.00001, restMouthWidth * 0.125)
             let smileL = unit(max(0, mouthWidthL / faceW - restMouthWidthL - 0.01) * 70)
@@ -202,23 +197,22 @@ public struct FaceEstimator {
             set(.lipCornerPullerL, smileL * smile - depressorL)
             set(.lipCornerPullerR, smileR * smile - depressorR)
 
-            // Funnel: tall for its width.
+            // Lip funneling from mouth height-to-width aspect ratio.
             let funnel = unit(mouthHeight / faceH / max(0.001, mouthWidth / faceW) - 0.3) * 0.5
             for expression in [FaceExpression.lipFunnelerLB, .lipFunnelerRB, .lipFunnelerLT, .lipFunnelerRT] { set(expression, funnel) }
 
-            // Pucker: narrower than at rest, and not simply open.
+            // Lip pucker when the mouth is narrower than at rest and not simply jaw-open.
             let pucker = unit((restMouthWidth - mouthWidth / faceW) * 3 + mouthHeight / faceH)
             set(.lipPuckerL, pucker * 3 - jawDrop)
             set(.lipPuckerR, pucker * 3 - jawDrop)
         }
 
-        // Lips drawn towards the middle of the mouth.
+        // Chin raiser from lips drawn toward the mouth center.
         let towardMiddle = max(0, (mouthMiddle.y - minY(inner)) / faceH) + max(0, (maxY(inner) - mouthMiddle.y) / faceH)
         set(.chinRaiserT, towardMiddle * 3)
         set(.chinRaiserB, towardMiddle * 3)
 
-        // Eyelids. How low the pupil sits against the eye's corners rises
-        // both when looking down and when the lid comes down.
+        // Eyelids: pupil drop relative to the eye corners increases on both downward gaze and lid closure.
         func lidDown(_ eye: [P], _ pupil: [P]) -> Float {
             let pupilY = average(pupil).y / faceH
             let cornersY = (minX(eye).y + maxX(eye).y) / 2 / faceH
@@ -232,8 +226,7 @@ public struct FaceEstimator {
         if rawOpenL - mostShutL > openRangeL { openRangeL = max(rawOpenL - mostShutL, 0.00001) }
         if rawOpenR - mostShutR > openRangeR { openRangeR = max(rawOpenR - mostShutR, 0.00001) }
         let lidDownL = lidDown(lEye, lPupil), lidDownR = lidDown(rEye, rPupil)
-        // The detector and the Persona both tend to shut the eyes together;
-        // push the two apart so that a wink survives.
+        // Both Vision and Spatial Persona couple left and right lid closure; exaggerate asymmetry so winks register.
         let shutL = 1 - openL, shutR = 1 - openR
         var closedL = shutL, closedR = shutR
         for _ in 0..<3 {
@@ -259,8 +252,7 @@ public struct FaceEstimator {
         set(.cheekRaiserL, unit(tightenL) * 0.7)
         set(.cheekRaiserR, unit(tightenR) * 0.7)
 
-        // Where the eyes look: the pupil's place between the eye's corners,
-        // and its height against the middle of the outline.
+        // Eye gaze features from horizontal pupil position between corners and vertical offset from the contour center.
         func look(_ eye: [P], _ pupil: [P], widest: Float) -> (across: Float, down: Float, belowCorners: Float) {
             let pupilAt = average(pupil)
             let across = (pupilAt.x - minX(eye).x) / max(0.001, width(eye)) - 0.5
@@ -279,12 +271,11 @@ public struct FaceEstimator {
         set(.eyesLookUpR, weightsR.up); set(.eyesLookDownR, weightsR.down)
         set(.eyesLookLeftR, weightsR.right); set(.eyesLookRightR, weightsR.left)
 
-        // Brows, against the top of the eye.
+        // Brow movement relative to the upper eye contour.
         var browLift: (left: Float, right: Float) = (0, 0)
         if !lBrow.isEmpty, !rBrow.isEmpty {
             let liftL = (maxY(lBrow) - minY(lEye)) / faceH, liftR = (maxY(rBrow) - minY(rEye)) / faceH
-            // For a calibration: the brow's middle above the line through the
-            // eye's corners, which do not move when the eye shuts (y runs downwards).
+            // For calibration, measure brow height relative to the fixed eye-corner line (+Y downward).
             browLift = (((minX(lEye).y + maxX(lEye).y) / 2 - average(lBrow).y) / faceH,
                         ((minX(rEye).y + maxX(rEye).y) / 2 - average(rBrow).y) / faceH)
             set(.innerBrowRaiserL, liftL * 8)
@@ -296,7 +287,7 @@ public struct FaceEstimator {
             set(.outerBrowRaiserR, outerUpR * 4 - 0.5 * closedR)
         }
 
-        // What is carried to the next picture.
+        // Update running baselines for subsequent frames.
         widestEyeL = max(widestEyeL, eyeWidthL)
         widestEyeR = max(widestEyeR, eyeWidthR)
         if picturesSeen <= FaceEstimator.picturesToLearnTheRestingFace {
@@ -325,7 +316,7 @@ public struct FaceEstimator {
                                               rightAcross: lookR.across, rightDown: lookR.down,
                                               leftBelowCorners: lookL.belowCorners, rightBelowCorners: lookR.belowCorners,
                                               leftOpen: rawOpenL, rightOpen: rawOpenR),
-                            // Shut means nearly as shut as these eyes have ever been seen.
+                            // Treat as blinking when both eyes are near their minimum observed openness.
                             blinking: openL < 0.12 && openR < 0.12, measures: measures)
     }
 }

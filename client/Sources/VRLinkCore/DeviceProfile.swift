@@ -4,40 +4,37 @@
 
 import Foundation
 
-/// What this client tells the host about its display and devices
-/// (docs/svl-values/). A cold host sends no video until it has the projection,
-/// chaperone, HMD static and power props, host defaults and refresh rates.
+/// Display, tracking, and controller properties advertised to the host
+/// (docs/svl-values/). A newly started host will not begin streaming video until it
+/// receives the projection, chaperone, HMD static and power properties, host defaults,
+/// and available refresh rates.
 public struct DeviceProfile {
-    /// Where each eye is, left then right, in the head's own frame.
-    /// We normalize this to OpenXR convention, which is the headset pose being the midpoint
-    /// between both eyes.
+    /// Left and right eye poses in head space.
+    /// Normalized to the OpenXR convention where the head pose is the midpoint between both eyes.
     public var eyesInHead = [DeviceProfile.eye(right: -0.0315), DeviceProfile.eye(right: 0.0315)]
 
-    /// An eye facing straight ahead, `meters` to the right of the middle.
+    /// Returns a forward-facing eye pose offset by `meters` along the +X (right) axis.
     public static func eye(right meters: Float) -> Pose {
         Pose(position: Vec3(meters, 0, 0), right: Vec3(1, 0, 0), up: Vec3(0, 1, 0), forward: Vec3(0, 0, -1))
     }
-    /// How many pixels the host should recommend that applications draw
-    /// for each eye, across and down, where the platform has a figure: the
-    /// host's "Render Target", which SteamVR calls 100%. Told nothing, the
-    /// host recommends 2048 x 1844. The size of the stream itself does not
-    /// depend on it.
+    /// Per-eye render target resolution (SteamVR's 100% render target) to request from
+    /// the host when known by the platform. If omitted, the host defaults to 2048 x 1844.
+    /// Encoded video resolution is controlled separately from the application render target.
     ///
-    /// What the host is sent is a display size, which it multiplies by
-    /// about 1.14 each way to get the render target (probed 2026-11-13:
-    /// 2160 gave 2472, 3200 gave 3660, 3660 gave 4184, 4096 gave 4684). So
-    /// what is sent is this divided by that, and the render target comes
-    /// out as asked, to within the host's rounding to a multiple of four.
+    /// On the wire, the client sends a panel display size that the host multiplies by ~1.1436
+    /// on each axis to compute the render target (probed 2026-11-13: 2160 -> 2472,
+    /// 3200 -> 3660, 3660 -> 4184, 4096 -> 4684). We divide `eyePixels` by
+    /// `renderTargetPerDisplayPixel` before sending so SteamVR lands on the requested render
+    /// target (within 4-pixel rounding).
     public var eyePixels: (width: Int, height: Int)?
-    /// The host's render target over the display size it is sent, each way.
+    /// Ratio of SteamVR's 100% render target resolution to the reported panel display size on each axis.
     static let renderTargetPerDisplayPixel: Float = 1.1436
     public var refreshHz: Float = 90
-    /// Other rates the display can be asked to refresh at, where a
-    /// platform has a way to ask (`StreamSession.onRefreshRateRequested`).
-    /// The host picks from these and `refreshHz` the rate nearest the one
-    /// it wants. Empty where the display's rate is not the client's to choose.
+    /// Additional display refresh rates supported by the platform when dynamic rate switching
+    /// is available (`StreamSession.onRefreshRateRequested`). The host selects the closest match
+    /// among `refreshHz` and these rates. Leave empty when the display refresh rate is fixed.
     public var otherRefreshRates: [Float] = []
-    /// Each eye's frustum, left then right
+    /// Per-eye projection frusta, ordered `[left, right]`.
     public var eyeFrusta = [Frustum.symmetric(halfAngleDegrees: 45), Frustum.symmetric(halfAngleDegrees: 45)]
 
     public init() {}
@@ -53,14 +50,14 @@ public struct DeviceProfile {
         static let focusEvent: UInt8 = 0x13, hostDefaults: UInt8 = 0x15, audioCapabilities: UInt8 = 0x18
         static let availableRates: UInt8 = 0x20, displayRateRequest: UInt8 = 0x21
         static let versionString: UInt8 = 0x22, propRefresh: UInt8 = 0x2B
-        /// From the host: not zero while an application has the scene, zero
-        /// in SteamVR's own grid (docs/svl-values/vte-id-table.md; inferred).
+        /// Sent by the host: non-zero while a scene application is running, and zero
+        /// when idle in the SteamVR grid (docs/svl-values/vte-id-table.md; inferred).
         static let sceneApplicationRunning: UInt8 = 0x35
     }
 
-    /// VTE_StaticProps_t, 1161 bytes: nine strings naming a device to SteamVR.
-    /// Order: tracking system, serial, manufacturer, model, render model,
-    /// resource root, input profile, controller type, device type.
+    /// Serializes `VTE_StaticProps_t` (1161 bytes), which describes a device to SteamVR using nine
+    /// strings in order: tracking system, serial, manufacturer, model, render model,
+    /// resource root, input profile, controller type, and device type.
     private static func staticProps(_ strings: [String], driverType: UInt8 = 0) -> Bytes {
         var out = Bytes()
         out.append(integer: UInt32(0x7FF))
@@ -71,59 +68,53 @@ public struct DeviceProfile {
         return out
     }
 
-    /// The second and third parts of the version string the host is
-    /// given, as in "qvlclient;visionOS;OpenVRLink 0.1.0-2": the system
-    /// this runs on, and the client and its version. The platform's shell
-    /// fills them in. (The Steam Link client sends "qvlclient;hollywood;2.0.20.1812".)
+    /// Platform name and client version fields for the `qvlclient;<systemName>;<clientVersion>`
+    /// version string sent to the host (for example, `"qvlclient;visionOS;OpenVRLink 0.1.0-2"`).
+    /// Set by the platform app; `vrlink` on Quest sends `"qvlclient;hollywood;2.0.20.1812"`.
     public var systemName = "unknown", clientVersion = DataDirectory.name
 
-    /// Experiment: name the controllers as PlayStation VR2 Sense
-    /// controllers with a model of their own, so that SteamVR draws what is
-    /// really in the hand. The model has to be on the host already, as a
-    /// driver's resources called `openvrlink_sense`; nothing installs it yet.
-    /// Otherwise the controllers are a Quest 2's Touch pair in every string,
-    /// and SteamVR draws its own Touch models
-    /// (docs/svl-values/static-and-power-props.md).
+    /// Experimental option to advertise controllers as PlayStation VR2 Sense controllers
+    /// with custom render models so SteamVR renders the physical controllers accurately.
+    /// Requires an `openvrlink_sense` driver resource directory to be installed on the host
+    /// manually. When false, controllers are advertised as Quest 2 Touch controllers and use
+    /// SteamVR's built-in Touch render models (docs/svl-values/static-and-power-props.md).
     public var senseControllerModels = false
 
-    /// Whether this headset sends where the eyes look, or the face. It
-    /// decides which headset the host is told this is, because the host
-    /// chooses how to treat a headset by its model name and no name it
-    /// knows gets everything (probed 2026-11-13, every name Steam Link
-    /// 2.0.25 ships and the Steam Frame's):
+    /// Whether this headset sends eye or face tracking to a SteamVR host.
+    /// This also controls the HMD model name reported to SteamVR, because the host
+    /// gates capabilities by model name and no built-in profile enables every feature at once
+    /// (probed 2026-11-13 across all model names in `vrlink` 2.0.25 plus Steam Frame):
     ///
-    /// - A name it does not know: the render target asked for
-    ///   (`eyePixels`) and the ordinary dashboard, but no eye-tracking
-    ///   input component, and an 8-bit picture.
-    /// - Any Quest, Pico or Vive name: a 10-bit picture and the ordinary
-    ///   dashboard, but the host replaces the render target with a fixed
-    ///   one for that model. Of those, the Quest Pro, Pico 4 Pro, Pico
-    ///   Neo 3 and Vive Focus Vision get the eye-tracking component; the
-    ///   last two have the largest fixed render target, 2480 x 2480.
-    /// - The Steam Frame's name ("Deckard MP"): the render target asked
-    ///   for, 10 bits and eye tracking, but the host leaves the dashboard
-    ///   to the headset, as that headset draws its own; the system button
-    ///   then opens nothing.
+    /// - Unrecognized model name: honors the requested `eyePixels` render target and
+    ///   enables the standard SteamVR dashboard, but limits video to 8-bit and disables
+    ///   the eye-tracking input component.
+    /// - Known Quest, Pico, or Vive model names: enables 10-bit video and the standard
+    ///   dashboard, but overrides `eyePixels` with a hardcoded per-model render target.
+    ///   Among those, Quest Pro, Pico 4 Pro, Pico Neo 3, and Vive Focus Vision enable
+    ///   eye tracking; Pico Neo 3 and Vive Focus Vision have the highest fixed render
+    ///   target at 2480 x 2480.
+    /// - Steam Frame (`"Deckard MP"`): honors `eyePixels` and enables 10-bit video and
+    ///   eye tracking, but expects the headset to render its own dashboard, leaving the
+    ///   system button non-functional.
     ///
-    /// So without eye tracking the headset is itself, an unknown model;
-    /// with it, a Vive Focus Vision. The controllers are described
-    /// separately (`handValues`), and Touch controllers work beside either.
+    /// Accordingly, we report `"OpenVRLink Headset"` when `tracksEyesOrFace` is false, and
+    /// `"Vive Focus Vision"` when true. Controller profiles are reported independently via
+    /// `handValues`, and Quest Touch controllers work alongside either HMD profile.
     ///
-    /// A host can be told about an unknown model in its own settings (a
-    /// section named `vrlink_` and the model name, with `enable`,
-    /// `serialNumber`, `supports10bit`, `supportsEyeTracking`,
-    /// `recommendedRenderWidth` and `recommendedRenderHeight`); with that
-    /// the unknown model got 10 bits and the size from the settings
-    /// (probed 2026-11-13). Nothing writes that section yet.
+    /// SteamVR also supports custom `vrlink_<model>` sections in `steamvr.vrsettings`
+    /// (`enable`, `serialNumber`, `supports10bit`, `supportsEyeTracking`,
+    /// `recommendedRenderWidth`, and `recommendedRenderHeight`), which enabled 10-bit video
+    /// and custom render target sizes for an unknown model in testing (2026-11-13), though
+    /// nothing writes those settings automatically yet.
     public var tracksEyesOrFace = false
-    /// Whether the platform can say where the eyes look at all, however
-    /// roughly. A WiVRn host is told so; a Steam host learns it from
-    /// `tracksEyesOrFace`, which also changes what headset it is shown.
+    /// Whether the platform provides eye gaze tracking (even approximate). Reported to WiVRn
+    /// hosts directly; SteamVR hosts instead check `tracksEyesOrFace`, which also switches
+    /// the reported HMD model.
     public var tracksGaze = false
 
     private func staticHMDProps() -> Bytes {
         if tracksEyesOrFace {
-            // What the Steam Link client sends on a Vive Focus Vision.
+            // Static HMD properties sent by vrlink on a Vive Focus Vision.
             return DeviceProfile.staticProps(["htc", "VRLINKHMDVIVEFOCUSVISION", "HTC", "Vive Focus Vision", "generic_hmd", "vrlink",
                                               "{htc}/input/vive_controller_profile.json", "vive_focus",
                                               "htc/VRLINKHMDVIVEFOCUSVISION"])
@@ -135,9 +126,8 @@ public struct DeviceProfile {
     static let headsetSerial = "OpenVRLink-HMD"
     static let headsetModel = "OpenVRLink Headset"
 
-    /// What is published when a hand starts holding a controller, or starts
-    /// being tracked bare: the device's identity and battery state (value id
-    /// -> bytes).
+    /// Builds the static identity and battery property values (`ValueID -> Bytes`) published
+    /// when a controller or tracked hand becomes active.
     func handValues(_ side: Side, isController: Bool) -> [UInt8: Bytes] {
         let name = side == .left ? "Left" : "Right"
         let power = DeviceProfile.powerProps(nil, reportsBattery: false)
@@ -148,7 +138,7 @@ public struct DeviceProfile {
             ? staticProps(["oculus", "OpenVRLink_Sense_\(name)", "Sony", "PlayStation VR2 Sense (\(name))",
                            "{openvrlink_sense}playstation_vr2_sense_\(name.lowercased())", "openvrlink_sense",
                            "{oculus}/input/touch_profile.json", "oculus_touch", "oculus/OpenVRLink_Sense_\(name)"], 0)
-            // What the Steam Link client sends for a Quest 2's Touch controller.
+            // Static controller properties sent by vrlink for a Quest 2 Touch controller.
             : staticProps(["oculus", "VRLINKQ2_Controller_\(name)", "Oculus", "Oculus Quest2 (\(name) Controller)",
                            "oculus_quest2_controller_\(name.lowercased())", "vrlink",
                            "{oculus}/input/touch_profile.json", "oculus_touch", "oculus/VRLINKQ2_Controller_\(name)"], 0)
@@ -161,23 +151,20 @@ public struct DeviceProfile {
         return [ValueID.staticController(side): identity, ValueID.powerController(side): power]
     }
 
-    /// Two row-major 3x4 matrices, left eye then right. Each one's columns
-    /// are the eye's right, up and backward axes and its position, all in
-    /// the head's frame.
-    /// VTE_PowerProps_t (docs/svl-values/static-and-power-props.md): a mask
-    /// of which fields are set, five flags, and the battery level.
+    /// `VTE_PowerProps_t` constants (docs/svl-values/static-and-power-props.md): a validity
+    /// bitmask, five status flags, and a `0...1` battery level.
     enum PowerProps {
         static let validMask: UInt32 = 0x3F
-        /// Flag 2 is "charging" (read from the reference client). The names
-        /// of the others are not known; these are the two sets it sends.
-        static let flagsWithBattery: UInt32 = 0x1B      // its headset
-        static let flagsWithoutBattery: UInt32 = 0x1A   // its controllers and hands, always with level 0
+        /// Bit 2 indicates charging (observed in `vrlink`). The remaining flag bits are
+        /// undocumented; these two presets match what `vrlink` sends.
+        static let flagsWithBattery: UInt32 = 0x1B      // HMD
+        static let flagsWithoutBattery: UInt32 = 0x1A   // controllers and hands (always sent with level 0)
         static let flagCharging: UInt32 = 0x04
     }
 
-    /// `reportsBattery` false is the reference client's constant for a
-    /// controller or hand. With it true and no `power` known, a full battery
-    /// that is not charging.
+    /// Serializes `VTE_PowerProps_t`. Pass `reportsBattery: false` for controllers and hands
+    /// (matching `vrlink`). When `reportsBattery` is true and `power` is `nil`, reports a
+    /// full, non-charging battery.
     static func powerProps(_ power: PowerState?, reportsBattery: Bool) -> Bytes {
         var out = Bytes()
         out.append(integer: PowerProps.validMask)
@@ -191,6 +178,8 @@ public struct DeviceProfile {
         return out
     }
 
+    /// Serializes two row-major 3x4 eye-to-head matrices (left, then right) whose columns
+    /// are the eye's right, up, and backward (+Z) basis vectors and head-space position.
     private func eyeToHead() -> Bytes {
         var out = Bytes()
         for eye in eyesInHead {
@@ -213,8 +202,7 @@ public struct DeviceProfile {
     }
 
     private func chaperone(universe: UInt32) -> Bytes {
-        // No play area: four degenerate walls, same as vrlink sends
-        // when the headset has no guardian.
+        // Report an empty play area with four degenerate walls, matching vrlink when no boundary is configured.
         let wall = "[[0,0,0],[0,2.43,0],[0,2.43,0],[0,0,0]]"
         let pose = #"{"translation":[0,0,0],"yaw":0}"#
         let json = #"{"jsonid":"chaperone_info","universes":[{"collision_bounds":["#
@@ -225,13 +213,12 @@ public struct DeviceProfile {
         return Bytes(json.utf8)
     }
 
-    /// VTE_CAPABILITIES: 32 bytes of flags for what this client can do.
-    /// The Steam Link client sets only the first bit, whose meaning is
-    /// not known. Bit 45 is "supports chroma key passthrough" as the host
-    /// logs it (probed 2026-11-13); not claimed here.
+    /// `VTE_CAPABILITIES` 32-byte feature bitfield. `vrlink` sets only bit 0 (meaning unknown).
+    /// Bit 45 advertises chroma-key passthrough according to host logs (probed 2026-11-13) and
+    /// is left unset here.
     static let capabilities: Bytes = [1] + Bytes(repeating: 0, count: 31)
 
-    /// The refresh rates the host may choose from: a mask of one field, how many, eight zeros, then each in Hz.
+    /// Serializes the list of supported refresh rates: validity mask (`1`), count, 8 zero bytes, and each rate in Hz.
     func availableRates(_ rates: [Float]) -> Bytes {
         var out = Bytes()
         out.append(integer: UInt32(1))
@@ -241,8 +228,8 @@ public struct DeviceProfile {
         return out
     }
 
-    /// Everything published before video starts. Controllers are published
-    /// by the session when a hand first holds one or is first tracked.
+    /// Initial device properties published before video streaming begins. Controller and
+    /// hand properties are published dynamically by the session once tracked.
     func startupValues() -> [UInt8: Bytes] {
         let instance = UInt64.random(in: 1...UInt64.max) | 1
         var instanceBytes = Bytes(), audio = Bytes()
@@ -254,7 +241,7 @@ public struct DeviceProfile {
             pixels.append(integer: UInt32((Float(eyePixels.height) / DeviceProfile.renderTargetPerDisplayPixel).rounded()))
         }
         return [
-            ValueID.eyePixels: pixels,                   // empty, and so never sent, when not known
+            ValueID.eyePixels: pixels,                   // omitted on the wire when empty
             ValueID.clientInstance: instanceBytes,
             ValueID.capabilities: DeviceProfile.capabilities,
             ValueID.projection: projection(),

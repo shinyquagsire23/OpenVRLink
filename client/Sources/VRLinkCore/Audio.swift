@@ -4,12 +4,12 @@
 
 import Foundation
 
-/// Audio from the host (docs/svl-audio/): raw interleaved 16-bit PCM, 48 kHz
-/// stereo, in groups of two data packets (A, B) and one XOR parity packet
-/// that can rebuild either one.
+/// The host streams audio as raw interleaved 16-bit 48 kHz stereo PCM in groups
+/// of two data packets (A and B) plus an XOR parity packet that can recover
+/// either one (docs/svl-audio/).
 
-/// PCM waiting to be played. The network delivers audio in bursts and the
-/// sound card consumes it steadily; this holds a small cushion between them.
+/// Ring buffer for incoming PCM audio. The network delivers audio in bursts while
+/// the audio device consumes it steadily, so this provides a small jitter buffer.
 public final class PlaybackBuffer {
     public static let sampleRate = 48_000
     public static let channels = 2
@@ -20,9 +20,9 @@ public final class PlaybackBuffer {
     static let maximum = sampleRate * 120 / 1000 // 120ms
 
     private let lock = NSLock()
-    /// Interleaved samples in a ring: `stored` of them, the oldest at
-    /// `oldest`, wrapping at the end. Nothing is shifted as audio is
-    /// played, and nothing is allocated on the audio device's thread.
+    /// Ring buffer of interleaved samples containing `stored` elements starting at
+    /// `oldest` and wrapping around at the end. Playing audio advances indices in
+    /// place without shifting elements or allocating on the audio thread.
     private var ring = [Int16](repeating: 0, count: PlaybackBuffer.maximum * PlaybackBuffer.channels)
     private var oldest = 0, stored = 0
     private var playing = false
@@ -34,9 +34,8 @@ public final class PlaybackBuffer {
     func write(_ pcm: ByteSlice) {
         lock.lock()
         defer { lock.unlock() }
-        // With no room for all of it, the oldest audio goes first: all but
-        // what playback needs to start from, so that the delay which built
-        // up is shed in one step.
+        // If the ring buffer overflows, drop the oldest samples down to the start
+        // threshold to shed accumulated latency in one step.
         let arriving = pcm.count / 2
         if stored + arriving > ring.count {
             let kept = min(stored, PlaybackBuffer.startThreshold * PlaybackBuffer.channels)
@@ -73,8 +72,8 @@ public final class PlaybackBuffer {
     }
 }
 
-/// Reassembles the audio stream from its packets, using the parity packet to
-/// replace a lost one.
+/// Reassembles the incoming audio stream, using the XOR parity packet to recover
+/// a single lost data packet per group.
 final class AudioReceiver {
     let buffer = PlaybackBuffer()
     private(set) var recovered = 0
@@ -93,9 +92,9 @@ final class AudioReceiver {
     private var reportedFormat: UInt16 = 0
     var onLog: ((String) -> Void)?
 
-    /// Accept ane class 0x0b / 0x0c message
-    /// `id` is its sequence number and `index` is either the format word, 
-    /// or the shorter data packet's length on a parity packet
+    /// Accepts a class 0x0b / 0x0c audio message.
+    /// `id` is the sequence number, and `index` is either the format word (for data packets)
+    /// or the length of the shorter data packet (for parity packets).
     func accept(_ element: SVLElement) {
         let position = Int(element.id) % 3
         let number = Int(element.id) / 3
@@ -111,7 +110,7 @@ final class AudioReceiver {
             noteFormat(element.index)
             group?.b = element.value
         default:
-            // The variable-length form says how long the shorter packet was.
+            // Variable-length parity packets store the shorter data packet's length in index.
             let shorter = element.kind == .audioVariable ? Int(element.index) : element.value.count
             group?.parity = (element.value, shorter)
         }
@@ -127,7 +126,7 @@ final class AudioReceiver {
         }
     }
 
-    /// The missing one of A and B is the XOR of the parity and the other
+    /// Reconstructs a missing data packet (A or B) by XORing the other data packet with the parity packet.
     private func rebuild(from other: ByteSlice, parity: (payload: ByteSlice, shorterLength: Int)) -> ByteSlice {
         // The two data packets have lengths max = parity length and min = shorterLength.
         let length = other.count == parity.payload.count ? parity.shorterLength : parity.payload.count
@@ -137,7 +136,7 @@ final class AudioReceiver {
         return out.prefix(length)
     }
 
-    /// Play what can be played in order, A then B
+    /// Queues available packets in order (A, then B), reconstructing a missing packet if possible.
     private func play() {
         guard var current = group else { return }
         if !current.aPlayed {

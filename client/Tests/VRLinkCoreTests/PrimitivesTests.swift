@@ -8,9 +8,8 @@ import XCTest
 import Security
 #endif
 
-/// The cryptographic operations against answers worked out by another
-/// implementation (Python's `cryptography`), so that whichever half of
-/// `Primitives` is built here is known to be right.
+/// Tests `Primitives` against reference vectors generated with Python's `cryptography`
+/// package so both platform crypto backends are verified against the same outputs.
 final class PrimitivesTests: XCTestCase {
     private let key32 = Bytes(0..<32), key16 = Bytes(16..<32), iv = Bytes(0xA0..<0xB0)
     private let block = Bytes(hex: "00112233445566778899aabbccddeeff")!
@@ -36,7 +35,7 @@ final class PrimitivesTests: XCTestCase {
         let encrypted = try XCTUnwrap(Primitives.aesCBC(message, key: key32, iv: iv, encrypting: true, padded: true))
         XCTAssertEqual(encrypted.hex, answer)
         XCTAssertEqual(Primitives.aesCBC(encrypted, key: key32, iv: iv, encrypting: false, padded: true), message)
-        // The wrong key leaves bad padding (or, one time in a few hundred, other bytes).
+        // Decrypting with the wrong key either fails PKCS#7 padding validation or produces different plaintext.
         XCTAssertNotEqual(Primitives.aesCBC(encrypted, key: Bytes(1..<33), iv: iv, encrypting: false, padded: true), message)
     }
 
@@ -49,7 +48,7 @@ final class PrimitivesTests: XCTestCase {
         XCTAssertNil(Primitives.aesCBC(Bytes(0..<47), key: key16, iv: iv, encrypting: true, padded: false))
     }
 
-    /// Steam's own form: the IV encrypted as one block, then CBC with padding.
+    /// Tests Steam's symmetric encryption format, which prepends an AES-ECB encrypted IV to AES-CBC padded ciphertext.
     func testSteamSymmetricForm() throws {
         let message = Bytes(0..<8)
         let ciphertext = Bytes(hex: "dc9f01fd76b87c0d0f4be8850b0bece0a17b2f73758182deab94330da00c3860")!
@@ -59,7 +58,7 @@ final class PrimitivesTests: XCTestCase {
         XCTAssertEqual(SteamCrypto.decrypt(ours, key: key32), message)
     }
 
-    /// RFC 7748, section 6.1.
+    /// RFC 7748 section 6.1 test vector.
     func testX25519() throws {
         let alice = try XCTUnwrap(Primitives.KeyAgreement(
             privateKey: Bytes(hex: "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")!))
@@ -80,22 +79,22 @@ final class PrimitivesTests: XCTestCase {
         XCTAssertNotEqual(host.sharedSecret(maskedPeerKey: headset.maskedPublicKey(pin: "0420"), pin: "0421"), ours)
     }
 
-    /// The ticket is encrypted to a key only Steam can open with, so all
-    /// that shows here is that the key is read and each piece comes out a modulus long.
+    /// Steam holds the private key for ticket encryption, so this verifies that the embedded
+    /// public key parses and each chunk encrypts to one 256-byte RSA block.
     func testTicketIsEncryptedInPieces() throws {
         XCTAssertEqual(SteamCrypto.encryptTicket(Bytes(repeating: 7, count: 100))?.count, 256)
         XCTAssertEqual(SteamCrypto.encryptTicket(Bytes(repeating: 7, count: 300))?.count, 512)
     }
 
     #if canImport(Security)
-    /// RSA-OAEP to a key made here, opened again with its private half.
+    /// Encrypts with `rsaOAEPSHA1` using a generated RSA keypair and decrypts with the private key.
     func testRSAOAEPOpensWithThePrivateKey() throws {
         let attributes: [CFString: Any] = [kSecAttrKeyType: kSecAttrKeyTypeRSA, kSecAttrKeySizeInBits: 2048]
         let privateKey = try XCTUnwrap(SecKeyCreateRandomKey(attributes as CFDictionary, nil))
         let publicKey = try XCTUnwrap(SecKeyCopyPublicKey(privateKey))
         let bare = Bytes(try XCTUnwrap(SecKeyCopyExternalRepresentation(publicKey, nil)) as Data)
 
-        // Wrapped as a SubjectPublicKeyInfo, the form the client's key comes in.
+        // Wrap the raw RSA public key in a DER SubjectPublicKeyInfo header, matching Steam's key format.
         func der(_ tag: UInt8, _ content: Bytes) -> Bytes {
             [tag, 0x82, UInt8(content.count >> 8), UInt8(content.count & 0xFF)] + content
         }

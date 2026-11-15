@@ -6,8 +6,8 @@ import XCTest
 @testable import VRLinkCore
 
 final class AudioTests: XCTestCase {
-    /// A group as the host sends it: A (1024 bytes), B (shorter), and their
-    /// XOR parity carrying the shorter length.
+    /// Builds a 3-packet audio FEC group matching the host format: packet A (1024 bytes),
+    /// a shorter packet B (896 bytes), and an XOR parity packet whose index stores B's length.
     private func group(_ number: UInt16) -> (a: SVLElement, b: SVLElement, parity: SVLElement, pcm: Bytes) {
         let a = (0..<1024).map { UInt8(truncatingIfNeeded: $0 &* 3 &+ Int(number)) }
         let b = (0..<896).map { UInt8(truncatingIfNeeded: $0 &* 5 &+ 1) }
@@ -25,8 +25,8 @@ final class AudioTests: XCTestCase {
         return samples.flatMap { [UInt8(truncatingIfNeeded: $0), UInt8(truncatingIfNeeded: $0 >> 8)] }
     }
 
-    /// Feed two groups (enough to pass the start threshold), dropping one
-    /// packet of the first, and check the audio comes out whole and in order.
+    /// Feeds enough groups to pass the playback start threshold while dropping one packet
+    /// from the first group, then verifies that the output PCM is intact and in order.
     private func check(dropping position: Int) {
         let receiver = AudioReceiver()
         var expected = Bytes()

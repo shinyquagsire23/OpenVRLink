@@ -4,19 +4,19 @@
 
 import Foundation
 
-/// The clock that everything in the core is timed against: nanoseconds since
-/// the machine started, not counting time asleep. It never jumps or runs backwards.
+/// Monotonic system uptime in nanoseconds (excluding sleep), used as the
+/// shared timebase across `VRLinkCore`.
 public enum Uptime {
     public static var nanoseconds: UInt64 { DispatchTime.now().uptimeNanoseconds }
 }
 
-/// Timestamp helper, call .now() to atomically set a time. One thread can
-/// mark that something happened and another ask how long ago that was.
+/// Thread-safe monotonic timestamp for recording an event on one thread and
+/// checking elapsed time from another.
 public final class Timestamp: @unchecked Sendable {
     private let lock = NSLock()
     private var nanoseconds = Uptime.nanoseconds
 
-    /// Starts out marked at the time it is made.
+    /// Initializes the timestamp to the current uptime.
     public init() {}
 
     public func now() {

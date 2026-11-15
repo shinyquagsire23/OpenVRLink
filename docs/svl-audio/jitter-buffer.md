@@ -1,4 +1,4 @@
-# The client jitter buffer (`CAudioJitterBuffer<short>`)
+# Client jitter buffer (`CAudioJitterBuffer<short>`)
 
 Sources (all weak template instantiations in `libvrlink_scene.so`):
 ctor +0x156fe0, `Push` +0x1579c0, `Pop` +0x157e14, `BasicPop` +0x158d1c,
@@ -13,17 +13,18 @@ and a client that ignores them will drift against the host's audio clock.
 
 ## Structure
 
-- Ring of `0x4000` (16384) frames × channels (client: 2), `short` samples
-  (**static**, ctor arguments `(channels, 0x4000)` from `SVLAudio` ctor).
-  At 48 kHz that is 341 ms. Usable capacity is `cap - 1`.
-- `fill = (write - read) mod cap`.
-- A 1024-entry `sin²(i/1023 · π/2)` table, linearly interpolated, is the gain
-  curve for every fade and crossfade (**static**, ctor).
-- Thresholds (frames) come from VTE 0x26, see
-  [negotiation-and-settings.md](negotiation-and-settings.md). Names used
-  below: `start_fill` (50 ms), `min_hi` (25 ms), `min_lo` (15 ms), `target`
-  (20 ms), `low_water` (7 ms), `window` (500 ms), `max_rewinds` (2),
-  `fade_in` (50 ms), `xfade_fwd` (10 ms), `xfade_rew` (5 ms).
+- The buffer is a ring of `0x4000` (16384) frames × channels (2 on the client)
+  of `short` samples (**static**, constructor arguments `(channels, 0x4000)`
+  from the `SVLAudio` constructor). At 48 kHz this holds 341 ms of audio, with
+  usable capacity `cap - 1`.
+- Buffer occupancy is `fill = (write - read) mod cap`.
+- A linearly interpolated 1024-entry `sin²(i/1023 · π/2)` table provides the
+  gain curve for every fade and crossfade (**static**, constructor).
+- Frame thresholds come from VTE 0x26 (see
+  [negotiation-and-settings.md](negotiation-and-settings.md)): `start_fill`
+  (50 ms), `min_hi` (25 ms), `min_lo` (15 ms), `target` (20 ms), `low_water`
+  (7 ms), `window` (500 ms), `max_rewinds` (2), `fade_in` (50 ms), `xfade_fwd`
+  (10 ms), and `xfade_rew` (5 ms).
 
 ## Output side
 
@@ -63,10 +64,10 @@ def pop(self, out, n):
             splice_at = next_zero_crossing_after(self.read, max_frames=300)
 
     # 4. copy frames out, applying fade gain / crossfade; when read == splice_at:
-    #      pending_skip <= 0 (rewind): new_read = zero-crossing search backwards (<=100 frames)
+    #      pending_skip <= 0 (rewind): new_read = zero-crossing search backward (<=100 frames)
     #                                  from read + pending_skip; crossfade old -> new over xfade_rew;
     #                                  cAudRew += 1; rewind_streak += 1
-    #      pending_skip  > 0 (forward): second cursor = zero-crossing search forwards (<=100 frames)
+    #      pending_skip  > 0 (forward): second cursor = zero-crossing search forward (<=100 frames)
     #                                  from read + pending_skip; crossfade over xfade_fwd, then
     #                                  read = second cursor;  cAudFwd += 1
     #      pending_skip = 0
@@ -81,9 +82,9 @@ All of the above is **static** from `Pop`, except the internals of
 returns the read index at which the rewind splice should start).
 "Zero crossing" is a sign change of the per-frame sum over channels.
 
-### The slow control loop (`CAudioJitterBuffer::UpdateStats`)
+### Windowed fill control loop (`CAudioJitterBuffer::UpdateStats`)
 
-Called at the end of every pop with (frames requested, frames missing):
+`Pop` calls `UpdateStats` at the end of every callback with `(requested, missing)`:
 
 ```python
 self.underrun_frames += missing
@@ -150,34 +151,35 @@ Klepton's live trace (`STEAMLINK.md` SL-25/26) is consistent with this
 reading: `cAudUnd` climbing before the stream starts, `cAudBufAvg` 76–100.
 `vr3` values are in the capture section below.
 
-## Confirmed against a wire capture
+## Capture verification (`vr3`)
 
-Capture: `vr3` (real client under Klepton, 40.26 s of streaming, 80,011 SVL
-datagrams, none torn, each with a CLOCK_MONOTONIC receive/send timestamp).
-Times below are seconds from the first SVL datagram of the capture. The earlier
-capture `vr1` had a third of its datagrams torn and no timestamps, so its
-counts were lower bounds; every figure here is a complete count.
-The audio burst is t = 1.855 to 11.556 s (see
-[packet-format.md](packet-format.md)); it is 9.71 s of all-zero PCM arriving
-with no loss. Client log lines carry no timestamp of their own; they are
-placed by the datagrams on either side of them in the log.
+Capture `vr3` records 40.26 s of `vrlink` streaming under Klepton (80,011
+intact SVL datagrams, each with a `CLOCK_MONOTONIC` receive/send timestamp).
+Times below are seconds from the first SVL datagram of the capture. Unlike the
+earlier `vr1` capture, which had a third of its datagrams torn and no
+timestamps (giving only lower-bound counts), every count here is complete.
+The audio burst runs from t = 1.855 to 11.556 s (see
+[packet-format.md](packet-format.md)), carrying 9.71 s of all-zero PCM with no
+packet loss. Client log lines carry no timestamps of their own and are
+bracketed by the datagrams on either side of them in the log.
 
-Start-up and shutdown of playback:
+Playback startup and shutdown in `vr3` match the configured thresholds:
 
-- **captured**: `CAudioJitterBuffer fade in 2400 2880` between the datagrams at
-  t = 1.9089 and 1.9090 s, i.e. 54 ms after the first audio message: playback
-  starts at the first device callback that finds at least `start_fill` (2400
-  frames) buffered - here 2880 - with a 2400-frame fade-in. (3,136 frames had
-  arrived by then.)
-- **captured**: `CAudioJitterBuffer fade out 479 479` then
-  `CAudioJitterBuffer underflow 240 1` between t = 11.581 and 11.585 s, 25 to
-  29 ms after the last audio message: with no more input the fill reaches the
-  low-water mark and the buffer fades out over the 479 frames it has left;
-  the next 240-frame callback is one frame short. There is exactly one fade
-  in, one fade out and one underflow line in the session.
+- **captured**: `vrlink` logged `CAudioJitterBuffer fade in 2400 2880` between
+  the datagrams at t = 1.9089 and 1.9090 s (54 ms after the first audio
+  message). Playback started on the first device callback that found at least
+  `start_fill` (2400 frames) buffered — 2880 frames here, out of 3,136 frames
+  received by then — with a 2400-frame fade-in.
+- **captured**: `vrlink` logged `CAudioJitterBuffer fade out 479 479` followed
+  by `CAudioJitterBuffer underflow 240 1` between t = 11.581 and 11.585 s (25
+  to 29 ms after the last audio message). Once input stopped and fill reached
+  the low-water mark, the buffer faded out over its remaining 479 frames,
+  leaving the next 240-frame callback one frame short. Those are the only
+  fade-in, fade-out, and underflow log lines in the session.
 
-The `cAud*` keys go client -> host as 32-byte records (name, f64, i32) in
-class 3 type 0x07 messages. **captured** values over the 40 s:
+The `cAud*` keys travel client to host as 32-byte records (name, f64, i32) in
+class 3 type 0x07 messages. Below are the **captured** values across the 40 s
+session:
 
 | key | before the burst | during | after |
 |---|---|---|---|
@@ -190,46 +192,46 @@ class 3 type 0x07 messages. **captured** values over the 40 s:
 | `cAudFade` | 0 | 0 | 0 -> 1 at t = 11.59 s |
 | `cAudRew`, `cAudOvf`, `cAudDrop`, `cAudFEC` | 0 | 0 | 0 |
 
-What that confirms of the static description:
+These measurements confirm several parts of the static analysis:
 
-- **captured**: `cAudUnd` counts frames (it advances at the 48 kHz device
-  rate, in multiples of the 240-frame burst) for all the time the buffer is
-  waiting for start-up fill, including before any audio has arrived and after
-  the stream stops, and stands still while audio plays. A host therefore sees
-  `cAudUnd` climb at 48,000 per second whenever it is not sending audio; that
-  is not a fault. (`vr1` showed a session-long climb and put it down to the
-  tracer starving the audio path; `vr3` shows `cAudUnd` climbs whenever the
-  host is not sending.)
-- **captured**: the window statistics are published every 0.5 s of playback
-  (new values at t = 2.40, 2.91, 3.41, 3.91, ...), matching the 500 ms window,
-  and their unit is milliseconds: the first window reports min 39 / avg 50 /
+- **captured**: `cAudUnd` advances at the 48 kHz device rate (in multiples of
+  the 240-frame burst) whenever the buffer is waiting for start-up fill, both
+  before audio first arrives and after the stream stops, and stays flat while
+  audio plays. As a result, `cAudUnd` climbs at 48,000 frames/s whenever the
+  host is not sending audio. (`vr1` attributed a session-long climb to tracer
+  starvation, whereas `vr3` shows that `cAudUnd` climbs whenever the host is
+  silent.)
+- **captured**: Window statistics are published every 0.5 s of playback (new
+  values at t = 2.40, 2.91, 3.41, 3.91, ...), matching the 500 ms window, and
+  are reported in milliseconds: the first window reports min 39 / avg 50 /
   max 64 for a buffer that started playing at 2880 frames (60 ms).
-- **captured**: the slow control loop. The first window's minimum (39 ms) is
-  above `min_hi` (25 ms); `cAudFwd` goes to 1 within 10 ms of that window
-  being published and the next window reports min 19 / avg 30, a drop of 20 ms
-  against the predicted `min - target` = 19 ms. From then on the minimum
-  stays at 19 ms, inside the 15 to 25 ms band, and no further splice happens
-  in the remaining 9 s.
+- **captured**: In the first 500 ms window, the minimum fill (39 ms) exceeded
+  `min_hi` (25 ms); `cAudFwd` incremented to 1 within 10 ms of that window
+  being published, and the next window reported min 19 / avg 30 — a 20 ms drop
+  versus the predicted `min - target` = 19 ms. For the remaining 9 s of
+  playback, the minimum stayed at 19 ms (inside the 15 to 25 ms band) with no
+  further splices.
 - **captured**: `cAudFade` counts the fade-out (one log line, one count), and
   the settings-byte-1 keys (`cAudRew`, `cAudFwd`, `cAudFade`, `cAudBufVar`)
-  are published, as byte 1 = 1 says.
-- **captured**: after the stream stops, the window keys keep their last
-  values for the rest of the session (they are not reset to 0), consistent
+  are published as configured by byte 1 = 1.
+- **captured**: After the stream stops, the window keys retain their last
+  values for the rest of the session rather than resetting to 0, consistent
   with `Pop` returning at the start-up gate before `UpdateStats` runs.
-- **captured**: the host echoes all eleven `cAud*` keys back in frame
+- **captured**: The host echoes all eleven `cAud*` keys back in frame
   descriptor trailers (docs/svl-video/frame-descriptor.md).
-- `vr1` reported `cAudFade` 0 -> 54 and all window statistics 0; that session's
-  audio path was starved by the tracer. `vr3` supersedes it.
+- `vr1` reported `cAudFade` 0 -> 54 and all window statistics at 0 because
+  tracer overhead starved that session's audio path; `vr3` supersedes it.
 
-## Open questions / to confirm on the wire
+## Open questions
 
-- Rewind, overflow, the emergency path and the sequence-gap splice were not
-  exercised (`cAudRew`, `cAudOvf`, `cAudDrop` all 0); they remain **static**
-  only. A lossy or jittery link is needed to see them.
-- The exact unit of `cAudBufVar` (values 846 to 1544 here) is not pinned down
+- Rewind, overflow, emergency rewind, and sequence-gap splices were not
+  exercised (`cAudRew`, `cAudOvf`, and `cAudDrop` stayed 0) and remain
+  **static** only; testing them requires a lossy or jittery link.
+- The exact scaling of `cAudBufVar` (846 to 1544 in `vr3`) is not pinned down
   by the capture.
-- Whether the host changes its behavior on any `cAud*` key (rate matching?
-  FEC on/off?) is unknown; a probe that reports large `cAudDrop` would show it.
-  The probe sends no `cAud*` keys at all and still receives audio
-  (docs/svl-values/startup-exchange.md).
-- `FindBestCrossfadeEndpoint` internals (probably a correlation search).
+- Whether the host changes its behavior in response to any `cAud*` key (such as
+  rate matching or toggling FEC) is unknown; a probe reporting large `cAudDrop`
+  would test this. The minimal probe sends no `cAud*` keys at all and still
+  receives audio (docs/svl-values/startup-exchange.md).
+- `FindBestCrossfadeEndpoint` (+0x15991c) has not been decompiled (likely a
+  correlation search).

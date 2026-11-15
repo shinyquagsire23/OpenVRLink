@@ -1,14 +1,14 @@
-# Retransmission, frame reports, ordering and reset
+# Retransmission, frame reports, ordering, and reset
 
-Client -> host messages on the video reply channel (`kind = 4`), and the
-client-side rules that decide when a frame is requested again, accepted,
-submitted or abandoned.
+This page covers client-to-host messages on the video reply channel (`kind =
+4`), along with `vrlink`'s rules for requesting missing packets, accepting and
+ordering frames, and resetting the stream on unrecoverable errors.
 
 ## Retransmit request - kind 4, type 5 (`resend_fec_request`)
 
-**static** - built in `SVLFECRXFrame::CheckRetry` (+0x15f2cc) and
-`SVLFEC::RerequestBookend` (+0x160328); parsed by
-`SVLFECTXFrame::HandleRetransmitRequest` (+0x15f9d0).
+`vrlink` builds retransmit requests in `SVLFECRXFrame::CheckRetry` (+0x15f2cc)
+and `SVLFEC::RerequestBookend` (+0x160328), while the shared TX code parses
+them in `SVLFECTXFrame::HandleRetransmitRequest` (+0x15f9d0, **static**).
 
 | Off | Type | Name | Notes |
 |---|---|---|---|
@@ -19,34 +19,35 @@ submitted or abandoned.
 | 6 | u16 | 0 | |
 | 8 | u16[n] | `packet_id` list | |
 
-Each entry is one of:
+Each entry takes one of three ranges:
 
 | Value | Meaning |
 |---|---|
-| 0xffff | "resend the frame descriptor" (the client has no descriptor for this frame). Always first in the list when present |
+| 0xffff | "resend the frame descriptor" (when `vrlink` has no descriptor for this frame). Always placed first in the list when present |
 | 0x000..0x7ff | data packet |
 | 0x800..0xfff | parity packet |
 
-It is sent with `SVLDataLink` virtual `+0x58` `(dataset, false, true)` - the
-unreliable path with the last flag set (**inferred**: "send now / high
-priority"; the transport doc owns that flag). Each request also bumps the
-SVLRoot value `rexmitReq` by the number of entries and reports timing event
-0x42 with the count.
+`vrlink` sends the message via `SVLDataLink` virtual `+0x58` `(dataset, false,
+true)`—the unreliable path with the third flag set (**inferred**: immediate /
+high-priority flush; see `docs/svl-transport/`). Each request increments the
+`rexmitReq` `SVLRoot` value by the number of entries and records timing event
+`0x42` with that count.
 
-Sender behavior (**inferred** for the host, static in the shared TX code): for
-each entry, resend that packet unless it was (re)sent less than 3000 us ago;
-0xffff resends the descriptor; ids outside what was sent are ignored; a request
-for a frame that is no longer in one of the sender's 16 TX slots logs
-`"Warning: retransmit request for unknown message %d (frame number=%d"` and is
-dropped. The sender counts resends in the SVLRoot value `rexmitSent`.
+In the shared TX code (**static**, **inferred** for the host),
+`HandleRetransmitRequest` resends each requested packet unless it was sent or
+resent within the last 3,000 us. An entry of `0xffff` resends the descriptor,
+ids outside the range sent for that frame are ignored, and a request for a
+`frame_id` no longer present in the sender's 16 TX slots logs `"Warning:
+retransmit request for unknown message %d (frame number=%d"` and is dropped.
+The sender counts resent packets in the `rexmitSent` `SVLRoot` value.
 
-### When the client asks
+### Retransmit triggers
 
-Three triggers, all ending in `CheckRetry` (**static**):
+`vrlink` invokes `CheckRetry` from three paths (**static**):
 
-**1. Guided - `CheckRetry(group)`**, when a packet or a descriptor arrives whose
-group number is higher than any seen for that frame. Everything that should
-already have arrived is requested:
+**1. Guided retry (`CheckRetry(group)`):** Runs whenever a packet or descriptor
+arrives with a group number higher than any previously seen for that frame,
+requesting everything missing from earlier groups:
 
 ```python
 def check_retry_guided(frame, group):
@@ -61,13 +62,14 @@ def check_retry_guided(frame, group):
     if want: send_request(frame.id, want)
 ```
 
-Parity of a stripe whose eight data packets all arrived is marked received by
-the FEC hook, so only stripes with a hole have parity requested. Note that the
-Q packet of such a stripe is requested even if the host never sent it.
+When all eight data packets of a stripe have arrived, the FEC hook marks that
+stripe's parity packets received as well, so parity is requested only on
+stripes with missing data. On incomplete stripes, `vrlink` requests the Q
+packet id too, even when the host never sent Q.
 
-**2. Unguided - `CheckRetry(-1)`**, from `SVLFEC::Tick` (+0x160a18) for every
-active slot, a time-based sweep for tail loss (the packets after the last one
-that arrived):
+**2. Unguided retry (`CheckRetry(-1)`):** Called from `SVLFEC::Tick` (+0x160a18)
+for every active slot as a timer-driven sweep for tail loss (packets lost after
+the final packet that arrived):
 
 ```python
 def check_retry_unguided(frame, now):
@@ -82,26 +84,28 @@ def check_retry_unguided(frame, now):
     if want: send_request(frame.id, want)
 ```
 
-`Tick` skips the sweep entirely when the *remote* ValueTransportSystem value
-**id 0x1a (26)**, read as a 4-byte int, is present and equal to 0
-(`GetRemoteValue(0x1a, &v, 4)`; default when absent is 1). So the host can
-switch unguided retries off. Name of that id: see docs/svl-values/.
+`Tick` skips this sweep altogether when the *remote* `ValueTransportSystem`
+value **id `0x1a` (26)**, read as a 4-byte `int`, is present and equal to `0`
+(`GetRemoteValue(0x1a, &v, 4)`, defaulting to `1` when absent), allowing the
+host to disable unguided retries. See `docs/svl-values/` for VTE id names.
 
-**3. Skipped frame - `SVLFEC::RerequestSkippedFrame`** (+0x160444). On every
-video packet for frame `F`, for each frame id in
-`[max(last_submitted + 1, F - 2), F)` (only once a frame has been submitted):
-if the slot does not hold that frame it is initialized with an unknown size
-(`"SVLFEC: frame %d was entirely dropped, initializing and re-requesting"`),
-then `CheckRetry(g)` runs once per frame with `g = 1` if the size is unknown or
-`ceil(n_data / 64)` otherwise - i.e. "request everything". More than 4 entries
-logs `"SVLFEC: substantive retry (%d packets) due to frame skip ..."`.
+**3. Skipped-frame retry (`SVLFEC::RerequestSkippedFrame`, +0x160444):** Runs on
+every arriving video packet for frame `F` once at least one frame has been
+submitted. For each `frame_id` in `[max(last_submitted + 1, F - 2), F)`, if the
+corresponding slot does not hold that frame, `vrlink` initializes the slot with
+an unknown size (logging `"SVLFEC: frame %d was entirely dropped, initializing
+and re-requesting"`) and runs `CheckRetry(g)` once per frame with `g = 1` when
+the size is unknown or `ceil(n_data / 64)` when known—requesting all missing
+packets. Requests exceeding 4 entries log `"SVLFEC: substantive retry (%d
+packets) due to frame skip ..."`.
 
-`SVLFEC::RerequestBookend(frame_id)` sends a one-entry request `[0xffff]`.
+`SVLFEC::RerequestBookend(frame_id)` sends a single-entry `[0xffff]` request.
 
 ## Frame report - kind 4, type 0x0f (`LastVideoPacket_t`)
 
-**static** - `SVLDataLink::SendLastRXID` (+0x15c648), called from
-`QSVLClient::SendPoses` (+0xf4d34), so it goes out once per pose packet.
+`SVLDataLink::SendLastRXID` (+0x15c648) builds `LastVideoPacket_t` and is
+called from `QSVLClient::SendPoses` (+0xf4d34, **static**), sending one frame
+report alongside every pose packet.
 
 | Off | Type | Name | Source |
 |---|---|---|---|
@@ -119,7 +123,8 @@ logs `"SVLFEC: substantive retry (%d packets) due to frame skip ..."`.
 | 0x1a | u16 | 0 | |
 | 0x1c | u32 | `display.flip_time` | |
 
-All times are the client's `GetCurrentTimestamp()` clock (us, 32-bit).
+All timestamps use `vrlink`'s `GetCurrentTimestamp()` clock (32-bit
+microseconds).
 
 | Event | Pushed by | Time recorded |
 |---|---|---|
@@ -128,44 +133,50 @@ All times are the client's `GetCurrentTimestamp()` clock (us, 32-bit).
 | display (predicted) | `QSVLRendererXR::FlipFrame` (+0x10ae78), only when descriptor `version > 5` | `now + (predictedDisplayTime - xr_now)` |
 | display (flip) | same | time `FlipFrame` was entered |
 
-Queue rule (per queue, **static**): if two or more entries are queued, pop one;
-then report the front entry without removing it. So each report carries the
-oldest unreported event, the latest event is repeated until a newer one
-arrives, and a queue that has never had an entry reports id 0, time 0. A queue
-that grows past 1000 entries is cleared.
+Each of the four queues follows the same draining rule (**static**): if two or
+more entries are queued, pop one entry, then read and report the front entry
+without removing it. Consequently, each report carries the oldest unreported
+event, the latest event repeats across consecutive reports until a newer event
+is pushed, and a queue that has never had an entry reports `id = 0, time = 0`.
+Any queue growing past 1,000 entries is cleared.
 
-The decoded/display queues are keyed by frame id via a 128-entry table
-`present_number & 0x7f -> frame_id` filled when the descriptor arrives.
+The `decoded` and `display` queues translate `present_number` back to
+`frame_id` through a 128-entry table (`present_number & 0x7f -> frame_id`)
+populated when each descriptor arrives.
 
-On the sending side `SVLFEC::ProcessVideoReply` (+0x160938) stores field +2 as
-`m_iLastAcknowledgeFrameNumber` and calls `HandleVideoAcceptedPacket` - so the
-**decoded** frame id is what the host treats as the acknowledged frame
-(**inferred** for the host; per frame the host expects one of these per pose packet, carrying
-accepted/decoded/displayed ids and times).
+On the transmit side, `SVLFEC::ProcessVideoReply` (+0x160938) stores field `+2`
+as `m_iLastAcknowledgeFrameNumber` and calls `HandleVideoAcceptedPacket`,
+meaning the host treats the **decoded** frame id as the acknowledged frame
+(**inferred** for the host from the shared TX code; the host receives one
+report per pose packet carrying accepted, decoded, and displayed ids and
+timestamps).
 
 ## Ordering and the backtrack window
 
-**static** - `SVLFEC::InternalAcceptFrameFromRX(size, &buffer, frame_id)`:
+`SVLFEC::InternalAcceptFrameFromRX(size, &buffer, frame_id)` enforces in-order
+submission to the decoder (**static**):
 
-- A completed frame goes into a 128-slot ring (`frame_id & 0x7f`) holding the
-  buffer pointer and size. `FrameHasBeenAccepted` is recorded.
-- Frames are handed to the decoder **strictly in frame-id order**. With `last`
-  = last submitted id (or none): let `d = (frame_id - last) & 0xffff` (0 if
-  none yet). If `d >= 6`: `"Received frame outside of backtrack window.
-  Resetting."` and the unrecoverable flag is set. Otherwise the ring is walked
-  from `last + 1` and every consecutive completed frame is submitted
-  (`codec->SubmitFrameForDecode(&buffer, size, frame_id, true)`); the walk
-  stops at the first frame that is not yet complete.
-- So up to 5 later frames can wait for a hole to be repaired; the hole is
-  being re-requested by trigger 3 above in the meantime.
-- A second completion of the same id logs `"[SVLFEC] Saw a re-accept in
-  InternalAcceptFrameFromRX."`. A frame completed without its descriptor logs
-  `"[SVLFEC] accepting a frame for submission without metadata [ %d ]"` and is
-  then dropped after decode for lack of metadata.
+- Each completed frame is placed in a 128-slot ring (`frame_id & 0x7f`) storing
+  its buffer pointer and byte size, and `FrameHasBeenAccepted` is recorded.
+- Frames are handed to the decoder **strictly in `frame_id` order**. Letting
+  `last` be the most recently submitted `frame_id` (if any) and `d = (frame_id
+  - last) & 0xffff` (`0` if none has been submitted yet), if `d >= 6`, `vrlink`
+  logs `"Received frame outside of backtrack window. Resetting."` and sets the
+  unrecoverable-error flag. Otherwise, it walks the ring starting at `last + 1`
+  and submits every consecutive completed frame
+  (`codec->SubmitFrameForDecode(&buffer, size, frame_id, true)`), stopping at
+  the first incomplete slot.
+- Up to 5 newer frames can therefore wait in the ring while an earlier gap is
+  repaired via trigger 3 above.
+- A duplicate completion for the same `frame_id` logs `"[SVLFEC] Saw a
+  re-accept in InternalAcceptFrameFromRX."`. A frame completed before its
+  descriptor arrives logs `"[SVLFEC] accepting a frame for submission without
+  metadata [ %d ]"` and is dropped after decode when metadata lookup fails.
 
 ## Unrecoverable errors and reset
 
-**static**. `SVLFEC+0xc50` is a "something broke" flag, set by:
+`SVLFEC+0xc50` is an unrecoverable-error flag (**static**), set by any of the
+following conditions:
 
 | Cause | Log string |
 |---|---|
@@ -176,17 +187,19 @@ accepted/decoded/displayed ids and times).
 | `AMediaCodec_queueInputBuffer` failed, input larger than the buffer, codec inactive | `"[SVLDecoder] Unrecoverable error was sent"` |
 | decoder stuck: oldest queued frame has produced no output for 300 ms (`QSVLCodecNDK::BIsStuck` +0xfdda8) | same |
 
-It is acted on at the next video packet (`SVLFEC::PeriodicCheckForErrors`
-+0x160540): log `"Fault, SVLFEC Received ExperiencedAnUnrecoverableError()"`,
-call `SVLRoot::HandleUnrecoverableError(-1)`, forget the last submitted id,
-flush the decoder, clear the completed ring and invalidate all 16 slots.
+`SVLFEC::PeriodicCheckForErrors` (+0x160540) acts on this flag when the next
+video packet arrives: it logs `"Fault, SVLFEC Received
+ExperiencedAnUnrecoverableError()"`, calls
+`SVLRoot::HandleUnrecoverableError(-1)`, clears the last submitted id, flushes
+the decoder, clears the 128-slot completed ring, and invalidates all 16 receive
+slots.
 
-`QSVLClient::HandleUnrecoverableError` (+0xf4bdc) only increments a counter at
-`QSVLClient+0xe04`. `QSVLClient::SendPoses` copies that counter as a **u16 into
-every pose packet** (`ldr w8,[x19,#0xe04]; strh w8,[sp,#0x130]` at +0xf4e2c).
-**inferred**: a change in that counter is how the host learns it must restart
-the stream with a keyframe. The field's offset inside the pose packet is in
-docs/svl-tracking-input/.
+`QSVLClient::HandleUnrecoverableError` (+0xf4bdc) increments a 16-bit counter
+at `QSVLClient+0xe04`, and `QSVLClient::SendPoses` writes that counter as a
+**`u16` into every outgoing pose packet** (`ldr w8,[x19,#0xe04]; strh
+w8,[sp,#0x130]` at +0xf4e2c). **inferred**: incrementing this `rst` counter
+signals the host to reset its encoder and send an IDR keyframe. See
+`docs/svl-tracking-input/` for the pose packet layout.
 
 ## SVLRoot keys and VTE ids touched by this layer
 
@@ -201,149 +214,157 @@ docs/svl-tracking-input/.
 
 ## Captured
 
-Capture `vr3` (not in the repo): the real client on a clean LAN, 39.33 s of
-video, 4,260 frames, every datagram timestamped on the client. Everything in
-this section is **captured** unless marked. The earlier capture `vr1` was a
-lossy, torn run; what only it showed is kept at the end.
+In `vr3` (not in the repo), `vrlink` streamed 39.33 s of video (4,260 frames)
+over a clean LAN with client receive timestamps on every datagram. Everything
+in this section is **captured** unless marked otherwise. Observations seen only
+in the earlier, lossy `vr1` capture appear at the end of this section.
 
-### Retransmit requests: none
+### Retransmit requests
 
-- `vr3` contains **no retransmit request**. The only kind-4 elements the
-  client sent are 17,423 frame reports (type 0x0f); there is no `04 05`.
-  The client never set `rexmitReq` in its SVLRoot values either, and its
-  log has none of the retry, re-accept, late-metadata, FEC-fail or fault
-  strings quoted on this page.
-- Nothing needed one: no data packet of any frame was missing. The single
-  datagram lost in the run was the closing bookend of frame 8 (see
-  [packets.md](packets.md)); the frame was already complete, so neither the
-  guided nor the unguided trigger fires, and the host did not resend it on
-  its own.
-- Consequently the host's side of retransmission - what it sends in reply,
-  how fast, the 3000 us resend floor, whether it answers for Q it never sent,
-  the 0xffff case - is **not observable in `vr3`** and stays open. The host
-  sent no packet twice: no duplicate data, parity or bookend in 60,945 video
-  elements.
+- `vr3` contains **zero retransmit requests**: the only kind-4 messages sent by
+  `vrlink` are 17,423 frame reports (type `0x0f`), with no `04 05` messages.
+  `vrlink` never published `rexmitReq` in its `SVLRoot` values, and its log
+  contains none of the retry, re-accept, late-metadata, FEC-fail, or fault
+  messages listed above.
+- No retransmission was needed because every data packet of every frame arrived
+  intact. The single lost datagram in the run was frame 8's closing bookend
+  (see [packets.md](packets.md)); because frame 8 was already complete, neither
+  the guided nor the unguided retry trigger fired, and the host did not resend
+  the bookend unprompted.
+- Host retransmission behavior—what the host sends in reply, response latency,
+  the 3,000 us cooldown, whether it answers requests for unsent Q packets, and
+  `0xffff` descriptor resends—is therefore **not observable in `vr3`** (see
+  later `client` loss-injection tests below). Across 60,945 video elements in
+  `vr3`, the host sent zero duplicate data, parity, or bookend messages.
 
 ### IDR frames and resets
 
-- The stream has **two IDR frames: frame 0 and frame 4**, each
-  `VPS, SPS, PPS` plus four IDR slices (NAL types 32, 33, 34, 19 x4; 2,512
-  and 2,378 bytes). The other 4,258 frames are four non-IDR slices (type 1)
-  each. There is **no periodic IDR**: after frame 4 the stream runs 4,255
-  frames (39.3 s) on P frames alone.
-- What precedes them: 0.72 s before the first video datagram the host sends
-  one debug message (kind 8, type 6) with the text `[SVLS] ResetVideoStream`;
-  it is the only one in the capture. Frame 0 is the first frame after it.
-- Frame 4 follows 34.8 ms after frame 0 by the host's `tx_time`, with
-  nothing from the client that asks for it: the pose packet's `rst` counter
-  is **0 in all 17,423 pose packets**, there is no second `ResetVideoStream`
-  message, and no request of any kind. The client's frame reports up to
-  then said "accepted frame 0" from 3.8 ms after frame 0 arrived and
-  "decoded: nothing yet" (the client's first decoded report, for frame 1,
-  came 116 ms after frame 0 arrived). `vr1` showed the same shape (IDRs at
-  frames 0 and 5). So an early second IDR is normal host behavior at stream
-  start and is unprompted as far as the `rst` counter goes; its cause is
-  open (**inferred** candidates: the host repeats the keyframe until a
-  decoded frame is acknowledged, or its encoder was reset twice during
-  start-up - the host's own `encResets` value read 3 from its first sample
-  on).
-- By contrast, the 20 s stream received by this project's Python client
-  (`probe1`, 2,217 access units) has parameter sets only before access unit
-  0: one IDR, no second one.
-- **The `rst` -> IDR link is not testable in `vr3`**: the client never hit an
-  unrecoverable error, so `rst` never changed. Whether each client reset is
-  answered by exactly one IDR is still open; it needs a lossy run or a probe
-  that bumps `rst`.
+- `vr3` contains **two IDR frames—frame 0 and frame 4**—each carrying `VPS,
+  SPS, PPS` plus four IDR slices (NAL types `32`, `33`, `34`, and `19` x4;
+  2,512 and 2,378 bytes). All other 4,258 frames contain four non-IDR P slices
+  (type `1`). There is **no periodic IDR**: after frame 4, the stream runs for
+  4,255 consecutive frames (39.3 s) on P frames alone.
+- Before frame 0 arrives (0.72 s prior to the first video datagram), the host
+  sends one debug message (kind 8, type 6) with text `[SVLS] ResetVideoStream`—
+  the only such message in the capture.
+- Frame 4 leaves the host 34.8 ms after frame 0 by `tx_time` without any reset
+  request from `vrlink`: the pose packet `rst` counter stays **`0` across all
+  17,423 pose packets**, with no second `ResetVideoStream` message and no
+  retransmit request. Up to that point, `vrlink`'s frame reports carried
+  `accepted = 0` (starting 3.8 ms after frame 0 arrived) and `decoded = 0` with
+  timestamp `0` (`vrlink`'s first non-zero decoded report, for frame 1, went
+  out 116 ms after frame 0 arrived). `vr1` showed the same pattern (IDRs at
+  frames 0 and 5), so an early second IDR during startup is normal host
+  behavior with `vrlink` and is not triggered by `rst` (**inferred**
+  possibilities: the host resends an IDR until a decoded frame is acknowledged,
+  or restarts its encoder during startup once client settings settle; the
+  host's `encResets` value already read `3` on its first sample).
+- By comparison, the 20 s stream captured by this repo's Python probe
+  (`probe1`, 2,217 access units) has parameter sets and an IDR only at access
+  unit 0, with no second IDR.
+- **The `rst` -> IDR path was not exercised in `vr3`** because `vrlink` never
+  encountered an unrecoverable error and `rst` stayed at `0` (verified later
+  with `client` below).
 
 ### Frame reports (kind 4, type 0x0f)
 
-Layout as tabled above: 17,423 reports, every one with a 24-byte payload,
-one in every pose datagram (17,423 of 17,423 share their datagram with the
-pose packet), 433 per second (median spacing 2.13 ms), i.e. four reports per
-video frame. The two zero fields (+0x12, +0x1a) are 0 in all. The timing
-fields are studied further in docs/svl-timing/frame-reports.md; what follows
-is what bears on this page.
+`vr3` contains 17,423 frame reports matching the 24-byte payload layout above,
+bundled one-to-one with every pose packet (all 17,423 share their datagram with
+a pose message) at 433 reports/s (median spacing `2.13 ms`, or roughly four
+reports per video frame). Both padding fields (`+0x12` and `+0x1a`) are `0` in
+every report. Timing details are analyzed further in
+`docs/svl-timing/frame-reports.md`; the points relevant to video tracking
+follow below.
 
-To compare the client's timestamps with packet arrival, the client clock was
-mapped onto the capture clock through the pose packet's own transmit stamp
-(same clock, same datagram); the mapping is good to about 0.2 ms.
+To compare `vrlink` timestamps against packet arrival times, `vrlink`'s clock
+was aligned to the capture clock via the pose packet's transmit timestamp in
+the same datagram (accurate to ~`0.2 ms`).
 
 | Slot | Ids reported | Timestamp relative to arrival of the frame's last data packet |
 |---|---|---|
-| accepted | **every frame, 0..4259**, each exactly once and in order | -0.17 .. +0.11 ms (median -0.03, max 1.3): the accept time *is* the arrival of the last data packet |
+| accepted | **every frame, 0..4259**, each once and in order | -0.17 .. +0.11 ms (median -0.03, max 1.3): the accept time *is* the arrival of the last data packet |
 | decoded | frames 1..4258, each once, in order (frame 0 never appears with a time; 4259 arrived as the capture ended) | +2.0 .. +8.8 ms (1 % 2.2, median 3.0, 99 % 4.0) |
 | display, flip time | 3,705 distinct frames, first 3, last 4257, in order | +4.2 .. +44.6 ms (median 18.1, 90 % 36.3) |
 | display, predicted time | the same id as the flip slot in all 17,423 reports | flip time + 8.29 .. 8.33 ms (one 120 Hz period) |
 
-- **Accept does not wait for parity or the closing bookend.** The accepted
-  time precedes the arrival of the frame's last element by 0.2 .. 7 ms
-  (median 0.42) and coincides with the last *data* packet, as
-  `CheckRXComplete` says: a frame is done when its data prefix is complete.
-- Decode latency, decoded time minus accepted time: min 2.1, median 3.0,
-  99 % 4.0, max 8.8 ms (4,258 frames). This is vrlink under
-  Klepton on a Mac, not a headset.
-- Displayed: 3,705 of 4,260 frames reached `FlipFrame` (94 per second
-  against 108 frames per second received). Step between consecutive
-  displayed ids: 1 x3289, 2 x320, 3 x69, 4 x18, 5..7 x8 - frames are skipped
-  by the display-time selection, never shown out of order. Flip minus
-  decoded: median 15.2 ms, 99 % 38.2 ms.
-- How far a report trails the wire: the first report that carries a frame's
-  accepted entry leaves 0.1 ms or more after its last data packet arrived
-  (median 1.3 ms, 99 % 3.5 ms); the first carrying its decoded entry, 2.3 ms
-  or more (median 4.3, 99 % 7.2). The worst case for both is 63 ms, at a
-  single 69 ms pause in the client's pose packets 0.17 s into the stream. At the moment a report is sent, its accepted id is the
-  newest completely arrived frame in 16,539 of 16,945 reports and one behind
-  in 403; its decoded id is the newest in 10,774 and one behind in 6,165;
-  its displayed id is mostly 1..4 frames behind (mode 2).
-- The queue rule holds: ids in each slot never go backwards and the accepted
-  and decoded slots advance one id at a time, so with four reports per frame
-  each (id, time) pair is repeated, typically in 3..5 consecutive reports
-  (4 in 2,592 of 4,260 cases for accepted).
-- Before the first frame all four slots are zero: 402 all-zero reports, the
-  last 0.6 ms before the first video datagram. At start the slots fill in
-  the order accepted (frame 0, 3.8 ms after it arrived), decoded (frame 1,
-  116 ms), display (frame 3, 126 ms). The 110 ms hole is the client's
-  start-up stall described in [packets.md](packets.md).
-- The host got one of these every 2.3 ms for the whole session and never
-  needed to act on loss, so which field it reacts to is still not visible.
+- **Frame acceptance does not wait for parity or the closing bookend.** The
+  `accepted` timestamp precedes the arrival of the frame's final element by
+  `0.2..7 ms` (median `0.42 ms`) and coincides with the arrival of the final
+  *data* packet, matching `CheckRXComplete`: a frame is accepted as soon as its
+  data prefix is complete.
+- Decode latency (`decoded.time - accepted.time`) across 4,258 frames is
+  `2.1 ms` min, `3.0 ms` median, `4.0 ms` 99th percentile, and `8.8 ms` max
+  (measured with `vrlink` running under Klepton on a Mac rather than a
+  headset).
+- For displayed frames, 3,705 of the 4,260 frames reached `FlipFrame` (94
+  frames/s displayed versus 108 frames/s received). Steps between consecutive
+  displayed ids are `1` x3289, `2` x320, `3` x69, `4` x18, and `5..7` x8:
+  display-time selection skips frames when needed and never presents frames out
+  of order. Flip time minus decode time has a median of `15.2 ms` and a 99th
+  percentile of `38.2 ms`.
+- Relative to wire arrival, the first report carrying a frame's `accepted`
+  entry goes out `0.1 ms` or more after its final data packet arrives (median
+  `1.3 ms`, 99% `3.5 ms`), and the first report carrying its `decoded` entry
+  goes out `2.3 ms` or more after arrival (median `4.3 ms`, 99% `7.2 ms`). The
+  worst case for both is `63 ms`, caused by a single `69 ms` pause in
+  `vrlink`'s outgoing pose packets 0.17 s into the stream. At the moment each
+  report is sent, its `accepted` id matches the newest completely arrived frame
+  in 16,539 of 16,945 reports (and is one frame behind in 403); its `decoded`
+  id is the newest in 10,774 reports (and one behind in 6,165); and its
+  `displayed` id typically trails by `1..4` frames (mode `2`).
+- The queue draining rule holds throughout: ids in every slot never move
+  backward, and the `accepted` and `decoded` slots advance one id at a time, so
+  at four reports per frame each `(id, time)` pair typically repeats across
+  `3..5` consecutive reports (`4` times in 2,592 of 4,260 frames for
+  `accepted`).
+- Before frame 0 arrives, all four slots report zero (402 all-zero reports, the
+  last sent `0.6 ms` before the first video datagram). At startup, the slots
+  populate in order: `accepted` (frame 0, `3.8 ms` after arrival), `decoded`
+  (frame 1, `116 ms`), and `display` (frame 3, `126 ms`), reflecting the
+  `111 ms` MediaCodec startup stall described in [packets.md](packets.md).
+- Because the host received a report every `2.3 ms` with zero packet loss,
+  `vr3` alone does not show which report fields drive host error recovery.
 
-### From `vr1` only (lossy run; not re-observed)
+### Lossy-link observations from `vr1`
 
-- Retransmit request layout. Nine `04 05` datasets, `index` (+6) always 0,
-  payload a list of u16 ids, e.g. frame 7: `05 00 06 00 07 00` (ids 5, 6, 7);
-  frame 21: ids `0..0xa, 0x800..0x803`. Data ids come first in ascending
-  order, parity ids after, as the guided scan produces them. No request
-  contained 0xffff.
-- Client log: 14 `"Fault, SVLFEC Received ExperiencedAnUnrecoverableError()"`
-  lines in that run, the pose `rst` counter rose 0 -> 18, and the decoder's
-  stream contained 5 IDR access units (frames 0, 5 and three later). So
-  resets are followed by IDRs, but fewer IDRs than resets; the pairing was
-  not traced through the torn log.
+- Nine `04 05` retransmit requests appeared on the wire with `index` (`+6`)
+  always `0` and a payload of `u16` packet ids—for example, frame 7 carried
+  `05 00 06 00 07 00` (ids `5, 6, 7`), and frame 21 requested ids `0..0xa` and
+  `0x800..0x803`. Data ids came first in ascending order followed by parity
+  ids, matching `CheckRetry`'s guided scan. None of the nine requests included
+  `0xffff`.
+- `vrlink` logged `"Fault, SVLFEC Received ExperiencedAnUnrecoverableError()"`
+  14 times during that run, the pose `rst` counter climbed from `0` to `18`,
+  and the decoder stream contained 5 IDR access units (frames 0, 5, and three
+  later frames). Resets were followed by IDRs, though fewer IDRs arrived than
+  resets, and datagram truncation prevented pairing individual resets with
+  IDRs.
 
 ## Open questions / to confirm on the wire
 
-1. A request with 0xffff as first id (lose the first bookend of a frame).
-2. Which field of the frame report the host reacts to, and what it does with
-   the times.
-3. Tie one client reset to the pose-packet `rst` counter changing and to the
-   next IDR, and count IDRs per reset (`vr3` had no reset; `vr1` had 14 fault
-   lines but 5 IDRs).
-4. Why the host sends a second IDR a few frames after the first (frame 4 in
-   `vr3`, frame 5 in `vr1`) when the real client connects, and not for the
-   Python client.
-5. What the host sends in reply to a request and how fast (the 3000 us
-   resend floor), and whether it answers requests for Q parity it never
-   sent. Needs a lossy run with timestamps.
-6. The value and name of VTE id 0x1a in a real session.
-7. The exact meaning of the third argument of the datalink send call (the
-   `true` used for descriptors and requests).
+1. Capturing a `0xffff` descriptor retransmit request from `vrlink` when a
+   frame's initial bookend is lost (tested from `client` below).
+2. Determining which fields of `LastVideoPacket_t` the host acts on and how it
+   uses the reported timestamps.
+3. Tracing a single `vrlink` reset to its `rst` increment and resulting host
+   IDR, and counting IDRs per reset (`vr3` had no resets; `vr1` had 14 fault
+   lines and `rst` up to 18 across 5 IDRs).
+4. Understanding why the host sends a second IDR a few frames after frame 0
+   (frame 4 in `vr3`, frame 5 in `vr1`) when `vrlink` connects, whereas the
+   Python probe received only frame 0's IDR.
+5. Measuring what the host sends in reply to a retransmit request and how
+   quickly (including the 3,000 us resend cooldown), and checking whether it
+   answers requests for Q parity packets it never originally sent.
+6. Checking the value and name of VTE id `0x1a` in a live session.
+7. Determining the exact transport behavior of the third argument (`true`) of
+   the `SVLDataLink` send call used for descriptors and retransmit requests.
 
-## Client results (2026-11-10): loss recovery against a real host
+## Client results (2026-11-10): loss recovery against a SteamVR host
 
-The Swift viewer (`client`, `VRLinkCore/Video.swift`) discarded a
-random fraction of incoming class-5 messages (data, parity and descriptors
-alike) on an otherwise clean LAN, at 90 Hz. **Captured by client**, about 12 s
-per row:
+The Swift viewer (`client`, `VRLinkCore/Video.swift`) randomly dropped a
+configurable fraction of incoming kind-5 messages (data, parity, and
+descriptors alike) over an otherwise clean LAN at 90 Hz (**captured** by
+`client`, ~12 s per row):
 
 | simulated loss | frames per second | packets repaired by FEC | packets re-requested | frames abandoned |
 |---|---|---|---|---|
@@ -352,42 +373,44 @@ per row:
 | 10 % | 90 | 759 | 1,188 | 0 |
 | 30 % | 90 | 804 | 7,920 | 0 |
 
-What this settles:
+These runs confirm three behaviors:
 
-- **The host answers retransmit requests** (class 4 type 5), for data packets
-  and for the descriptor (`0xffff`), fast enough that no frame missed its turn
-  even at 30 % loss. This was static-only before.
-- **Real FEC repairs** against host parity work, including in short last
-  stripes with the missing blocks treated as known zeros.
-- **The reset counter requests a keyframe.** An earlier, buggy build of the
-  assembler abandoned frames and bumped the pose message's reset counter; each
-  bump was followed by `[SVLS] ResetVideoStream` from the host and a fresh
-  keyframe. So the `rst` -> keyframe link is real.
+- **The host answers retransmit requests** (kind 4, type 5) for both data
+  packets and frame descriptors (`0xffff`), fast enough that zero frames missed
+  their decode turn even at 30% packet loss (previously static-only).
+- **Live FEC repairs** against host parity succeed, including on short final
+  stripes when out-of-range data blocks are treated as known zeros.
+- **Incrementing the pose `rst` counter triggers a fresh keyframe.** An earlier
+  build of `client`'s frame assembler abandoned frames and incremented the pose
+  packet's `rst` counter; each increment was answered by `[SVLS]
+  ResetVideoStream` from the host followed by a new IDR keyframe, confirming
+  the `rst` -> keyframe mechanism.
 
-The client's rules, simpler than vrlink's: when a packet from a
-later group arrives, request every missing data packet of the earlier groups;
-when an incomplete frame has been quiet for 4 ms, request up to 20 of its
-missing data packets (or just the descriptor); never request parity. Frames go
-to the decoder strictly in order; a frame that holds later ones up for 100 ms,
-or falls out of the host's 16-frame window, is abandoned and a keyframe
-requested.
+`client` uses a simpler retransmit policy than `vrlink`: when a packet from a
+later group arrives, request every missing data packet from earlier groups;
+when an incomplete frame has been idle for 4 ms, request up to 20 missing data
+packets (or `0xffff` if the descriptor is missing); and never request parity
+packets. Completed frames go to the decoder strictly in `frame_id` order; any
+frame that blocks later frames for 100 ms or falls outside the host's 16-frame
+window is abandoned, incrementing `rst` to request a keyframe.
 
-Not measured: how long a retransmission takes, the picture quality cost of the
-extra bitrate, or behavior under burst loss (the simulated loss is
-independent per message).
+These runs did not measure single-packet retransmit round-trip latency, the
+picture-quality impact of retransmit bitrate overhead, or recovery under burst
+loss (simulated drops were independent per message).
 
 ## Client results (2026-11-10): pacing of unprompted requests
 
-`client` first asked, for every incomplete frame that had been quiet
-for 4 ms, for its first 20 missing packets, and reset the timer on each
-request. With many frames incomplete at once that is thousands of requests a
-second (measured: 570,000 packet requests in 15 s of a stalled session). It
-now follows vrlink's rule above: only as many of the frame's
-missing packets as the host should have sent by now, at 104 microseconds a
-packet counted from the end of the quiet interval, and at most 20. While it
-is waiting for a keyframe it only chases the newest three frames.
+Initially, whenever an incomplete frame had been quiet for 4 ms, `client`
+requested its first 20 missing packets and reset the 4 ms timer. When many
+frames were incomplete at once during a stall, that unthrottled rule sent
+thousands of requests per second (570,000 requested packet ids in 15 s of a
+stalled session). `client` now implements `vrlink`'s unguided budget rule
+above: it requests only as many missing packets as the host should have
+transmitted so far—counted at 104 us per packet from the end of the 4 ms quiet
+window, capped at 20 packets per request—and while waiting for a recovery
+keyframe it sends retries only for the three newest frames.
 
-With that, and an optimized build, 10 % and 25 % simulated loss on a 120 Hz
-stream of 100 to 150 kB frames is recovered at the full frame rate with no
-frame abandoned (about 1,000 packets repaired by FEC and 1,700 re-requested
-in 15 s at 10 %).
+With that pacing and an optimized build, `client` recovers from 10% and 25%
+simulated packet loss on a 120 Hz stream of `100..150 kB` frames at full frame
+rate with zero abandoned frames (roughly 1,000 packets repaired by FEC and
+1,700 re-requested over 15 s at 10% loss).

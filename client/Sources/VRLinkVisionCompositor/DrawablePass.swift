@@ -11,11 +11,11 @@ import VRLinkMetal
 import VRLinkVideoToolbox
 import simd
 
-/// Draw quads into one compositor drawable, both eyes in one pass.
+/// Renders both eyes into a single compositor drawable in one render pass.
 ///
-/// `quads` is asked once per eye for what that eye should see, given where
-/// the eye is; the eyes need not have the same number of quads. Returns
-/// the two eye views used (world space), or none if nothing could be drawn.
+/// Calls `quads` once per eye with that eye's world-space `EyeView` to obtain
+/// the quads to draw (the two eyes do not need to return the same quad count).
+/// Returns the two world-space `EyeView`s used, or an empty array if encoding failed.
 @discardableResult
 func drawQuads(into drawable: LayerRenderer.Drawable, commands: MTLCommandBuffer, renderer: QuadRenderer,
                frame: DecodedFrame?, originFromDevice: simd_float4x4, behind: MTLClearColor,
@@ -26,12 +26,12 @@ func drawQuads(into drawable: LayerRenderer.Drawable, commands: MTLCommandBuffer
     pass.colorAttachments[0].loadAction = .clear
     pass.colorAttachments[0].clearColor = behind
     pass.colorAttachments[0].storeAction = .store
-    // Depth is kept: the compositor reprojects with it. Reversed, so 0 is far.
+    // Store reversed depth (0 = far plane) so the compositor can reproject the frame.
     pass.depthAttachment.texture = drawable.depthTextures[0]
     pass.depthAttachment.loadAction = .clear
     pass.depthAttachment.clearDepth = 0
     pass.depthAttachment.storeAction = .store
-    // Both eyes are layers of one texture, drawn in one pass.
+    // Render both eye slices of the layered texture in a single pass.
     pass.renderTargetArrayLength = views.count
     pass.rasterizationRateMap = drawable.rasterizationRateMaps.first
     guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { return [] }
@@ -47,7 +47,7 @@ func drawQuads(into drawable: LayerRenderer.Drawable, commands: MTLCommandBuffer
     }
     guard views.count == 2 else { return [] }
 
-    // Each eye, in world space: the device's pose, then the eye's place on the device.
+    // Compute each eye's world-space pose and frustum from the device anchor and per-view transform.
     let eyes = Eye.allCases.map { eye -> (quads: [Quad], view: EyeView) in
         let originFromEye = originFromDevice * views[eye.rawValue].transform
         let projection = drawable.computeProjection(viewIndex: eye.rawValue)

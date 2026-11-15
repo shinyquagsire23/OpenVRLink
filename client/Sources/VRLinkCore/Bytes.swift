@@ -2,12 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-/// Little-endian byte packing. Everything on the SVL wire is little-endian.
+/// Little-endian byte packing utilities. All values on the SVL wire are little-endian.
 
 public typealias Bytes = [UInt8]
-/// Part of a `Bytes` without a copy of its own: it keeps the whole array
-/// alive and shares its memory. Its indices are the array's, so code that
-/// reads one counts from `startIndex` (as `integer(at:)` does).
+/// Zero-copy slice of a `Bytes` array that shares the underlying buffer.
+/// Slices preserve the parent array's indices, so index calculations must
+/// offset from `startIndex` (as `integer(at:)` does).
 public typealias ByteSlice = ArraySlice<UInt8>
 
 public struct ByteReader {
@@ -40,9 +40,8 @@ public struct ByteReader {
 }
 
 public extension RandomAccessCollection where Element == UInt8, Index == Int {
-    /// The integer `offset` bytes after the first byte, for an array and
-    /// for a slice of one alike. Reads past the end as zero, so a short
-    /// message parses as zeros rather than trapping.
+    /// Reads a little-endian integer `offset` bytes from `startIndex`.
+    /// Out-of-bounds bytes read as zero so truncated messages zero-pad instead of trapping.
     @inlinable
     func integer<T: FixedWidthInteger>(at offset: Int) -> T {
         var value: T = 0
@@ -67,7 +66,7 @@ public extension Array where Element == UInt8 {
     mutating func append(double value: Double) { append(integer: value.bitPattern) }
     mutating func append(zeros count: Int) { append(contentsOf: Bytes(repeating: 0, count: count)) }
 
-    /// A C string in a fixed, zero-filled field.
+    /// Appends a UTF-8 string into a fixed-size, null-padded field.
     mutating func append(text: String, fieldSize: Int) {
         var field = Bytes(text.utf8.prefix(fieldSize - 1))
         field.append(zeros: fieldSize - field.count)

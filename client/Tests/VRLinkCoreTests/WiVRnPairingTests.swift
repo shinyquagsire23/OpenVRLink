@@ -25,7 +25,7 @@ final class WiVRnPairingTests: XCTestCase {
         XCTAssertEqual(seven.power(Natural(2), Natural(100)), Natural(976_371_285))
         XCTAssertEqual(seven.subtract(Natural(3), Natural(5)), Natural(1_000_000_005))
         XCTAssertEqual(seven.multiply(seven.inverse(Natural(12345)), Natural(12345)), Natural(1))
-        // More than the modulus going in.
+        // Inputs larger than the modulus are reduced before multiplication.
         XCTAssertEqual(seven.multiply(Natural(hex: "0100000000000000000000"), Natural(1)),
                        Natural(hex: "0100000000000000000000").remainder(dividingBy: Natural(1_000_000_007)))
     }
@@ -33,7 +33,7 @@ final class WiVRnPairingTests: XCTestCase {
     func testArithmeticInThePairingGroup() {
         let group = WiVRnPinCheck.group, order = WiVRnPinCheck.order
         XCTAssertEqual(group.value.bitCount, 1536)
-        // The generator's powers come round after as many as the order says.
+        // Raising the generator to the subgroup order yields 1.
         XCTAssertEqual(group.power(Natural(4), order.value), Natural(1))
         let a = WiVRnPinCheck.randomExponent(), b = WiVRnPinCheck.randomExponent()
         XCTAssertEqual(group.power(group.power(Natural(2), a), b), group.power(group.power(Natural(2), b), a))
@@ -42,13 +42,13 @@ final class WiVRnPairingTests: XCTestCase {
     }
 
     func testHashIsOverLengthsAndSignBytes() {
-        // A byte 1, the proof's number, then the number 0x80 as "one byte more than it has, a zero first".
+        // Encodes a leading 0x01 byte, the proof ID, and each integer with a 32-bit big-endian length and leading 0x00 sign byte when its high bit is set.
         XCTAssertEqual(WiVRnPinCheck.hash(3, Natural(0x80)), Natural(bytes: Primitives.sha256([1, 3, 0, 0, 0, 2, 0, 0x80])))
         XCTAssertEqual(WiVRnPinCheck.hash(5, Natural(0x7f), Natural(0x0102)),
                        Natural(bytes: Primitives.sha256([1, 5, 0, 0, 0, 1, 0x7f, 0, 0, 0, 2, 1, 2])))
     }
 
-    /// The host's side of the PIN check, as far as answering goes (it checks none of the headset's proofs).
+    /// Minimal host-side responder for the zero-knowledge PIN check; generates valid replies without verifying the headset's proofs.
     private struct Host {
         let pin: Natural
         let g = WiVRnPinCheck.group, q = WiVRnPinCheck.order, one = WiVRnPinCheck.generator
@@ -102,7 +102,7 @@ final class WiVRnPairingTests: XCTestCase {
         var second = host.second(answering: headset.first())
         second[2] = second[2] + Natural(1)
         XCTAssertThrowsError(try headset.third(answering: second))
-        // And numbers that are no use in the group at all.
+        // Reject group elements with trivial value 1.
         var other = WiVRnPinCheck(pin: "123456")
         var otherHost = Host(pin: "123456")
         var again = otherHost.second(answering: other.first())
@@ -123,7 +123,7 @@ final class WiVRnPairingTests: XCTestCase {
     }
 
     func testKeysAreWhatAHostMakesOfThePin() throws {
-        // PBKDF2 with HMAC-SHA1, 2048 rounds, the salt "saltsalt": what a 26.9 host derives for a paired headset.
+        // Matches the keys a WiVRn 26.9 host derives for an already-paired headset using PBKDF2-HMAC-SHA1 (2048 iterations, salt "saltsalt").
         let secrets = try XCTUnwrap(WiVRnSecrets(pin: WiVRnSecrets.pairedPin))
         XCTAssertEqual(secrets.controlKey, bytes("93949818635fd3a0db5417699fc0f77a"))
         XCTAssertEqual(secrets.controlCounterToHeadset, bytes("e09247f6c971d61036caa5e6eb139d46"))
@@ -134,12 +134,12 @@ final class WiVRnPairingTests: XCTestCase {
     }
 
     func testCounterModeIsTheStandardsAndCarriesOn() throws {
-        // NIST SP 800-38A, F.5.1.
+        // NIST SP 800-38A section F.5.1 AES-CTR test vector.
         let key = bytes("2b7e151628aed2a6abf7158809cf4f3c"), counter = bytes("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff")
         let plain = bytes("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51")
         let sealed = bytes("874d6191b620e3261bef6864990db6ce9806f66b7970fdff8617187bb9fffdff")
         XCTAssertEqual(try XCTUnwrap(Primitives.CounterCipher(key: key, counter: counter)).apply(plain), sealed)
-        // In pieces that are no multiple of a block, the run is the same.
+        // Streaming encryption across non-block-aligned chunks produces the same keystream.
         let pieces = try XCTUnwrap(Primitives.CounterCipher(key: key, counter: counter))
         XCTAssertEqual(pieces.apply(plain[0..<5]) + pieces.apply(plain[5..<21]) + pieces.apply(plain[21...]), sealed)
     }
@@ -153,11 +153,11 @@ final class WiVRnPairingTests: XCTestCase {
         XCTAssertEqual(Bytes(first[0..<8]), [0, 0, 0, 0, 0, 0, 0, 0])
         XCTAssertEqual(Bytes(second[0..<8]), [1, 0, 0, 0, 0, 0, 0, 0])
         XCTAssertNotEqual(Bytes(first[8...]), Bytes(second[8...]))
-        // The host opens it with the counter in front and the headset's half after.
+        // The host decrypts using the 8-byte packet prefix followed by the 8-byte headset-to-host counter suffix.
         let hosts = try XCTUnwrap(Primitives.CounterCipher(key: secrets.streamKey,
                                                            counter: Bytes(second[0..<8]) + secrets.streamCounterTailFromHeadset))
         XCTAssertEqual(hosts.apply(second[8...]), packet)
-        // And what the host seals, the headset opens.
+        // Verify the headset decrypts a packet encrypted with the host-to-headset counter suffix.
         let head: Bytes = [5, 0, 0, 0, 0, 0, 0, 0]
         let fromHost = try XCTUnwrap(Primitives.CounterCipher(key: secrets.streamKey, counter: head + secrets.streamCounterTailToHeadset))
         XCTAssertEqual(cipher.opened(head + fromHost.apply(packet)), packet)
@@ -170,7 +170,7 @@ final class WiVRnPairingTests: XCTestCase {
         let made = WiVRnIdentity.own(file: file)
         XCTAssertEqual(made.count, 56)
         XCTAssertEqual(WiVRnIdentity.own(file: file), made)
-        // PEM of an X448 public key: 68 bytes of DER, the last 56 the key.
+        // An X448 SubjectPublicKeyInfo PEM encodes 68 DER bytes ending with the 56-byte raw public key.
         let body = WiVRnIdentity.pem(made).split(separator: "\n")[1]
         let der = try XCTUnwrap(Data(base64Encoded: String(body)))
         XCTAssertEqual(der.count, 68)

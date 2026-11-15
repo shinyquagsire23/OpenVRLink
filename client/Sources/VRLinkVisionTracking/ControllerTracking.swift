@@ -11,17 +11,17 @@ import Spatial
 import VRLinkCore
 import simd
 
-/// Hand-held controllers (PlayStation VR2 Sense and other spatial gamepads).
+/// Tracks spatial handheld controllers (such as PlayStation VR2 Sense).
 ///
-/// visionOS splits one controller across two frameworks: GameController has
-/// its buttons, ARKit accessory tracking has where it is. This class joins
-/// them by the hand each belongs to and answers with one `ControllerState`
-/// per hand.
+/// visionOS splits spatial controller state across two frameworks:
+/// GameController provides button and thumbstick inputs, while ARKit accessory
+/// tracking provides 6DoF poses. `ControllerTracking` pairs both sources by
+/// chirality and produces one `ControllerState` per hand.
 public final class ControllerTracking {
     public init() {}
 
     private let session = ARKitSession()
-    /// The Home (PS) button, which needs the system's and the person's leave.
+    /// Manages claiming and monitoring the controller Home (PS) button, which requires user permission in Settings.
     public let homeButton = HomeButton()
     private var sourcesNoted: Set<String> = []
     private let lock = NSLock()
@@ -29,48 +29,46 @@ public final class ControllerTracking {
     /// ("concurrent API call detected - caller must serialize").
     private let oneCallerAtATime = NSLock()
     private var provider: AccessoryTrackingProvider?
-    /// The newest anchor ARKit has given for each hand, and that hand's buttons.
+    /// Latest ARKit accessory anchor and `GCController` instance for each hand.
     private var anchors: [Side: AccessoryAnchor] = [:]
     private var gamepads: [Side: GCController] = [:]
     private var updates: Task<Void, Never>?
-    /// One running haptic engine per hand, made the first time it is needed.
+    /// Lazily created Core Haptics engine for each hand.
     private var engines: [Side: CHHapticEngine] = [:]
-    /// How far ahead of now controllers are predicted, in seconds: not at
-    /// all. The host carries every pose forward itself, by its velocities,
-    /// from the time it was sampled to the time the client reports frames
-    /// reaching the display (docs/svl-tracking-input/poses.md, "the host
-    /// predicts to the reported display time"), so anything added here is
-    /// added twice. ARKit is still asked for the pose as it is now, since
-    /// the newest anchor it has handed over is already a little old.
+    /// Prediction lookahead in seconds (`0` because client-side lookahead is disabled).
+    /// The host extrapolates controller poses from sample time to target display time
+    /// using the reported velocities (`docs/svl-tracking-input/poses.md`), so any
+    /// lookahead added here would double-predict. We still query ARKit at `now`
+    /// because the most recently delivered anchor is slightly behind current time.
     private static let prediction: TimeInterval = 0
 
-    /// ARKit gives a controller's place two ways: as tracked, and "as
-    /// rendered", which is turned the same way but shifted to where the
-    /// system would draw it.
+    /// Selects between ARKit's `.rendered` and `.none` (raw tracked) grip pose
+    /// corrections. Both share the same orientation, but `.rendered` adds an
+    /// offset matching where visionOS renders virtual controllers.
     ///
-    /// Under the compositor (Metal) renderer the rendered one lines the
-    /// host's controller up with the real one, and is what is sent. Under
-    /// the RealityKit renderer it cannot be used: the shift wanders there
-    /// (seen on the headset, 2026-11-11: 36 mm, sinking to 6 mm over half a
-    /// minute, then creeping up again; worst after walking into another
-    /// room), and since the head and hands are sent as tracked, the
-    /// controller then sits off from them by that much, lifted towards the
-    /// eyes. There the tracked place is sent, moved by the shift as it was
-    /// once it had come to rest (`renderedShiftAtRest`).
+    /// Under the CompositorServices (Metal) renderer, `.rendered` aligns the
+    /// host's virtual controller with the physical controller in passthrough,
+    /// so we send `.rendered`. Under the RealityKit renderer, `.rendered`
+    /// drifts over time (measured on device on 2026-11-11: starting at 36 mm,
+    /// settling to 6 mm over ~30 s, then creeping back up, especially after
+    /// walking into another room). Because head and hand poses use raw tracking,
+    /// that drift offsets the controllers toward the user's eyes relative to
+    /// their hands. RealityKit therefore disables `.rendered` and applies the
+    /// static settled offset `renderedShiftAtRest` to the raw tracked pose.
     ///
-    /// Each display sets this when it connects.
+    /// Configured by each display backend when connecting.
     public var gripsAsRendered: Bool {
         get { lock.lock(); defer { lock.unlock() }; return asRendered }
         set { lock.lock(); asRendered = newValue; lock.unlock() }
     }
     private var asRendered = true
-    /// What is added to the tracked grip there, along the grip's own axes,
-    /// in meters, for the right controller; the left one's is its mirror
-    /// image (x the other way). Tuned by eye on the headset, starting from
-    /// the rendered shift read at rest in that session, (-0.002, 0.008,
-    /// -0.001): a centimeter down from that. (x is the line the stick and
-    /// the circle button sit on, positive towards the circle button; 2 and
-    /// 4 cm that way were tried and were worse.)
+    /// Static local-space offset (in meters along the grip axes) added to the
+    /// raw tracked grip pose when `gripsAsRendered` is `false`. Defined for the
+    /// right controller; the X component is negated for the left controller.
+    /// Tuned visually on device starting from the settled `.rendered` offset
+    /// measured in that session `(-0.002, 0.008, -0.001)`, shifted 1 cm lower
+    /// in Y. (+X runs from the thumbstick toward the circle button; +2 cm and
+    /// +4 cm shifts along X were tested and aligned worse.)
     private static let renderedShiftAtRest = SIMD3<Float>(-0.002, -0.002, -0.001)
 
     public func start() {
@@ -95,7 +93,7 @@ public final class ControllerTracking {
         }
     }
 
-    /// Start accessory tracking over with the spatial controllers connected now.
+    /// Restarts ARKit accessory tracking for the currently connected spatial controllers.
     private func trackConnectedControllers() {
         updates?.cancel()
         let spatial = GCController.controllers().filter { $0.productCategory == GCProductCategorySpatialController }
@@ -141,12 +139,12 @@ public final class ControllerTracking {
         }
     }
 
-    /// Both hands as they are right now: left then right, nil for a hand
-    /// whose controller is not being tracked.
+    /// Returns the current controller state for `[left, right]`, using `nil`
+    /// for any hand without an actively tracked controller.
     ///
-    /// With `clackSwitching`, knocking the controllers together twice in
-    /// front of `head` makes this answer "no controllers" (so the bare hands
-    /// are used) until they are knocked together twice again.
+    /// When `clackSwitching` is enabled, tapping the controllers together twice
+    /// in front of `head` toggles controller reporting off (falling back to
+    /// bare-hand tracking) until they are tapped together twice again.
     public func states(clackSwitching: Bool, head: Pose?) -> [ControllerState?] {
         oneCallerAtATime.lock()
         defer { oneCallerAtATime.unlock() }
@@ -174,7 +172,7 @@ public final class ControllerTracking {
             guard let latest = anchors[side], latest.isTracked else { return nil }
             let anchor = provider.predictAnchor(for: latest, at: now + ControllerTracking.prediction) ?? latest
 
-            // The grip pose: the middle of the handle, in world space (see `gripsAsRendered`).
+            // World-space grip pose at the center of the handle (see `gripsAsRendered`).
             var originFromGrip = anchor.coordinateSpace(for: .grip, correction: asRendered ? .rendered : .none)
                 .ancestorFromSpaceTransformFloat().matrix
             if !asRendered {
@@ -184,15 +182,14 @@ public final class ControllerTracking {
                     + originFromGrip.columns.2 * shift.z
             }
             var grip = TrackedPose(pose: HeadTracking.pose(originFromGrip))
-            // ARKit gives both velocities along the controller's own axes
-            // (undocumented; this is how the ALVR visionOS client reads them).
-            // The host wants the linear one along the world's axes: so many
-            // meters per second along each of the grip's axes, added up.
+            // ARKit reports linear and angular velocity in the controller's local
+            // coordinate space (undocumented, matching the ALVR visionOS client).
+            // Rotate linear velocity from grip space into world space for the host.
             let v = anchor.velocity, pose = grip.pose
             grip.linearVelocity = pose.right * v.x + pose.up * v.y + pose.forward * -v.z
             grip.angularVelocity = Vec3(anchor.angularVelocity.x, anchor.angularVelocity.y, anchor.angularVelocity.z)
             var state = ControllerState(grip: grip)
-            // Where a ray from the controller starts and points, for hosts that take OpenXR's aim pose.
+            // Populate the OpenXR aim pose (pointer ray origin and orientation) for hosts that consume it.
             state.aim = HeadTracking.pose(anchor.coordinateSpace(for: .aim, correction: asRendered ? .rendered : .none)
                 .ancestorFromSpaceTransformFloat().matrix)
             guard let gamepad = gamepads[side] else { return state }
@@ -200,11 +197,10 @@ public final class ControllerTracking {
                 state.power = PowerState(level: battery.batteryLevel,
                                          charging: battery.batteryState == .charging || battery.batteryState == .full)
             }
-            // A controller can be read from two places: its live input, and
-            // the older "physical input profile". For the Sense controllers
-            // the two do not always agree (some builds have had the buttons
-            // only in one and the analog values only in the other), so every
-            // control is taken from whichever of the two reports it.
+            // GCController exposes inputs through both `input` (live capture) and the
+            // older `physicalInputProfile`. On Sense controllers, visionOS builds have
+            // inconsistently populated digital buttons in one API and analog axes in
+            // the other, so read each control from whichever source reports activity.
             let live = gamepad.input.capture()
             let profile = gamepad.physicalInputProfile
             func pressed(_ name: String) -> Bool {
@@ -213,7 +209,7 @@ public final class ControllerTracking {
             func touched(_ name: String) -> Bool {
                 (live.buttons[name]?.touchedInput?.isTouched ?? false) || (profile.buttons[name]?.isTouched ?? false)
             }
-            /// The one of two readings that is further from rest.
+            /// Returns whichever reading has the larger magnitude.
             func stronger(_ a: Float, _ b: Float) -> Float { abs(a) >= abs(b) ? a : b }
             let liveTrigger = live.buttons["Trigger"]?.pressedInput.value ?? 0
             let profileTrigger = profile.buttons["Trigger"]?.value ?? 0
@@ -225,12 +221,11 @@ public final class ControllerTracking {
                 y: pad?.yAxis.value ?? ((profile.buttons["Thumbstick Up"]?.value ?? 0) - (profile.buttons["Thumbstick Down"]?.value ?? 0)))
 
             // On a Sense controller "Button A" is the lower face button
-            // (cross, square) and "Button B" the upper (circle, triangle).
+            // (cross, square) and "Button B" is the upper (circle, triangle).
             state.lowerButton = pressed("Button A")
             state.upperButton = pressed("Button B")
-            // Create and Options both arrive as "Button Menu". The host's
-            // Touch controller has one such button, on the left hand, so
-            // only the left one is sent (ControllerState.menuButton).
+            // Create and Options both map to "Button Menu". Oculus Touch only has a
+            // menu button on the left controller, so the core forwards only the left side (`ControllerState.menuButton`).
             state.menuButton = pressed("Button Menu") || HomeButton.isPressed(gamepad)
             state.stickClick = pressed("Thumbstick Button")
             state.lowerButtonTouched = touched("Button A")
@@ -242,7 +237,7 @@ public final class ControllerTracking {
             state.stickX = stronger(liveStick.x, profileStick.x)
             state.stickY = stronger(liveStick.y, profileStick.y)
 
-            // DIAGNOSTIC: when a control is first used, say which source reported it.
+            // DIAGNOSTIC: log once per control which input API reported its first activation.
             func note(_ control: String, live: Bool, profile: Bool) {
                 guard live || profile, !sourcesNoted.contains("\(side) \(control)") else { return }
                 sourcesNoted.insert("\(side) \(control)")
@@ -257,21 +252,20 @@ public final class ControllerTracking {
         }
     }
 
-    /// Play a vibration the host asked for on that hand's controller.
+    /// Plays a host-requested haptic pulse on the target hand's controller.
     public func vibrate(_ pulse: HapticPulse) {
         lock.lock()
         defer { lock.unlock() }
         do {
             if engines[pulse.side] == nil, let engine = gamepads[pulse.side]?.haptics?.createEngine(withLocality: .default) {
-                // An engine the system has stopped is dropped and made again on the next pulse.
+                // Drop stopped or reset engines so they are recreated on the next pulse.
                 engine.stoppedHandler = { [weak self] _ in self?.forgetEngine(pulse.side) }
                 engine.resetHandler = { [weak self] in self?.forgetEngine(pulse.side) }
                 try engine.start()
                 engines[pulse.side] = engine
             }
             guard let engine = engines[pulse.side] else { return }
-            // Core Haptics has "sharpness" where the host has a frequency:
-            // 0 at 50 Hz and below, 1 at 300 Hz and above.
+            // Map the host pulse frequency (50-300 Hz) onto Core Haptics sharpness (0-1).
             let sharpness = max(0, min(1, (pulse.frequency - 50) / 250))
             let event = CHHapticEvent(eventType: .hapticContinuous, parameters: [
                 CHHapticEventParameter(parameterID: .hapticIntensity, value: min(1, pulse.amplitude)),

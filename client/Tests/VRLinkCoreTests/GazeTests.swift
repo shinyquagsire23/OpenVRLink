@@ -6,14 +6,14 @@ import XCTest
 @testable import VRLinkCore
 
 final class GazeCalibrationTests: XCTestCase {
-    /// A made-up eye: how its pupil features would relate to where it looks.
+    /// Synthetic ground-truth mapping from pupil features to gaze tangents.
     private func truth(_ f: EyeFeatures) -> (across: Float, up: Float) {
         let a = f.across, d = f.down
         return (0.05 + 2.5 * a + 0.1 * d + 0.8 * a * a, -0.1 - 3 * d + 0.5 * a * d)
     }
 
     private func features(_ across: Float, _ down: Float) -> EyeFeatures {
-        // The two eyes differ a little, as they do; the fit uses their average.
+        // Offset the left and right eye features slightly; calibration fits against their average.
         EyeFeatures(leftAcross: across + 0.02, leftDown: down - 0.01, rightAcross: across - 0.02, rightDown: down + 0.01)
     }
 
@@ -28,7 +28,7 @@ final class GazeCalibrationTests: XCTestCase {
         let calibration = try XCTUnwrap(calibrator.fit())
         XCTAssertLessThan(calibration.typicalErrorDegrees, 0.3)
         XCTAssertEqual(calibration.sampleCount, 15)
-        // A place it was not shown.
+        // Evaluate on a sample point not included in the training grid.
         let unseen = features(0.15, -0.05), expected = truth(unseen), got = calibration.tangents(for: unseen)
         XCTAssertEqual(got.across, expected.across, accuracy: 0.01)
         XCTAssertEqual(got.up, expected.up, accuracy: 0.01)
@@ -38,14 +38,14 @@ final class GazeCalibrationTests: XCTestCase {
         var calibrator = GazeCalibrator()
         let places: [(Float, Float)] = [(-0.2, 0), (0.2, 0), (0, -0.1), (0, 0.1), (0, 0), (0.1, 0.1)]
         for (index, place) in places.enumerated() {
-            if index == 4 { XCTAssertNil(calibrator.fit()) }                 // four so far
+            if index == 4 { XCTAssertNil(calibrator.fit()) }                 // four samples are not enough to fit
             let f = features(place.0, place.1), t = truth(f)
             calibrator.add(f, across: t.across, up: t.up)
         }
         let calibration = try XCTUnwrap(calibrator.fit())
         XCTAssertTrue(calibration.acrossTerms[3...].allSatisfy { $0 == 0 })
         XCTAssertTrue(calibration.usable)
-        XCTAssertEqual(calibration.acrossTerms[1], 2.5, accuracy: 0.3)       // the slope of the made-up eye
+        XCTAssertEqual(calibration.acrossTerms[1], 2.5, accuracy: 0.3)       // linear across slope from `truth`
         XCTAssertEqual(calibration.upTerms[2], -3, accuracy: 0.3)
     }
 
@@ -56,7 +56,7 @@ final class GazeCalibrationTests: XCTestCase {
     }
 
     func testARayBecomesTangentsInTheHeadsFrame() throws {
-        // A head turned to face +x: its right is +z.
+        // When the head faces +x, its local right axis points along +z.
         let head = Pose(position: Vec3(0, 1.6, 0), right: Vec3(0, 0, 1), up: Vec3(0, 1, 0), forward: Vec3(1, 0, 0))
         let tangents = try XCTUnwrap(GazeCalibrator.tangents(ofRay: Vec3(2, 0.5, 1), head: head))
         XCTAssertEqual(tangents.across, 0.5, accuracy: 1e-6)
@@ -64,7 +64,7 @@ final class GazeCalibrationTests: XCTestCase {
         XCTAssertNil(GazeCalibrator.tangents(ofRay: Vec3(-1, 0, 0), head: head))
     }
 
-    /// A calibration of the made-up eye from fifteen places.
+    /// Fits a baseline calibration across a 15-point sample grid.
     private func calibrated() throws -> GazeCalibration {
         var calibrator = GazeCalibrator()
         for across: Float in [-0.2, -0.1, 0, 0.1, 0.2] {
@@ -78,7 +78,7 @@ final class GazeCalibrationTests: XCTestCase {
 
     func testTuningFollowsAHeadsetThatHasShifted() throws {
         var calibration = try calibrated()
-        // The headset slips: everything now looks 0.1 further right than the calibration thinks.
+        // Simulate headset slip shifting true gaze tangents 0.1 units to the right.
         let places: [(Float, Float)] = [(0, 0), (0.1, 0.05), (-0.1, -0.05), (0.05, -0.08), (-0.15, 0.06), (0.18, 0)]
         let probe = features(0.03, 0.02), before = calibration.tangents(for: probe)
         for round in 0..<10 {
@@ -107,7 +107,7 @@ final class GazeCalibrationTests: XCTestCase {
             calibration = try XCTUnwrap(calibration.tuned(with: GazeSample(features: f, across: t.across, up: t.up)))
         }
         XCTAssertEqual(calibration.samples.count, GazeCalibration.mostSamples)
-        // The corners of the first calibration are still among the samples, and still fitted.
+        // Corner samples from the initial calibration are retained and still fit accurately.
         let corner = features(-0.2, 0.1), expected = truth(corner)
         XCTAssertTrue(calibration.samples.contains { $0.features == corner })
         XCTAssertEqual(calibration.tangents(for: corner).across, expected.across, accuracy: 0.02)
@@ -133,15 +133,15 @@ final class GazeCalibrationTests: XCTestCase {
 }
 
 final class FaceEstimatorTests: XCTestCase {
-    /// A plain face in a square bounding box. `pupil` moves both pupils
-    /// (in box units, +x to the picture's right, +y up); `mouthOpen` parts the lips.
+    /// Builds synthetic face landmarks in a square bounding box. `pupil` offsets both pupils
+    /// in normalized box coordinates (+x right, +y up), and `mouthOpen` separates the lips.
     private func face(pupil: (Float, Float) = (0, 0), mouthOpen: Float = 0.005, tilt: Float = 0) -> FaceLandmarks {
         func eye(_ cx: Float, _ cy: Float) -> [LandmarkPoint] {
             [(-0.06, 0), (-0.03, 0.02), (0, 0.025), (0.03, 0.02), (0.06, 0), (0.03, -0.02), (0, -0.025), (-0.03, -0.02)]
                 .map { LandmarkPoint(cx + Float($0.0), cy + Float($0.1)) }
         }
         func lips(_ halfWidth: Float, _ halfHeight: Float) -> [LandmarkPoint] {
-            // Round the mouth, starting at the picture's right corner.
+            // Place 10 points around an ellipse starting from the right corner of the mouth.
             (0..<10).map { index in
                 let angle = Double(index) / 10 * 2 * Double.pi
                 return LandmarkPoint(0.5 + halfWidth * Float(cos(angle)), 0.3 + halfHeight * Float(sin(angle)))
@@ -160,7 +160,7 @@ final class FaceEstimatorTests: XCTestCase {
         lm.innerLips = lips(0.09, mouthOpen)
         lm.noseCrest = [LandmarkPoint(0.5, 0.6), LandmarkPoint(0.5, 0.5)]
         if tilt != 0 {
-            // The whole face turned about the middle of the box.
+            // Rotate all landmarks around the center of the bounding box.
             let s = Float(sin(Double(tilt))), c = Float(cos(Double(tilt)))
             func turned(_ points: [LandmarkPoint]) -> [LandmarkPoint] {
                 points.map { LandmarkPoint(0.5 + c * ($0.x - 0.5) - s * ($0.y - 0.5), 0.5 + s * ($0.x - 0.5) + c * ($0.y - 0.5)) }
@@ -237,14 +237,14 @@ final class FaceCalibrationTests: XCTestCase {
         XCTAssertTrue(fit.usable)
         let fallback = [Float](repeating: 0.5, count: FaceExpressions.weightCount)
         var face = try XCTUnwrap(fit.poses[FacePose.neutral.rawValue])
-        // At rest nothing is on, whatever the rules of thumb said, except where the eyes look.
+        // At the neutral pose, calibrated expression weights are zero regardless of fallback values, except eye-look weights.
         var weights = fit.weights(for: face, fallback: fallback)
         XCTAssertEqual(weight(weights, .jawDrop), 0)
         XCTAssertEqual(weight(weights, .lipCornerPullerL), 0)
         XCTAssertEqual(weight(weights, .eyesLookUpL), 0.5)
 
         face.mouthOpen = 0.11                       // halfway to the open pose
-        face.mouthWidthL = 0.26                     // the left half fully at the smile
+        face.mouthWidthL = 0.26                     // left side at full smile width
         weights = fit.weights(for: face, fallback: fallback)
         XCTAssertEqual(weight(weights, .jawDrop), 0.5, accuracy: 0.01)
         XCTAssertEqual(weight(weights, .lipCornerPullerL), 1, accuracy: 0.01)
@@ -255,27 +255,27 @@ final class FaceCalibrationTests: XCTestCase {
         let fit = calibration()
         let fallback = [Float](repeating: 0, count: FaceExpressions.weightCount)
         var face = try XCTUnwrap(fit.poses[FacePose.neutral.rawValue])
-        // A wink as the picture shows it: one eye mostly shut, the other dragged half-way along.
+        // Simulate a camera wink where one eye is mostly closed and the other partially squints with it.
         face.eyeOpenL = 0.20 - 0.18 * 0.7
         face.eyeOpenR = 0.20 - 0.18 * 0.35
-        // One brow up, the other following a little.
+        // Raise the left brow while the right brow moves up slightly.
         face.browLiftL = 0.06 + 0.04 * 0.6
         face.browLiftR = 0.06 + 0.04 * 0.2
         var weights = fit.weights(for: face, fallback: fallback)
         XCTAssertGreaterThan(weight(weights, .eyesClosedL), 0.95)
         XCTAssertLessThan(weight(weights, .eyesClosedR), 0.05)
         XCTAssertLessThan(weight(weights, .innerBrowRaiserR), 0.05)
-        // The left brow is up, but its eye is shut, which holds the brow down.
+        // Closing the left eye suppresses the left brow-raise weight and drives brow lowerer instead.
         XCTAssertLessThan(weight(weights, .innerBrowRaiserL), 0.1)
         XCTAssertEqual(weight(weights, .browLowererL), 0.7, accuracy: 0.05)
 
-        // Both eyes shut stay both shut.
+        // Closing both eyes keeps both eye-closed weights at 1.
         face.eyeOpenL = 0.02; face.eyeOpenR = 0.02
         weights = fit.weights(for: face, fallback: fallback)
         XCTAssertEqual(weight(weights, .eyesClosedL), 1, accuracy: 0.01)
         XCTAssertEqual(weight(weights, .eyesClosedR), 1, accuracy: 0.01)
 
-        // One brow raised with both eyes open.
+        // Test raising one brow while both eyes remain open.
         face = try XCTUnwrap(fit.poses[FacePose.neutral.rawValue])
         face.browLiftL = 0.06 + 0.04 * 0.6
         face.browLiftR = 0.06 + 0.04 * 0.2
@@ -283,15 +283,15 @@ final class FaceCalibrationTests: XCTestCase {
         XCTAssertGreaterThan(weight(weights, .innerBrowRaiserL), 0.95)
         XCTAssertLessThan(weight(weights, .innerBrowRaiserR), 0.05)
 
-        // A slight frown is sent as a clear one.
+        // A partial frown is boosted to full weight.
         face = try XCTUnwrap(fit.poses[FacePose.neutral.rawValue])
-        face.cornerDropL = 0.012; face.cornerDropR = 0.012               // 40 % of the way
+        face.cornerDropL = 0.012; face.cornerDropR = 0.012               // 40% of calibrated frown
         weights = fit.weights(for: face, fallback: fallback)
         XCTAssertEqual(weight(weights, .lipCornerDepressorL), 1, accuracy: 0.01)
     }
 
-    /// Measurements like those recorded on the headset: a frown widens the
-    /// mouth, and an open jaw narrows it nearly as much as a pucker does.
+    /// Tests cross-expression disambiguation when a frown widens the mouth and
+    /// opening the jaw narrows the mouth almost as much as a pucker.
     func testAFrownIsNotASmileAndAGaspIsAPuckerWithTheJawOpen() throws {
         var fit = calibration()
         fit.poses[FacePose.frown.rawValue]?.mouthWidth = 0.43
@@ -304,12 +304,12 @@ final class FaceCalibrationTests: XCTestCase {
         XCTAssertEqual(weight(weights, .lipCornerDepressorL), 1, accuracy: 0.01)
         XCTAssertEqual(weight(weights, .lipCornerPullerL), 0, accuracy: 0.01)
 
-        // The jaw-open pose itself: no pucker.
+        // The calibrated jaw-open pose alone should not trigger lip pucker.
         weights = fit.weights(for: try XCTUnwrap(fit.poses[FacePose.jawOpen.rawValue]), fallback: fallback)
         XCTAssertEqual(weight(weights, .jawDrop), 1, accuracy: 0.01)
         XCTAssertEqual(weight(weights, .lipPuckerL), 0, accuracy: 0.01)
 
-        // Jaw open and the mouth as narrow as the pucker pose: a gasp.
+        // Opening the jaw while narrowing the mouth to the pucker width produces both pucker and funnel.
         var gasp = try XCTUnwrap(fit.poses[FacePose.jawOpen.rawValue])
         gasp.mouthWidth = 0.28
         weights = fit.weights(for: gasp, fallback: fallback)
@@ -317,7 +317,7 @@ final class FaceCalibrationTests: XCTestCase {
         XCTAssertEqual(weight(weights, .lipPuckerL), 1, accuracy: 0.01)
         XCTAssertEqual(weight(weights, .lipFunnelerLT), 1, accuracy: 0.01)
 
-        // The pucker pose itself: all pucker, no funnel.
+        // The calibrated pucker pose produces pucker without lip funnel.
         weights = fit.weights(for: try XCTUnwrap(fit.poses[FacePose.pucker.rawValue]), fallback: fallback)
         XCTAssertEqual(weight(weights, .lipPuckerL), 1, accuracy: 0.01)
         XCTAssertEqual(weight(weights, .lipFunnelerLT), 0, accuracy: 0.01)
@@ -333,7 +333,7 @@ final class FaceCalibrationTests: XCTestCase {
 
     func testEyeDirectionWeightsFollowTheGaze() {
         var face = FaceExpressions(weights: [Float](repeating: 0, count: FaceExpressions.weightCount))
-        face.setEyeDirection(across: Float(tan(17.5 * Double.pi / 180)), up: -1)      // half-way right, far down
+        face.setEyeDirection(across: Float(tan(17.5 * Double.pi / 180)), up: -1)      // halfway right, full down
         XCTAssertEqual(face.weights[FaceExpression.eyesLookRightL.rawValue], 0.5, accuracy: 0.01)
         XCTAssertEqual(face.weights[FaceExpression.eyesLookLeftR.rawValue], 0)
         XCTAssertEqual(face.weights[FaceExpression.eyesLookDownR.rawValue], 1)
@@ -343,7 +343,7 @@ final class FaceCalibrationTests: XCTestCase {
     func testSmallChangesAreFollowedSlowlyAndLargeOnesFast() {
         var smoother = FaceSmoother()
         XCTAssertEqual(smoother.smooth([0, 0], seconds: 0), [0, 0])
-        // A thirtieth of a second later: a blink's worth of change, and a shimmer's.
+        // Advance one 30 Hz frame with one large jump (a blink) and one tiny change (landmark jitter).
         let next = smoother.smooth([1, 0.03], seconds: 1.0 / 30)
         XCTAssertGreaterThan(next[0], 0.6)
         XCTAssertLessThan(next[1], 0.03 * 0.25)
@@ -354,15 +354,15 @@ final class FoveationTests: XCTestCase {
     func testRatesAreSharpAroundStraightAheadAndFallAwayToTheEdges() {
         let rates = Foveation.rates(zones: 59, center: 0.63, unseenAtStart: 2)
         XCTAssertEqual(rates.count, 59)
-        // (The fall begins at full rate, as ALVR's does: one zone more.)
+        // Matching ALVR, the falloff region starts with one zone at full rate.
         XCTAssertEqual(rates.filter { $0 == 1 }.count, Foveation.sharpZones + 1)
-        // The sharp block is around 0.63 of the way across.
+        // The full-rate region is centered around 63% across the axis.
         let firstSharp = rates.firstIndex(of: 1)!
         XCTAssertEqual(Float(firstSharp) + Float(Foveation.sharpZones) / 2, 0.63 * 59, accuracy: 1)
-        // Rising up to it, falling after it, never nothing.
+        // Rates ramp up to the center, fall off after it, and stay at or above the minimum rate.
         XCTAssertEqual(rates[0], Foveation.lowest)
         XCTAssertEqual(rates[1], Foveation.lowest)
-        // (The first few zones of the rise are all at the lowest rate there is.)
+        // The unseen leading zones and the start of the ramp clamp to the minimum rate.
         for zone in 3..<firstSharp { XCTAssertGreaterThanOrEqual(rates[zone], rates[zone - 1]) }
         XCTAssertGreaterThan(rates[firstSharp - 1], rates[firstSharp - 8])
         for zone in (firstSharp + Foveation.sharpZones + 2)..<59 { XCTAssertLessThan(rates[zone], rates[zone - 1]) }
@@ -370,13 +370,13 @@ final class FoveationTests: XCTestCase {
     }
 
     func testEachEyeIsSharpTowardsTheNose() {
-        // A Vision Pro's frusta: much wider outwards than towards the nose.
+        // Vision Pro frusta extend much further outward temporally than nasally.
         let left = Foveation.rates(for: .left, frustum: Frustum(left: -1.74, right: 1.01, down: -1.20, up: 1.01))
         let right = Foveation.rates(for: .right, frustum: Frustum(left: -1.01, right: 1.74, down: -1.20, up: 1.01))
         XCTAssertGreaterThan(left.across.firstIndex(of: 1)!, 59 / 2 - Foveation.sharpZones / 2)
         XCTAssertLessThan(right.across.firstIndex(of: 1)!, 59 / 2 - Foveation.sharpZones / 2)
         XCTAssertEqual(left.down, right.down)
-        // An axis off the edge of the picture still gives a whole sharp block.
+        // Clamping an off-center gaze point still preserves a full-width sharp region.
         let off = Foveation.rates(zones: 20, center: 1.4)
         XCTAssertGreaterThanOrEqual(off.filter { $0 == 1 }.count, Foveation.sharpZones)
     }

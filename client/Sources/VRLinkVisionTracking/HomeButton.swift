@@ -6,26 +6,26 @@
 import GameController
 import VRLinkCore
 
-/// The controller's Home button (PS on a Sense controller), which visionOS
-/// keeps for itself unless both the app and the person say otherwise.
+/// Claims and monitors the controller Home button (the PS button on a Sense
+/// controller), which visionOS intercepts unless configured otherwise by both
+/// the app and the user.
 ///
-/// Two things have to happen for a press to reach the app. The app asks the
-/// system not to act on the button (`claim`). And, on visionOS 27, the person
-/// allows it: Settings > General > Game Controller > Home Button, where this
-/// app's in-app action has to be "Defer to app". The app can read that choice
-/// and open that page, but cannot make the choice.
+/// Delivering Home button presses to the app requires two steps: the app must
+/// disable the preferred system gesture on the button (`claim`), and on
+/// visionOS 27 the user must set Settings > General > Game Controller > Home
+/// Button to "Defer to app" for this app. The app can read that setting and
+/// deep-link to the Settings page, but cannot change the setting itself.
 ///
-/// Everything found is written to the log, because what a controller reports
-/// here is not documented and has differed between controllers and releases.
+/// Button discovery details are logged because controller button reporting is
+/// undocumented and varies across controller models and OS releases.
 ///
-/// Measured on visionOS 27 with PlayStation VR2 Sense controllers
-/// (2026-11-10): they have no Home button at all as far as an app can see,
-/// in the profile, the live inputs, the unmapped inputs or an extended
-/// gamepad view (it has none), and that does not
-/// change when the person sets "Defer to app". Pressing PS produced no input
-/// of any name, while Create/Options ("Button Menu") and the face buttons
-/// did. So for those controllers this class finds nothing to deliver; it is
-/// here for controllers that do report the button.
+/// Tested on visionOS 27 with PlayStation VR2 Sense controllers (2026-11-10):
+/// Sense controllers do not expose a Home button in `physicalInputProfile`,
+/// live inputs, unmapped inputs, or `extendedGamepad` (which is `nil`), even
+/// when the user selects "Defer to app". Pressing PS generates no input event
+/// under any name, whereas Create/Options (`"Button Menu"`) and face buttons
+/// work normally. This class is therefore a no-op for Sense controllers,
+/// retained for spatial or standard controllers that do expose `Button Home`.
 public final class HomeButton: ObservableObject {
     public init() {}
 
@@ -34,15 +34,15 @@ public final class HomeButton: ObservableObject {
         case systemKeepsIt = "the system keeps it"
         case reachesApp = "it reaches this app"
     }
-    /// What the person's setting says, as far as it can be read.
+    /// Current state of the user's Home button routing setting, if readable.
     @Published public private(set) var delivery: Delivery = .unknown
 
     private var manager: AnyObject?
-    /// The controllers asked about so far, to ask again when the setting changes.
+    /// Connected controllers already inspected, retained so they can be re-queried if settings change.
     private var claimed: [(controller: GCController, side: Side)] = []
     private var updates: Task<Void, Never>?
 
-    /// Ask for the Home button of a controller, and say what it has.
+    /// Requests control of `controller`'s Home button and logs its available system/menu buttons.
     public func claim(_ controller: GCController, side: Side) {
         if !claimed.contains(where: { $0.controller === controller }) { claimed.append((controller, side)) }
         let profile = controller.physicalInputProfile
@@ -64,7 +64,7 @@ public final class HomeButton: ObservableObject {
         Task { @MainActor in self.watchSetting() }
     }
 
-    /// Read the person's setting, and keep reading it when it changes.
+    /// Reads the user's Home button setting and subscribes to updates.
     @MainActor private func watchSetting() {
         guard #available(visionOS 27.0, *), manager == nil else { return }
         let settings = GCControllerHomeButtonSettingsManager()
@@ -83,12 +83,12 @@ public final class HomeButton: ObservableObject {
             guard now != delivery else { return }
             delivery = now
             Log.note("home button: the setting says \(delivery.rawValue)")
-            // What the controllers report may change with the setting: ask them again.
+            // Re-claim and re-log connected controllers in case exposed buttons changed with the setting.
             for entry in claimed where GCController.controllers().contains(where: { $0 === entry.controller }) {
                 claim(entry.controller, side: entry.side)
             }
         } catch {
-            // It can only be read with a controller connected; the next controller tries again.
+            // Reading fails when no controller is connected; reset so the next controller connection retries.
             Log.note("home button: the setting could not be read: \(error)")
             manager = nil
             updates?.cancel()
@@ -96,7 +96,7 @@ public final class HomeButton: ObservableObject {
         }
     }
 
-    /// Open the Settings page where the person can let the button through.
+    /// Opens the system Settings page where the user can defer the Home button to this app.
     @MainActor public func openSettings() {
         guard #available(visionOS 27.0, *), let settings = manager as? GCControllerHomeButtonSettingsManager else { return }
         do {
@@ -106,7 +106,7 @@ public final class HomeButton: ObservableObject {
         }
     }
 
-    /// Whether the Home button is down.
+    /// Returns whether `controller`'s Home button is currently pressed.
     public static func isPressed(_ controller: GCController) -> Bool {
         controller.physicalInputProfile.buttons[GCInputButtonHome]?.isPressed ?? false
     }

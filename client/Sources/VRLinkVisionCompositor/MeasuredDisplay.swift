@@ -5,13 +5,14 @@
 import Foundation
 import VRLinkCore
 
-/// What the headset's displays are like, as last measured: where each eye
-/// is and what it sees (a `DeviceProfile`, its frusta unscaled), and where
-/// the middle of the eyes is from the device anchor.
+/// Thread-safe store for the headset's measured display geometry: an unscaled
+/// `DeviceProfile` (per-eye offsets, frusta, resolution, and refresh rate) and
+/// the eye midpoint offset relative to ARKit's device anchor.
 ///
-/// Only a compositor layer is told these things. The RealityKit renderer
-/// is not, so a compositor layer is opened for a moment first, just to
-/// measure (the ALVR visionOS client does the same).
+/// Only `CompositorServices` exposes per-eye transforms and projections on
+/// visionOS. Because neither the 2D pre-connection UI nor the RealityKit
+/// renderer can query them directly, the app briefly opens a compositor layer
+/// at launch to record these values (the same approach used by ALVR on visionOS).
 public final class MeasuredDisplay: ObservableObject {
     public init() {}
 

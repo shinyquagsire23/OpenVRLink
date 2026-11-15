@@ -3,7 +3,7 @@
 Sources: `SVLAudio::TransmitAndUpdateFEC()` +0x157854,
 `SVLAudio::TransmitAudioPacket` +0x1575a8,
 `SVLAudio::TransportRXAudioFrames` +0x1571b8, `SVLAudio::UpdateStats` +0x158f78.
-All claims **static** unless marked.
+All claims below are **static** unless marked otherwise.
 
 ## Scheme
 
@@ -14,7 +14,7 @@ share one 16-bit sequence counter. The position in a group is `seq % 3`:
 |---|---|
 | 0 | data packet A |
 | 1 | data packet B |
-| 2 | parity: byte-wise XOR of A's and B's payloads over 1024 bytes (shorter one zero-padded) |
+| 2 | parity: byte-wise XOR of A's and B's payloads over 1024 bytes (shorter payload zero-padded) |
 
 The parity packet's `len` is `max(len_A, len_B)`. In the type-0x0c variant its
 `aux` field is `min(len_A, len_B)`, so two packets of different length can be
@@ -24,7 +24,7 @@ data packets are assumed equal length.
 When the sequence counter reaches 0xffff after a completed group it is reset to
 0 (0xffff is a multiple of 3, so group alignment survives the wrap).
 
-Which variant a sender uses is decided by the peer's capability word
+The peer's capability word determines which packet variant a sender uses
 (see [negotiation-and-settings.md](negotiation-and-settings.md)):
 
 ```python
@@ -53,8 +53,9 @@ def transmit_and_update_fec(self):
 
 ## Receiver
 
-State: `last_seq` (`SVLAudio+0xc5c`), one held packet `held` (`+0x824`, header
-+ 1024 payload bytes; `held.seq == 2` is the "nothing held" sentinel).
+The receiver tracks `last_seq` (`SVLAudio+0xc5c`) and one held packet `held`
+(`+0x824`, header plus 1024 payload bytes, where `held.seq == 2` means no
+packet is held).
 
 ```python
 def rx_fec_packet(self, p):            # p.type in (0x0b, 0x0c) and p.flags == 0x10
@@ -79,9 +80,9 @@ def rx_fec_packet(self, p):            # p.type in (0x0b, 0x0c) and p.flags == 0
         if self.held.seq == 2 or p.seq - self.held.seq > 2: return
         n = self.held.len
         if p.type == 0x0c:
-            if self.held.len < p.len:  # held is the shorter one -> the lost one is the longer
+            if self.held.len < p.len:  # held packet is shorter -> lost packet is longer
                 zero-pad held.payload to p.len;  n = p.len
-            else:                      # the lost one is the shorter
+            else:                      # lost packet is shorter
                 n = p.aux
         rec = xor(p.payload, self.held.payload)        # 1024 bytes
         if self.held.seq == p.seq - 2:     # held A (played), lost B
@@ -95,10 +96,10 @@ def rx_fec_packet(self, p):            # p.type in (0x0b, 0x0c) and p.flags == 0
 `play(x)` is `AcceptAudioFramesFromPeer(x.payload, x.len // (2*out_channels))`
 (vtable +0x30), i.e. a push into the jitter buffer.
 
-Note the comparison `p.seq - self.last_seq > 2` is done on zero-extended
-16-bit values as a signed int, so it does not handle the 0xffff→0 wrap as a
-continuation — but the sender's reset happens on a group boundary, and a
-backwards jump simply fails the `> 2` test and proceeds.
+Note that `p.seq - self.last_seq > 2` is evaluated on zero-extended 16-bit
+values as a signed int, so it does not treat the 0xffff→0 wrap as a contiguous
+step — however, the sender resets on a group boundary, and a backward jump
+fails the `> 2` test and proceeds normally.
 
 Plain type-6 packets bypass all of this and are played immediately.
 
@@ -113,59 +114,59 @@ channel:
 | `cAudDrop` | `SVLAudio+0xc58` | estimated lost data packets (2/3 of each sequence gap) |
 | `cAudFEC` | `SVLAudio+0xc54` | packets reconstructed from parity |
 
-## Confirmed against a wire capture
+## Capture verification (`vr3`)
 
-Capture: `vr3` (real client under Klepton, 40.26 s of streaming, 80,011 SVL
-datagrams, none torn, each with a CLOCK_MONOTONIC receive/send timestamp).
-Times below are seconds from the first SVL datagram of the capture. The earlier
-capture `vr1` had a third of its datagrams torn and no timestamps, so its
-counts were lower bounds; every figure here is a complete count.
+Capture `vr3` records 40.26 s of `vrlink` streaming under Klepton (80,011
+intact SVL datagrams, each with a `CLOCK_MONOTONIC` receive/send timestamp).
+Times below are seconds from the first SVL datagram of the capture. Unlike the
+earlier `vr1` capture, which had a third of its datagrams torn and no
+timestamps (giving only lower-bound counts), every count here is complete.
 
-Field names as in [packet-format.md](packet-format.md): "type 0x0c, flags
-0x10" is what the transport prints as "class 0x0c, type 0x10".
+Field names follow [packet-format.md](packet-format.md), where "type 0x0c,
+flags 0x10" corresponds to "class 0x0c, type 0x10" in transport tools.
 
-- **captured**: 2,913 messages, `seq` 0 to 2912, every step +1. That is 971
-  complete A / B / parity triples and no partial one: the burst starts on
-  `seq % 3 == 0` and ends on `seq % 3 == 2`.
+- **captured**: All 2,913 messages have contiguous `seq` values from 0 to 2912
+  (+1 per step), forming 971 complete A / B / parity triples with no partial
+  group; the burst starts on `seq % 3 == 0` and ends on `seq % 3 == 2`.
 - **captured**: `seq % 3 == 2` messages carry a length in the last header
-  field (896 x851, 1024 x60, 768 x60); the other two positions carry `0x4b01`
-  (1,942 of 1,942).
-- **captured**: for all 971 triples, `parity == A ^ B` over 1024 zero-padded
-  bytes, parity `len == max(len_A, len_B)` and parity last field
-  `== min(len_A, len_B)`. 971 of 971, 0 failures. Caveat, same as `vr1`
-  (which had 11 of 11): every data payload is zeros, so the XOR itself is of
-  zeros and the parity payloads are all zero - the length rules are the
-  informative part, and the XOR of non-zero audio is still **static** only.
-- **captured**: position 0 is always 1024 bytes; position 1 is 896 (851),
-  1024 (60) or 768 (60); parity is always 1024 long, because A always is.
-  The unequal-length convention is therefore exercised in 911 of 971 triples
-  (min 896 or 768 against max 1024).
-- **captured**: the host uses type 0x0c (flags 0x10) for every message after
+  field (896 ×851, 1024 ×60, 768 ×60); the other two positions carry `0x4b01`
+  in all 1,942 data packets.
+- **captured**: Across all 971 triples (0 failures), `parity == A ^ B` over
+  1024 zero-padded bytes, parity `len == max(len_A, len_B)`, and the parity
+  packet's last field equals `min(len_A, len_B)`. As in `vr1` (which had 11 of
+  11 triples), every data payload is all zeros, so the capture verifies the
+  length fields while XOR over non-zero audio remains **static** only.
+- **captured**: Position 0 (A) is always 1024 bytes; position 1 (B) is 896
+  (851 times), 1024 (60 times), or 768 (60 times); parity is always 1024 bytes
+  because A is always 1024 bytes. The unequal-length convention is exercised in
+  911 of 971 triples (min 896 or 768 versus max 1024).
+- **captured**: The host uses type 0x0c (flags 0x10) for every message after
   the client advertises capabilities 3 in VTE 0x18. No type 0x0b or 0x06
   message appears.
-- **captured**: `cAudFEC` and `cAudDrop` stay 0 for the whole session, as they
-  should with no sequence gap. (`vr1` showed `cAudFEC` 0 -> 1 in a session
-  the tracer was disturbing; `vr3` has no recovery to show.)
-- **captured**: the parity packet is sent late. B follows A within 0.2 ms
-  (median), but the parity arrives a median 4.4 ms after B, spread evenly over
-  0 to 10 ms, and 907 of 971 arrive within 0.3 ms of the next video frame's
-  first descriptor. Details and the inference in
-  [packet-format.md](packet-format.md) ("Timing of the downlink"). For the
-  receiver above this means a lost A is replayed (with its held B) up to
-  about 10 ms late.
-- **Not visible**: sequence wrap. The burst is 2,913 messages, so `seq` never
-  gets near 0xffff. The counter started at 0 at the first audio message of the
-  session; whether it restarts at 0 for a later burst in the same session is
-  unknown (there was only one burst).
+- **captured**: `cAudFEC` and `cAudDrop` stay 0 for the whole session, matching
+  the absence of sequence gaps. (`vr1` showed `cAudFEC` increment from 0 to 1
+  when tracer overhead disrupted packet delivery, whereas `vr3` had no packet
+  loss.)
+- **captured**: The parity packet is sent late. B follows A within 0.2 ms
+  (median), whereas parity arrives a median 4.4 ms after B (spread evenly over
+  0 to 10 ms), and 907 of 971 parity packets arrive within 0.3 ms of the next
+  video frame's first descriptor; see [packet-format.md](packet-format.md)
+  ("Downlink timing"). For the receiver above, this delay means a lost A packet
+  (along with its held B packet) is replayed up to ~10 ms late.
+- Sequence wrap was not observed because the 2,913-message burst never
+  approached 0xffff. The counter started at 0 on the first audio message of the
+  session; whether it resets to 0 for a later burst in the same session is
+  unknown because `vr3` contained only one burst.
 
-## Open questions / to confirm on the wire
+## Open questions
 
-- XOR parity over non-silent audio (both captures carried only zeros), and an
-  actual recovery: no packet was lost in `vr3`, so the receive state machine
-  is still **static** only.
-- Whether the host's sequence counter also resets at 0xffff (needs more than
-  3.6 minutes of continuous audio at 300 messages/s), and whether it continues
-  or restarts when audio resumes after a pause.
-- Which type the host sends when the client advertises capabilities 1 or 0
-  (probe).
-- Whether the host changes anything when `cAudDrop` / `cAudFEC` grow.
+- Verify XOR parity and receive-side recovery over non-silent audio on a lossy
+  link (both captures carried all-zero payloads with zero packet loss, so the
+  receive state machine remains **static** only).
+- Check whether the host's sequence counter also resets at 0xffff (requiring
+  more than 3.6 minutes of continuous audio at 300 messages/s) and whether it
+  continues or resets when audio resumes after a pause.
+- Probe which packet type the host sends when the client advertises
+  capabilities 1 or 0.
+- Check whether the host changes its behavior when `cAudDrop` or `cAudFEC`
+  increases.

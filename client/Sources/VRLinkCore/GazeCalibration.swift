@@ -4,23 +4,20 @@
 
 import Foundation
 
-/// Where the eyes look, worked out from where the pupils sit in a camera
-/// picture of the face (`EyeFeatures`), for platforms that don't provide
-/// poses directly.
+/// Estimates eye gaze direction from face-camera pupil measurements (`EyeFeatures`)
+/// on platforms that do not expose raw eye-tracking poses directly.
 ///
-/// The link between the two is different for every face and every fit of
-/// the headset, so it is calibrated: the wearer looks at a number of places
-/// while a ground-truth provider provides real eye poses 
-/// (On visionOS, the gaze-pinch ray provides in-meters eye poses).
+/// Because the mapping from camera features to gaze direction depends on facial
+/// geometry and headset fit, it requires per-user calibration. The user looks at
+/// targets while a ground-truth source supplies actual eye directions (on visionOS,
+/// the system pinch ray provides world-space gaze rays).
 ///
-/// From those data pairs a `GazeCalibration` is fitted, which from then on 
-/// turns features into a real-time gaze pose.
-///
-/// A gaze pose is written as two tangents in the head's frame: `across` is
-/// meters to the right per meter ahead, `up` meters up per meter ahead.
+/// Fitting a `GazeCalibration` to those samples maps `EyeFeatures` to real-time
+/// gaze directions. Gaze direction is represented as two tangents in head space:
+/// `across` (meters right per meter forward) and `up` (meters up per meter forward).
 
-/// One calibration pair: what the camera saw of the eyes, and where they
-/// really looked then, as tangents in the head's frame.
+/// A single calibration sample pairing measured `EyeFeatures` with the ground-truth
+/// head-space gaze tangents at that moment.
 public struct GazeSample: Codable, Equatable {
     public var features: EyeFeatures
     public var across: Float, up: Float
@@ -33,20 +30,20 @@ public struct GazeSample: Codable, Equatable {
 }
 
 public struct GazeCalibration: Codable, Equatable {
-    /// across = acrossTerms . terms(features), and the same for up, where
-    /// terms = [1, a, d, a*a, a*d, d*d, c, o] with a = features.across,
-    /// d = features.down, c = features.belowCorners and o = features.open.
-    /// The first three are a plane; the next three let it bend, since an
-    /// eyeball turns and a picture of it is flat; the last two are the
-    /// other signs of looking up and down (see `EyeFeatures`).
+    /// Polynomial weights where `across = acrossTerms . terms(features)` (and
+    /// similarly for `up`), over `terms = [1, a, d, a*a, a*d, d*d, c, o]` with
+    /// `a = features.across`, `d = features.down`, `c = features.belowCorners`,
+    /// and `o = features.open`. The first three terms fit a plane, the three
+    /// quadratic terms account for spherical eye rotation projected onto a flat
+    /// camera image, and the last two capture eyelid cues for vertical gaze
+    /// (see `EyeFeatures`).
     public var acrossTerms: [Float]
     public var upTerms: [Float]
-    /// How far off the fit was on its own samples, root mean square, in degrees.
+    /// RMS angular error across the training samples, in degrees.
     public var typicalErrorDegrees: Float
     public var sampleCount: Int
-    /// The pairs it was fitted to, oldest first, kept so that it can be
-    /// fitted again with more (`tuned`). Empty in a calibration saved by a
-    /// build that did not keep them.
+    /// Training samples ordered oldest-first, retained so the fit can be updated
+    /// incrementally via `tuned(with:)`. Empty when loaded from older saved calibrations.
     public var samples: [GazeSample] = []
 
     static func terms(_ features: EyeFeatures) -> [Double] {
@@ -55,10 +52,10 @@ public struct GazeCalibration: Codable, Equatable {
     }
     static let termCount = 8
 
-    /// Whether this is a fit this build can use (an older one had fewer terms).
+    /// Whether the coefficient arrays match the current model's term count (older builds used fewer terms).
     public var usable: Bool { acrossTerms.count == GazeCalibration.termCount && upTerms.count == GazeCalibration.termCount }
 
-    /// The direction for these features, as tangents.
+    /// Evaluates the fitted head-space gaze tangents for `features`.
     public func tangents(for features: EyeFeatures) -> (across: Float, up: Float) {
         guard usable else { return (0, 0) }
         let terms = GazeCalibration.terms(features)
@@ -72,7 +69,7 @@ public struct GazeCalibration: Codable, Equatable {
 }
 
 extension GazeCalibration {
-    /// A file from a build that kept no samples still reads.
+    /// Decodes saved calibrations, defaulting `samples` to empty for files written by older builds.
     public init(from decoder: Decoder) throws {
         let saved = try decoder.container(keyedBy: CodingKeys.self)
         acrossTerms = try saved.decode([Float].self, forKey: .acrossTerms)
@@ -82,26 +79,23 @@ extension GazeCalibration {
         samples = (try? saved.decodeIfPresent([GazeSample].self, forKey: .samples)) ?? []
     }
 
-    /// Continuous calibration: this calibration fitted again with one more
-    /// pair, picked up while it was in use (on visionOS, a pinch made while
-    /// streaming, whose ray says where the eyes looked). The fit of the
-    /// headset shifts through a session and from one wearing to the next,
-    /// and this follows it.
+    /// Refits the calibration with an additional sample collected during normal
+    /// use (for example, from a visionOS pinch ray while streaming) to track
+    /// headset slippage during a session or across sessions.
     ///
-    /// Nil when the pair is not taken: a calibration with no samples kept
-    /// cannot be fitted again, and a pair that disagrees with it by more
-    /// than `furthestBelievable` is a bad reading of the eyes (they were
-    /// moving, or half shut), not news about the fit.
+    /// Returns `nil` if the calibration has no stored samples to refit, or if
+    /// the new sample deviates from the current prediction by more than
+    /// `furthestBelievable` (indicating a blink or saccade rather than headset shift).
     public func tuned(with sample: GazeSample) -> GazeCalibration? {
         guard usable, !samples.isEmpty else { return nil }
         let expected = tangents(for: sample.features)
         guard GazeCalibration.apart(expected, (sample.across, sample.up)) <= GazeCalibration.furthestBelievable
         else { return nil }
         var kept = samples
-        // Once there are enough, the new pair takes the place of the old
-        // one that looked nearest to the same spot. Dropping the oldest
-        // instead would in time leave only where people pinch most, the
-        // middle, and nothing to hold the fit down at the edges.
+        // Once at capacity, replace the existing sample with the closest gaze
+        // direction. Evicting the oldest sample instead would eventually cluster
+        // all samples near the center where users pinch most often, degrading
+        // accuracy at the edges.
         if kept.count >= GazeCalibration.mostSamples,
            let nearest = kept.indices.min(by: {
                GazeCalibration.apart((kept[$0].across, kept[$0].up), (sample.across, sample.up))
@@ -114,17 +108,16 @@ extension GazeCalibration {
         return calibrator.fit(fading: GazeCalibration.fading)
     }
 
-    /// How far apart two directions are, as a length between their tangents.
+    /// Euclidean distance between two tangent pairs.
     static func apart(_ a: (across: Float, up: Float), _ b: (across: Float, up: Float)) -> Float {
         ((a.across - b.across) * (a.across - b.across) + (a.up - b.up) * (a.up - b.up)).squareRoot()
     }
 
-    /// A new pair this far from what the calibration expects is left out (tangent; about 19 degrees).
+    /// Maximum tangent-space residual allowed when accepting an online sample (~19 degrees).
     static let furthestBelievable: Float = 0.35
-    /// How many pairs are kept.
+    /// Maximum number of samples retained for online refitting.
     static let mostSamples = 60
-    /// When tuning, each pair counts this much of the one after it, so the
-    /// newest say most; the oldest of sixty still counts a sixth.
+    /// Exponential decay factor per sample step during online refitting; the oldest of 60 samples retains about 1/6 weight.
     static let fading = 0.97
 }
 
@@ -132,39 +125,38 @@ extension GazeCalibration {
 public struct GazeCalibrator {
     public internal(set) var samples: [GazeSample] = []
 
-    /// The fewest samples a fit is made from, and the fewest for one that may bend.
+    /// Minimum sample counts required for a linear fit and for a full quadratic fit.
     public static let fewestSamples = 5, fewestForCurvature = 10
 
     public init() {}
 
-    /// One pair: what the camera saw, and where the eyes really looked.
+    /// Appends a calibration sample pairing camera features with ground-truth head-space tangents.
     public mutating func add(_ features: EyeFeatures, across: Float, up: Float) {
         samples.append(GazeSample(features: features, across: across, up: up))
     }
 
-    /// Where the eyes looked, from a ray known in world space and the head's pose then.
+    /// Converts a world-space gaze direction vector into head-space tangents given `head`.
     public static func tangents(ofRay direction: Vec3, head: Pose) -> (across: Float, up: Float)? {
         let ahead = direction.dot(head.forward)
-        guard ahead > 0.1 else { return nil }                // not a ray behind or beside the head
+        guard ahead > 0.1 else { return nil }                // reject rays behind or nearly perpendicular to the head
         return (direction.dot(head.right) / ahead, direction.dot(head.up) / ahead)
     }
 
-    /// The calibration that fits the samples best (least squares), or nil
-    /// when there are too few or they do not pin it down, as when every
-    /// sample looks at the same place. With `fading` below 1 each sample
-    /// counts that much of the one after it (see `GazeCalibration.tuned`).
+    /// Fits a `GazeCalibration` using weighted least squares, or returns `nil`
+    /// if there are too few samples or the system is underdetermined (for example,
+    /// all samples look at the same target). When `fading` is less than 1, older
+    /// samples are exponentially down-weighted (see `GazeCalibration.tuned`).
     public func fit(fading: Double = 1) -> GazeCalibration? {
         guard samples.count >= GazeCalibrator.fewestSamples else { return nil }
-        // With few samples only the plane is fitted; the bending terms stay zero.
+        // Fit only the linear plane terms until enough samples are available for curvature.
         let termCount = samples.count >= GazeCalibrator.fewestForCurvature ? GazeCalibration.termCount : 3
         let rows = samples.map { Array(GazeCalibration.terms($0.features).prefix(termCount)) }
-        // The bending terms are held back a little (ridge regression), so
-        // that noise in a handful of samples does not turn into wild curves
-        // away from them.
+        // Apply light L2 regularization (ridge regression) to the higher-order
+        // terms so noisy samples do not cause wild extrapolation near the edges.
         let weights = samples.indices.map { pow(fading, Double(samples.count - 1 - $0)) }
         let restraint = 1e-4 * weights.reduce(0, +)
         func solve(_ targets: [Double]) -> [Double]? {
-            // Normal equations: (rows' rows + restraint) x = rows' targets.
+            // Build the weighted normal equations `(rows^T * W * rows + restraint * I) * x = rows^T * W * targets`.
             var m = [[Double]](repeating: [Double](repeating: 0, count: termCount + 1), count: termCount)
             for (index, row) in rows.enumerated() {
                 for i in 0..<termCount {
@@ -173,7 +165,7 @@ public struct GazeCalibrator {
                 }
             }
             for i in 3..<termCount { m[i][i] += restraint }
-            // Gaussian elimination, largest pivot first.
+            // Solve via Gaussian elimination with partial pivoting.
             for column in 0..<termCount {
                 let pivot = (column..<termCount).max { abs(m[$0][column]) < abs(m[$1][column]) }!
                 guard abs(m[pivot][column]) > 1e-9 else { return nil }
@@ -190,7 +182,7 @@ public struct GazeCalibrator {
         else { return nil }
         var calibration = GazeCalibration(acrossTerms: across.map { Float($0) }, upTerms: up.map { Float($0) },
                                           typicalErrorDegrees: 0, sampleCount: samples.count, samples: samples)
-        // How well it does on what it was fitted to: the angle between the true and the fitted direction.
+        // Compute the RMS angular error (in degrees) between ground-truth and fitted gaze vectors.
         var squares = 0.0
         for sample in samples {
             let fitted = calibration.tangents(for: sample.features)
@@ -204,27 +196,27 @@ public struct GazeCalibrator {
     }
 }
 
-/// Turns a stream of eye features into a gaze that is sent to vrlink
+/// Converts a stream of face-camera eye features into smoothed head-space gaze targets.
 public struct GazeFromFeatures {
     private var filter = OneEuroFilterVec3(slowestCutoff: 2.0, speedGain: 30)
     private var lastTime: Double?
     private var last: Vec3?
 
-    /// How far away the eyes are taken to be fixed, in meters
+    /// Assumed vergence/fixation distance in meters.
     public static let fixationDistance: Float = 1.5
 
     public init() {}
 
-    /// The fixation point in the head's frame (x right, y up, z back), as
-    /// `StreamSession.gazeProvider` wants it.
+    /// Returns the smoothed 3D fixation point in head space (+x right, +y up, +z back)
+    /// expected by `StreamSession.gazeProvider`.
     public mutating func gaze(_ estimate: FaceEstimate, calibration: GazeCalibration, seconds: Double) -> Vec3 {
-        // A shut eye has no pupil to find: keep looking where it last looked.
+        // Hold the last valid gaze point during blinks when pupils are occluded.
         if estimate.blinking, let last { return last }
         let tangents = calibration.tangents(for: estimate.eyes)
         let step = Float(seconds - (lastTime ?? seconds))
         if step < 0 || step > 0.5 { filter = OneEuroFilterVec3(slowestCutoff: 2.0, speedGain: 30) }
         lastTime = seconds
-        // Nobody's eyes turn further than this; a wilder answer is the fit running away.
+        // Clamp extreme tangents caused by polynomial extrapolation outside the calibrated range.
         let limit: Float = 1.2
         let steadied = filter.smooth(Vec3(max(-limit, min(limit, tangents.across)), max(-limit, min(limit, tangents.up)), 0),
                                      seconds: max(step, 0))

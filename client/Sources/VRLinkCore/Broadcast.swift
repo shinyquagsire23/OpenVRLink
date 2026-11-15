@@ -4,18 +4,18 @@
 
 import Foundation
 
-/// The UDP 27036 protocol: find a host and ask it for a VR Link session (docs/remoteplay/)
+/// Steam Remote Play discovery, pairing, and VR Link session setup over UDP port 27036 (docs/remoteplay/).
 
 public struct SteamHost {
     public let address: String
     public let clientID: UInt64
     public let hostname: String
-    /// The host says it can serve VR Link (it has SteamVR and a hardware encoder).
+    /// Whether the host advertises VR Link support (SteamVR installed with a hardware encoder).
     public let offersVRLink: Bool
 }
 
-/// The session string the host returns (docs/remoteplay/session-request.md):
-/// `host~port~port~startinfo~~~~token`.
+/// Parsed connection parameters from the host's session response string
+/// (`host~port~port~startinfo~~~~token`; see docs/remoteplay/session-request.md).
 public struct SessionArgs {
     public let host: String
     public let port: UInt16
@@ -77,7 +77,7 @@ public enum Broadcast {
         return out
     }
 
-    /// (sender's client id, message type, body)
+    /// Parses a broadcast packet into its sender client ID, message type, and protobuf body.
     static func parse(_ datagram: Bytes) -> (clientID: UInt64, type: UInt64, body: ProtoMessage)? {
         guard datagram.count >= 16, Bytes(datagram.prefix(8)) == magic else { return nil }
         let headerLength = Int(datagram.integer(at: 8) as UInt32)
@@ -117,11 +117,9 @@ public enum Broadcast {
         throw BroadcastError.noReply
     }
 
-    /// Reach a host at a known address, by a preferred network interface if
-    /// it answers there. `preferred` lists interface names in order of
-    /// preference (a platform puts its wired ones here); each is tried
-    /// briefly, and the system's own routing is the fallback. Returns the
-    /// socket to go on using, and the interface it is tied to, if any.
+    /// Probes a host at a known IP address, trying each network interface in `preferred`
+    /// (such as wired Ethernet interfaces) before falling back to default system routing.
+    /// Returns the working socket, the discovered host, and the bound interface name if any.
     public static func reach(address: String, deviceID: UInt64, preferring preferred: [String])
         throws -> (socket: UDPSocket, host: SteamHost, interface: String?) {
         for interface in preferred {
@@ -134,10 +132,9 @@ public enum Broadcast {
         return (socket, try findHost(socket, address: address, deviceID: deviceID), nil)
     }
 
-    /// Find Steam hosts on the local network without broadcasting, which
-    /// Apple's platforms refuse without an entitlement: send the probe to
-    /// every address of the local subnets, one by one. A host answers a
-    /// unicast probe exactly as it answers a broadcast.
+    /// Discovers Steam hosts on the local network by sending unicast probes to every IP
+    /// address in the local subnets. This avoids UDP broadcast, which requires a special
+    /// entitlement on Apple platforms; hosts respond to unicast probes identically.
     public static func discover(_ socket: UDPSocket, deviceID: UInt64, wait: Double = 1.5) -> [SteamHost] {
         let datagram = probe(deviceID: deviceID)
         for address in UDPSocket.localSubnetAddresses() { socket.send(datagram, host: address, port: port) }
@@ -151,11 +148,10 @@ public enum Broadcast {
         return found.values.sorted { $0.hostname < $1.hostname }
     }
 
-    /// Pair with a host (docs/remoteplay/pairing.md). `showPIN` is called once
-    /// with a four-digit PIN that the user must type into Steam on the host.
-    /// On success, the shared secret is stored in `identity`.
-    /// `deviceName` and `deviceModel` are what the host is told this device
-    /// is called and what kind of device it is, at most 64 characters each.
+    /// Pairs with a host (docs/remoteplay/pairing.md). Calls `showPIN` once with a
+    /// 4-digit PIN for the user to enter in Steam on the host, and saves the resulting
+    /// shared secret in `identity`. `deviceName` and `deviceModel` identify this client
+    /// to the host (up to 64 characters each).
     public static func pair(_ socket: UDPSocket, host: SteamHost, identity: Identity, deviceName: String,
                             deviceModel: String, showPIN: (String) -> Void) throws {
         let pin = String(format: "%04d", Int.random(in: 1...9999))
@@ -165,8 +161,8 @@ public enum Broadcast {
         var deviceIDBytes = Bytes()
         deviceIDBytes.append(integer: identity.deviceID)
 
-        // Only Steam's servers can open the ticket. A host that completes the
-        // key exchange itself does not need it, but the field is required.
+        // Only Steam's servers can decrypt this ticket. Hosts that perform direct key
+        // exchange ignore its contents, but the field is still required.
         var ticket = ProtoWriter()
         ticket.bytes(1, Bytes(pin.utf8))             // password
         ticket.varint(2, identity.deviceID)          // identifier
@@ -202,8 +198,8 @@ public enum Broadcast {
                 if result == 5 { continue }                  // in progress: waiting for the PIN
                 guard result == 0 else { throw BroadcastError.pairingRefused("host answered result \(result)") }
                 guard let hostKey = message.body.bytes(3) else {
-                    // The older route: Steam's servers opened the ticket, so the
-                    // secret we put in it is now the shared one.
+                    // Legacy pairing path where Steam's servers decrypted the ticket,
+                    // making unpairedSecret the shared secret.
                     identity.setSecret(unpairedSecret, forHost: host.clientID)
                     return
                 }
@@ -223,13 +219,13 @@ public enum Broadcast {
         throw BroadcastError.pairingRefused("nobody entered the PIN on the host")
     }
 
-    /// Ask the host to start SteamVR streaming.
-    /// Repeats the request once a second, answers the proof challenge, 
-    /// and decrypts the session string from the final response
+    /// Asks the host to start SteamVR streaming.
+    /// Repeats the request once a second, answers the proof challenge,
+    /// and decrypts the session string from the final response.
     ///
     /// We roll our own protobuf here because I hate having protobuf as a dependency.
     ///
-    /// `deviceVersion` is free text the host is given about this client.
+    /// `deviceVersion` is a client version string reported to the host.
     public static func requestSession(_ socket: UDPSocket, host: SteamHost, identity: Identity,
                                       deviceVersion: String) throws -> SessionArgs {
         let secret = identity.secret(forHost: host.clientID)
@@ -291,7 +287,7 @@ public enum Broadcast {
                           let cert = body.string(8).flatMap({ Bytes(hex: $0) }),
                           let text = SteamCrypto.decrypt(cert, key: sessionKey)
                     else { throw BroadcastError.badResponse("session key or session string did not decrypt") }
-                    // The host omits its own address; the client prepends the one it used.
+                    // If the host omits its address from the session string, prepend the host address we connected to.
                     let string = String(decoding: text, as: UTF8.self)
                     guard let args = SessionArgs(string.hasPrefix("~") ? host.address + string : string)
                     else { throw BroadcastError.badResponse("unexpected session string shape") }

@@ -7,42 +7,42 @@ chops each value into 128-byte chunks, and keeps re-sending unacknowledged
 chunks until the peer acks them. It has no socket of its own: its bytes are
 piggy-backed on other SVL messages.
 
-Binary: `libvrlink_scene.so` (Android arm64). Offsets below are file offsets
-(Ghidra address = offset + 0x100000). All integers are little-endian.
+File offsets below refer to `libvrlink_scene.so` (Android arm64; Ghidra
+address = offset + 0x100000). All multi-byte integers are little-endian.
 
-Evidence classes: **static** = read from the binary at the named symbol;
-**captured** = decoded from the streaming capture `vr3` (Klepton
-`KL_TRACE_NET` trace of the real client against a real host: 80,035
-datagrams, none torn, timestamped, complete from the session's first
-datagram; payloads in the clear); **inferred** = a guess, with what would
-confirm it. See §7 for exactly what the capture confirmed. Times are seconds
-after the client's first datagram.
+Claims are tagged **static** (read from `libvrlink_scene.so` at the named
+symbol), **captured** (decoded from streaming capture `vr3`, a complete,
+untorn, timestamped 80,035-datagram Klepton `KL_TRACE_NET` trace of `vrlink`
+against a SteamVR host with cleartext payloads), or **inferred** (a deduction
+paired with how to test it). See §7 for capture verification details.
+Timestamps are in seconds after `vrlink`'s first datagram.
 
-## 1. Where VTS bytes travel
+## 1. Carriers
 
 | direction | carrier | where in the carrier | budget | evidence |
 |---|---|---|---|---|
-| client → host | the pose packet, dataset class 3 type `0x01` (`QSVLClient::SendPoses` +0xf4d34 writes `0x0103` into the first two header bytes) | appended after the 0x168-byte pose block, i.e. at dataset payload offset 0x168; dataset length field = `0x168 + vts_len` | 372 bytes (`TickUpdate(buf, 0x174)` at +0xf5154) | static + captured (17,446 pose datasets, payload lengths 360..731 — so at most 371 VTS bytes — and the VTS parse consumes every byte after 0x168; only the first 408, up to 0.926 s, carry any) |
+| client → host | the pose packet, dataset class 3 type `0x01` (`QSVLClient::SendPoses` +0xf4d34 writes `0x0103` into the first two header bytes) | appended after the 0x168-byte pose block, i.e. at dataset payload offset 0x168; dataset length field = `0x168 + vts_len` | 372 bytes (`TickUpdate(buf, 0x174)` at +0xf5154) | static + captured (17,446 pose datasets, payload lengths 360..731 — so at most 371 VTS bytes — and the VTS parse consumes every byte after 0x168; only the first 408 pose datasets, up to 0.926 s, carry VTS bytes) |
 | host → client | dataset class 3 type `0x0d` on the unreliable stream | the whole dataset payload (`payload_len` bytes at dataset +8) is handed to `RXMessage` | dataset size | static: `SVLRoot::RXUnreliableStream` +0x164ae0, `case 0xd`; captured (6 datasets, 12..216 bytes, zero bytes left over, all in the first 42 ms) |
 | host → client | the video frame "bookend" (dataset class 5 type 2) trailer, see docs/svl-video/frame-descriptor.md | after the `TransportValue_t[]` and timing-event arrays; length is the `u8` at trailer +0x0f | 255 bytes per bookend | static: `QSVLClient::ReceivedBookend` +0xf6cf8; captured (8,632 bookends, all trailer version 3; the VTS section is non-empty in 30 of them and never longer than 252 bytes = 63 acks; parses exactly) |
 
 The dataset header itself (type byte, length, sequence) belongs to the
-transport (docs/svl-transport/). What this layer relies on: `dataset[1]` is the
-message type, `u16 dataset[4..6]` is the payload length, payload starts at
-`dataset + 8` (**static**, same function).
+transport layer (docs/svl-transport/); VTS relies only on `dataset[1]` holding
+the message type, `u16 dataset[4..6]` holding the payload length, and the
+payload starting at `dataset + 8` (**static**, same function).
 
-The two directions use different carriers (**captured**): the client never
-sends a type-0x0d dataset, and the host never sends VTS inside a type-0x01
-one. The host's two carriers do not overlap in time: type-0x0d datasets until
-it decides to start video (the last at 0.042 s), bookends once video flows
-(the first at 0.926 s), and **nothing in between** — see §7.4. The packet decoded in Klepton's notes (`kind=0x0d03 payload_len=168`,
-elements id 2/6/0x19/0x1a/0x1b/0x1f/0x26/0x2e) is a host→client type-0x0d
-dataset; the capture contains the same burst.
+The two directions use different carriers (**captured**): `vrlink` never sends
+a type-0x0d dataset, and the host never sends VTS inside a type-0x01 dataset.
+The host's two carriers do not overlap in time: it sends type-0x0d datasets
+until it begins preparing video (last seen at 0.042 s), switches to bookends
+once video flows (first seen at 0.926 s), and sends **no VTS carrier in
+between** (see §7.4). The packet decoded in Klepton's notes (`kind=0x0d03
+payload_len=168`, elements id 2/6/0x19/0x1a/0x1b/0x1f/0x26/0x2e) is a
+host→client type-0x0d dataset; `vr3` contains the same startup burst.
 
 ## 2. Elements
 
-A VTS byte string is a concatenation of elements. There is no count and no
-terminator; the parser walks until fewer than 4 bytes remain.
+A VTS byte string is a concatenation of elements with no element count and no
+terminator; the parser advances until fewer than 4 bytes remain.
 
 ### 2.1 Data chunk (8-byte header + up to 128 payload bytes)
 
@@ -54,11 +54,12 @@ terminator; the parser walks until fewer than 4 bytes remain.
 | 4 | u32 | `total_size` | size of the whole value in bytes, repeated in every chunk |
 | 8 | ≤128 | payload | `min(128, total_size - chunk_index*128)` bytes |
 
-**static**: writer `ValueTransportSystem::TickUpdate` +0x169aac (tail loop),
-reader `ValueTransportSystem::RXMessage` +0x16a618.
+Chunk serialization is in `ValueTransportSystem::TickUpdate` (+0x169aac, tail
+loop) and parsing is in `ValueTransportSystem::RXMessage` (+0x16a618)
+(**static**).
 
-This is what Klepton's notes read as "id/len/value triples with ids like
-0x0281": `81 02` is version 1, id 2; the "len" was `total_size` of a
+This framing explains what Klepton's notes read as "id/len/value triples with
+ids like 0x0281": `81 02` is version 1, id 2, and "len" was `total_size` on a
 single-chunk value.
 
 ### 2.2 Ack (4 bytes)
@@ -69,21 +70,21 @@ single-chunk value.
 | 1 | u8 | `id` |
 | 2 | u16 | `chunk_index` |
 
-**static**: `VTEAckPacket` is a 4-byte struct (vector element size in the ctor
-+0x168bb8); written first in `TickUpdate`, consumed in `RXMessage` (branch with
-bit 7 clear) and applied in `TickUpdate`.
+`VTEAckPacket` is a 4-byte struct (per the vector element size in the
+constructor at +0x168bb8, **static**), written first in `TickUpdate`, queued in
+`RXMessage` (the branch with bit 7 clear), and applied in `TickUpdate`.
 
 ### 2.3 Limits and rejects (all **static**, `RXMessage` / `InternalUpdateValue` +0x169584)
 
-- `id < 0x33` (51) on send; values above are refused locally. On receive, an id
-  byte of 0 or ≥ 0x80 logs `Unknown VTE: %d [%d/%d/%d]` (arguments: version,
-  offset, buffer length, id) but parsing continues.
-- `total_size ≤ 0x800000` (8 MiB) and `total_size > chunk_index*128`, otherwise
-  parsing of the *whole buffer stops* (no log). A zero-length value therefore
-  cannot be transported; the sender never emits one (a value with zero chunks is
-  "complete").
-- A data header that does not fit logs `Error: Payload VTE is too small.` and
-  stops.
+- On send, `id` must be `< 0x33` (51); ids `>= 0x33` are rejected locally. On
+  receive, an id byte of 0 or ≥ 0x80 logs `Unknown VTE: %d [%d/%d/%d]`
+  (arguments: version, offset, buffer length, id) and parsing continues.
+- `total_size ≤ 0x800000` (8 MiB) and `total_size > chunk_index*128`;
+  otherwise parsing of the *entire buffer stops* without logging. A zero-length
+  value therefore cannot be transported, and the sender never emits one (a
+  value with zero chunks is already marked complete).
+- A data header that does not fit in the remaining buffer logs `Error: Payload
+  VTE is too small.` and stops.
 
 ## 3. Receiver algorithm
 
@@ -127,17 +128,18 @@ def rx_message(buf):
         off += 8 + size
 ```
 
-**static**: `RXMessage` +0x16a618. The `vid < 4` exception is read directly
-from the compare at the "completed value, same version" branch; why ids 0..3
-are special is **inferred** (they behave as non-deduplicated). To confirm:
-see whether the host ever re-sends an already-acked chunk of id 2.
+This logic comes from `ValueTransportSystem::RXMessage` (+0x16a618, **static**).
+The `vid < 4` exception is read directly from the comparison on the "completed
+value, same version" branch; why ids 0..3 bypass deduplication is **inferred**.
+Checking whether the host ever re-sends an already-acked chunk of id 2 would
+clarify its purpose.
 
 The ack queue and the changed-id queue are 1024-entry rings; when the ack ring
-is full the ack is silently not queued (the peer will re-send the chunk).
+is full the ack is silently dropped (the peer will re-send the chunk).
 
 Readers use `GetRemoteValue(id, dst, max)` (+0x16a2bc: copies
 `min(max, size)` bytes, returns the count or -1 if nothing was received),
-`GetRemoteValueAsFloat` (+0x16a1c8: first 4 bytes as float if size ≥ 4) and
+`GetRemoteValueAsFloat` (+0x16a1c8: first 4 bytes as float if size ≥ 4), and
 `GetRemoteValueVersion` (+0x16a530).
 
 ## 4. Sender algorithm
@@ -187,125 +189,134 @@ def tick_update(max_len):                         # called once per outgoing car
     return out
 ```
 
-**static**: `InternalUpdateValue` +0x169584 (mode 0 = update-if-changed, 1 =
-event/forced, 2 = invalidate re-send), `UpdateValue` +0x169574 (tail call, the
-`bool` argument becomes the mode), `SendEvent(id)` +0x169928 (sends 4 zero
-bytes, mode 1), `SendEvent(id, data, len)` +0x16997c (mode 1), `TickUpdate`
-+0x169aac, `InvalidateAll` +0x16ab14 (sets a flag consumed by the next tick),
-`AdvanceMessageSend` +0x16a1a4 (moves the round-robin cursor to the next id).
+These routines correspond to `InternalUpdateValue` (+0x169584; mode 0 =
+update-if-changed, 1 = event/forced, 2 = invalidate re-send), `UpdateValue`
+(+0x169574, a tail call where the `bool` argument selects mode 0 or 1),
+`SendEvent(id)` (+0x169928, sends 4 zero bytes with mode 1),
+`SendEvent(id, data, len)` (+0x16997c, mode 1), `TickUpdate` (+0x169aac),
+`InvalidateAll` (+0x16ab14, sets a flag consumed on the next tick), and
+`AdvanceMessageSend` (+0x16a1a4, moves the round-robin cursor to the next id)
+(**static**).
 
-Consequences a compatible implementation must reproduce:
+Key behaviors a compatible implementation must preserve:
 
-- **Retransmission is tick-driven, not timer-driven.** Every un-acked chunk of
-  every active value is re-sent in every carrier packet that has room, until its
-  ack arrives. There is no backoff.
+- **Retransmission is tick-driven rather than timer-driven.** Every unacked
+  chunk of every active value is re-sent in every carrier packet that has room
+  until its ack arrives, with no backoff.
 - **Versions** start at 1 for the first value of an id and increment modulo 128
-  each time a new value replaces a fully-acked one. A receiver must treat "same
-  version as the completed value" as a duplicate (ack it, do not re-deliver).
-- **Events are values.** `SendEvent` is just a forced update: sending the same
-  bytes twice produces two versions and two deliveries. Events are not re-sent
-  by `InvalidateAll`; plain values are.
-- **Acks carry the version**; an ack for an old version is ignored.
-- Nothing is sent until the first local update (`dirty`), except acks.
+  each time a new value replaces a fully acked value. A receiver must treat
+  "same version as the completed value" as a duplicate (ack it without
+  re-delivering).
+- **Events use the same chunk mechanism.** `SendEvent` is a forced update:
+  sending identical bytes twice produces two versions and two deliveries.
+  Events are skipped by `InvalidateAll`, whereas plain values are re-staged.
+- **Acks carry the version**; an ack for an older version is ignored.
+- Aside from acks, nothing is transmitted until the first local update sets
+  `dirty`.
 
 ## 5. Watches
 
 `AddWatch(id, std::function<void(ValueTransportID, bool)>, owner)` +0x1691c0
 registers a callback. The `bool` is `true` when a new remote value for `id` has
-been completely received, `false` when the peer has acked all chunks of our
-local value. Every client-side handler examined ignores the `false` case
-(**static**: the lambdas listed in the id table test the flag first).
+been completely received, and `false` when the peer has acked all chunks of our
+local value. Every `vrlink` handler examined ignores the `false` case
+(**static**: the lambdas listed in the id table check the flag first).
 
 ## 6. Session restart detection
 
-The client publishes a random non-zero 64-bit instance id in VTE 1 at init and
-watches the host's 8-byte VTE 2. When VTE 2 changes, it calls
-`InvalidateAll()`, which re-sends every non-event local value and forgets the
-versions of everything received (**static**: `QSVLClient::Init` +0xf5e84,
-`QSVLClient::OnRenderComplete` +0xf671c). That VTE 2 is "the host's instance
-id" is **inferred** from the symmetry, and `vr3` supports it from the other
-side (**captured**): 19 ms after the host first acked the client's VTE 1, it
-re-sent all of its own plain values under version 2 — ids 0x02, 0x19, 0x1a,
-0x1b, 0x1f, 0x26, 0x2e — and not the three it had sent as events (0x27, 0x29,
-0x2b). That is exactly what `InvalidateAll` does, run by the host on seeing a
-new client instance id. Still to be seen: a VTE 2 that changes when SteamVR
-restarts.
+`vrlink` publishes a random non-zero 64-bit instance id in VTE 1 at init and
+watches the host's 8-byte VTE 2. When VTE 2 changes, `vrlink` calls
+`InvalidateAll()`, which re-sends every non-event local value and resets the
+received versions of all remote ids (**static**: `QSVLClient::Init` +0xf5e84,
+`QSVLClient::OnRenderComplete` +0xf671c). Treating VTE 2 as the host's instance
+id is **inferred** from this symmetry, and `vr3` confirms the reverse direction
+(**captured**): 19 ms after the host first acked `vrlink`'s VTE 1, it re-sent
+all of its own plain values under version 2—ids 0x02, 0x19, 0x1a, 0x1b, 0x1f,
+0x26, and 0x2e—while omitting the three values it had sent as events (0x27,
+0x29, and 0x2b). That matches `InvalidateAll` running on the host in response
+to a new client instance id. Observing VTE 2 change across a mid-session
+SteamVR restart remains untested.
 
-## 7. What the capture confirmed
+## 7. Capture verification
 
-Decoded from capture `vr3` with the two algorithms above (the repository's
-`ovrlink/vts.py`). All **captured**. The session's whole value exchange is in
-it: 59 distinct (id, version) values, 32 from the client and 27 from the
-host, every chunk of every one acked.
+Capture `vr3` was decoded with the sender and receiver algorithms above
+(implemented in `ovrlink/vts.py`; all findings in this section are
+**captured**). The capture contains the session's entire value exchange: 59
+distinct `(id, version)` values—32 from `vrlink` and 27 from the host—with
+every chunk acknowledged.
 
 ### 7.1 Framing
 
-- Every client pose dataset parses as `0x168` pose bytes followed by a whole
-  number of VTS elements, with nothing left over (17,446 of 17,446).
+- Every client pose dataset parses as `0x168` pose bytes followed by an exact
+  number of VTS elements with zero trailing bytes (all 17,446 datasets).
 - Every host type-0x0d dataset (6) and every bookend VTS section (8,632)
-  parses with nothing left over.
-- Example, the host's first datagram (type 0x0d, 156 bytes, 3.8 ms after the
-  client's first): seven 4-byte acks — `01 01 00 00`, `01 04 00 00`,
-  `01 05 00 00` … `01 05 03 00`, `01 08 00 00` (version 1; ids 1, 4, the four
-  chaperone chunks, 8) — followed by seven data chunks, ids 0x02, 0x19, 0x1a,
-  0x1b, 0x1f, 0x26, 0x2e.
-- Example data chunk, host: `82 02 00 00 08 00 00 00` + 8 bytes = version 2,
-  id 2, chunk 0, total 8. Client: `81 20 00 00 14 00 00 00` + 20 bytes.
-- Multi-chunk values: `0x0d`/`0x0e`/`0x0f` (1161 bytes) travel as chunks 0..9
-  with `total_size = 1161` in each; the 507-byte chaperone JSON as chunks 0..3.
-  The pose packet's 372-byte budget holds two full chunks, so a 1161-byte
-  value takes five pose packets, about 10 ms.
-- An ack-only message exists: the host's sixth dataset (28 bytes) is seven
-  acks and nothing else.
+  parses with zero trailing bytes.
+- For example, the host's first datagram (type 0x0d, 156 bytes, 3.8 ms after
+  `vrlink`'s first datagram) carries seven 4-byte acks—`01 01 00 00`,
+  `01 04 00 00`, `01 05 00 00` … `01 05 03 00`, `01 08 00 00` (version 1; ids
+  1, 4, the four chaperone chunks, and 8)—followed by seven data chunks for ids
+  0x02, 0x19, 0x1a, 0x1b, 0x1f, 0x26, and 0x2e.
+- Example host data chunk: `82 02 00 00 08 00 00 00` + 8 bytes (version 2, id
+  2, chunk 0, total 8). Example client data chunk: `81 20 00 00 14 00 00 00` +
+  20 bytes.
+- Multi-chunk values: `0x0d`, `0x0e`, and `0x0f` (1161 bytes each) travel as
+  chunks 0..9 with `total_size = 1161` in each chunk; the 507-byte chaperone
+  JSON travels as chunks 0..3. Because the pose packet's 372-byte VTS budget
+  fits two full chunks, a 1161-byte value spans five pose packets (~10 ms).
+- Ack-only messages occur on the wire: the host's sixth type-0x0d dataset
+  (28 bytes) consists of seven acks and no data chunks.
 
 ### 7.2 Versions and `InvalidateAll`
 
 - Both sides start each id at version 1.
-- The client received host id 2 at 3.8 ms, logged `All VTEs Invalidated.`
-  once, and re-sent every non-event value with version 2 (ids 0x01, 0x04,
-  0x05, 0x08, 0x0d–0x12, 0x15, 0x18, 0x20, 0x22). The event-type value 0x13
-  (focus) was *not* re-sent, as the static reading predicts. Version 2 of an
-  id did not start until every chunk of its version 1 had been acked — the
-  "staged value waits" rule of §4 — so the re-send ran from 32 ms to 71 ms,
-  directly after the first pass finished at 30 ms.
-- The host did the same in the other direction (§6): versions 1 at 3.8 ms,
-  versions 2 at 23 ms.
-- The chaperone (0x05) reached version 3 at 71 ms, and shows both causes of
-  a new version. Version 2 differs from version 1 in one byte — the JSON's
-  `time` string, one second later — because the host's prop-refresh request
-  (0x2b, at 3.9 ms) made the client regenerate it: a real change. Version 3 is
-  byte-identical to version 2: the forced re-send of `InvalidateAll`, which
-  for every other id produced version 2. (Which version came from which cause
-  is **inferred** from the order of the client's log lines: prop refresh
-  first, invalidation second.)
-- Events re-sent with identical bytes still get a new version: the host's
+- `vrlink` received host id 2 at 3.8 ms, logged `All VTEs Invalidated.` once,
+  and re-sent every non-event value as version 2 (ids 0x01, 0x04, 0x05, 0x08,
+  0x0d–0x12, 0x15, 0x18, 0x20, 0x22). Event value 0x13 (focus) was *not*
+  re-sent, matching the static analysis. Version 2 of each id waited until all
+  chunks of version 1 were acked (the "staged value waits" rule in §4), so the
+  re-send ran from 32 ms to 71 ms, immediately after the version-1 pass
+  finished at 30 ms.
+- The host ran the same sequence in reverse (§6): version 1 at 3.8 ms,
+  version 2 at 23 ms.
+- Chaperone (0x05) reached version 3 at 71 ms, illustrating both causes of a
+  version bump. Version 2 differs from version 1 in a single byte—the JSON's
+  `time` string, one second later—because the host's prop-refresh request
+  (0x2b at 3.9 ms) caused `vrlink` to regenerate it. Version 3 is
+  byte-identical to version 2, produced by `InvalidateAll`'s forced re-send.
+  (Assigning version 2 to prop refresh and version 3 to invalidation is
+  **inferred** from the order of `vrlink`'s log lines: prop refresh first,
+  invalidation second.)
+- Events re-sent with identical bytes still increment the version: the host's
   0x29 went out as version 1 at 3.9 ms and again as version 2 at 1.051 s with
-  the same four bytes. (`vr1` showed the same for the client's 0x0c; in `vr3`
-  the host asked for a refresh rate only once, so 0x0c has a single version.)
-- The host sent id 2 version 1 in two consecutive datagrams, 0.16 ms apart,
-  before any ack could have reached it. The client acked both and logged one
-  invalidation, so re-accepting a duplicate of ids 0..3 (§3) does not by
-  itself re-trigger the watch when the bytes are unchanged.
+  the same four bytes. (`vr1` showed the same behavior for `vrlink`'s 0x0c; in
+  `vr3` the host requested a refresh rate only once, so 0x0c stayed at version
+  1.)
+- The host sent id 2 version 1 in two consecutive datagrams 0.16 ms apart,
+  before any ack could have arrived. `vrlink` acked both and logged a single
+  invalidation, showing that re-accepting duplicate chunks for ids 0..3 (§3)
+  does not re-trigger `OnRenderComplete`'s invalidation check when the payload
+  bytes are unchanged.
 
-### 7.3 Ids outside this client's table
+### 7.3 Out-of-table host ids
 
 The host sent single-chunk values with ids **0x35** (4 bytes, `00 00 00 00`),
-**0x64**, **0x65**, **0x67** and **0x72** (1 byte each, `00`) inside bookend
-trailers, and the client acked each of them (`01 35 00 00`, …). So the host's
-enum is larger than this client build's 51 slots (the bookend's protocol
-version field read 14; this client was built against 9 — docs/svl-video/), and
-a client must ack ids it does not understand or the host will repeat them
-forever. The real client stores them in its 128-entry receive table and never
-reads them.
+**0x64**, **0x65**, **0x67**, and **0x72** (1 byte each, `00`) inside bookend
+trailers, and `vrlink` acked each of them (`01 35 00 00`, …). The host's enum
+is therefore larger than this `vrlink` build's 51 slots (the bookend's protocol
+version field was 14, whereas this `vrlink` binary was built for version 9; see
+docs/svl-video/). A client must ack unknown ids or the host will retransmit
+them indefinitely. `vrlink` stores them in its 128-entry receive table and
+never reads them.
 
-### 7.4 Ack latency, and the retransmission storm at startup
+### 7.4 Startup ack gap and retransmission storm
 
-With timestamps the picture `vr1` only hinted at (a 4-byte `0x0c` value sent
-in 373 consecutive pose packets) is clear. The host had
-**no carrier for acks** for most of a second; the acks were not stuck in a slow queue.
+Capture timestamps explain why `vr1` showed a 4-byte `0x0c` value repeated in
+373 consecutive pose packets: rather than draining a slow ack queue, the host
+had **no outgoing VTS carrier** for nearly 0.9 s while starting its video
+stream.
 
-Ack latency, measured from the first transmission of a chunk to the arrival
-of its first ack:
+Measured ack latency from the first transmission of a chunk to the arrival of
+its first ack:
 
 | who acks | when | carrier | latency |
 |---|---|---|---|
@@ -314,56 +325,57 @@ of its first ack:
 | host | 0.042 s – 0.926 s | none | **0.85–0.88 s** |
 | host | after 0.926 s | bookend trailers, at most 63 acks each | about a thousand queued acks, drained over the first 18 bookends, by 1.051 s |
 
-The sequence: the host sent its last type-0x0d dataset at 0.042 s, acking
-the client's 0x0c reply to the rate request, and then sent no value-transport
-bytes at all until the first bookend of the first video frame, 0.884 s later.
-At 0.042 s the client was in the middle of its version-2 re-send. Everything
-it transmitted after that moment — chunks 3..9 of 0x0d, all of 0x0e and 0x0f,
-0x10, 0x11, 0x12, 0x15, 0x18, 0x20, 0x22, 0x23 and the four chunks of 0x05
-version 3: 39 chunks, 4.0 kB — stayed un-acked, so the client cycled through
-all of it again and again, filling every pose packet to the 372-byte limit:
-**27 complete passes** (one every 31 ms), 1,062 chunk transmissions where 39
-would have done. The first bookend acked the whole set at once and the
-re-sending stopped with the next pose packet. The host had queued an ack for
-every copy it received; the surplus thousand arrived in the following
-bookends and were ignored.
+Specifically, the host sent its last type-0x0d dataset at 0.042 s (acking
+`vrlink`'s 0x0c reply to the rate request) and then sent no VTS bytes until the
+first bookend of frame 0, 0.884 s later. At 0.042 s `vrlink` was partway
+through its version-2 re-send. Everything `vrlink` transmitted after that
+point—chunks 3..9 of 0x0d, all of 0x0e and 0x0f, 0x10, 0x11, 0x12, 0x15, 0x18,
+0x20, 0x22, 0x23, and the four chunks of 0x05 version 3 (39 chunks, 4.0 kB)—remained
+unacked, so `vrlink` cycled through those chunks on every pose tick, filling
+each pose packet up to its 372-byte VTS limit for **27 complete passes** (one
+pass every 31 ms, or 1,062 chunk transmissions for 39 unique chunks). The first
+bookend acked the entire set, stopping retransmissions on the very next pose
+packet. Because the host had queued an ack for every duplicate chunk received,
+roughly a thousand extra acks drained across the next 17 bookends and were
+ignored.
 
-Cost: the client's uplink carried 338 kB in the first second against 233 kB
-in a normal one — about 100 kB of repeats. Harmless on a LAN.
+During that first second, `vrlink`'s uplink carried 338 kB versus 233 kB/s
+during steady-state streaming—about 100 kB of duplicate chunks, which is
+negligible on a LAN.
 
-The host does the same on a small scale: the nine values it
-first sent in bookends at 1.051 s (0x06, 0x17, 0x1c, 0x29, 0x35, 0x64, 0x65,
-0x67, 0x72) were repeated in each of the next 12–13 bookends, for 18 ms,
-although the client's acks left within 1.6 ms. So neither side throttles: an
-un-acked chunk goes into every carrier that has room.
+The host exhibits the same unthrottled behavior on a smaller scale: the nine
+values it first sent in bookends at 1.051 s (0x06, 0x17, 0x1c, 0x29, 0x35,
+0x64, 0x65, 0x67, 0x72) were repeated in each of the next 12–13 bookends over
+18 ms, even though `vrlink`'s acks went out within 1.6 ms. Neither peer
+throttles retransmissions; an unacked chunk is emitted into every carrier
+packet with available space.
 
-For a new client: do not expect acks between the rate reply and the first
-frame; send each chunk once, then again only after a pause (the reference
-client's behavior is legal but wasteful); tolerate duplicate acks and acks for
-versions already complete. Whether the acks' absence is tied to the host
-*starting* video, or the host simply never sends type-0x0d datasets except in
-reply to a client's first values, is not settled — on a host that is already
-streaming to no one, a probe's values were all acked "within 2 s"
-(`startup-exchange.md`, probe results), which fits either reading.
+A new client implementation should not expect acks between sending 0x0c and
+receiving frame 0. Sending each chunk once and pacing retransmissions after a
+short delay avoids `vrlink`'s redundant burst (though `vrlink`'s behavior is
+valid under the protocol), and the receiver should tolerate duplicate acks as
+well as acks for already-completed versions. Whether the ack gap occurs because
+the host is busy initializing video or because the host only sends type-0x0d
+datasets during initial handshake is unresolved; on an idle warm host, a
+probe's values were all acked "within 2 s" ([startup-exchange.md](startup-exchange.md)),
+which is consistent with either explanation.
 
-## Open questions / to confirm on the wire
+## Open questions
 
-Resolved by `vr3` (see §7): carrier and offset of client→host VTS; both
-host→client carriers are used, one after the other; versions start at 1 on
-both sides; the host runs `InvalidateAll` too; host acks take milliseconds
-when it has a carrier and 0.85 s when it has none (the old "ack backlog"
-question); the host retransmits through whichever carrier it is currently
-using, in every one, until acked.
+Capture `vr3` resolved several earlier questions (see §7): the carrier and
+offset of client→host VTS data, sequential use of the two host→client carriers,
+initial version numbering (1 on both sides), host-side `InvalidateAll`
+behavior, the cause of the 0.85 s startup ack delay, and unthrottled host
+retransmissions.
 
-Still open:
-
-1. Whether the host applies the same `id < 4` duplicate exception.
-2. Version wrap: after 127 the next version is 0. `0x80|0` is a valid data
-   header; confirm the host handles it (needs a long session with a frequently
-   changing id, e.g. 0x23).
-3. What exactly stops the host's type-0x0d datasets (§7.4, last paragraph),
-   and whether a value the client publishes mid-gap is *applied* by the host
-   on arrival or only when it gets round to acking it. Probe: publish a
-   changed 0x20 during the gap and see which rate the host requests.
-4. Whether the host ever sends a type-0x0d dataset once video is running (in
-   `vr3`: never, in 39 s).
+1. Does the host apply the same `id < 4` duplicate exception?
+2. After version 127, the 7-bit version wraps to 0 (`0x80 | 0` is a valid data
+   header); does the host handle version 0 cleanly? Confirming this requires a
+   long session with a frequently updated id such as 0x23.
+3. What causes the host to stop sending type-0x0d datasets (§7.4), and does the
+   host apply a client value arriving during the gap immediately or only once
+   bookends start and drain the acks? A probe can test this by publishing an
+   updated 0x20 during the gap and checking which refresh rate the host
+   requests.
+4. Does the host ever send a type-0x0d dataset after video has started (in
+   `vr3`, none appeared over 39 s)?

@@ -4,13 +4,13 @@
 
 import Foundation
 
-/// This device's id and serial, and its pairing secret per host
+/// Persists this client's device ID, synthetic serial number, and per-host pairing secrets.
 public final class Identity {
     public let deviceID: UInt64
-    /// What a host is given as this device's serial when pairing: 64 random
-    /// bits made up once and kept, as 16 hex digits. Apple's systems do not
-    /// give an app the real one.
-    /// TODO: on Android, the device's real serial where the system gives it.
+    /// Persistent 16-character hex serial reported to hosts during pairing,
+    /// generated once from 64 random bits because Apple platforms do not expose
+    /// hardware serial numbers to apps.
+    /// TODO: Use the hardware serial on Android when available.
     public let serial: String
     private var secrets: [UInt64: Bytes] = [:]
 
@@ -37,7 +37,7 @@ public final class Identity {
 
     public func isPaired(withHost clientID: UInt64) -> Bool { secrets[clientID] != nil }
 
-    /// The 32-byte key shared with a host
+    /// Returns the stored 32-byte pairing secret for `clientID`, or generates a random 32-byte key if unpaired.
     public func secret(forHost clientID: UInt64) -> Bytes {
         if let secret = secrets[clientID] { return secret }
         var generator = SystemRandomNumberGenerator()

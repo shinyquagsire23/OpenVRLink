@@ -8,26 +8,27 @@ import QuartzCore
 import UIKit
 import VRLinkCore
 
-/// Asks visionOS for a display refresh rate. There is no call that sets
-/// it: the system chooses the rate itself, and by default runs as fast
-/// as the displays go. It takes two hints, and both are given (the ALVR
-/// visionOS client does the same):
+/// Requests a target display refresh rate from visionOS.
 ///
-/// - a display link's preferred frame rate, so one that does nothing is
-///   kept running at the rate wanted;
-/// - a window's preferred display criteria, which say "video of this
-///   format at this rate is playing". That one needs the stream's format,
-///   so it is given once the decoder has seen the stream's parameter sets.
+/// visionOS does not expose an API to force a refresh rate; the OS manages the
+/// display rate itself and defaults to maximum refresh. Following the ALVR
+/// visionOS client, we pass two hints:
 ///
-/// The criteria are what the system was seen to act on (its log,
-/// 2026-11-13): setting them makes this app assert "playing 90 Hz
-/// content" (or 96, 100, 120) to the system's rate manager, and the
-/// displays changed rate four seconds after the last time that was
-/// asserted. Setting them again, even to the same thing, asserts again
-/// and the wait starts over, so they are set only when they change.
+/// - A no-op `CADisplayLink` configured with `preferredFrameRateRange` set to
+///   the target rate.
+/// - `AVDisplayCriteria` on the key window's `avDisplayManager`, which signals
+///   that video of a given format and framerate is playing. Because this
+///   requires a `CMFormatDescription`, we apply it once the decoder parses the
+///   stream's parameter sets.
 ///
-/// The system is free to ignore both; the session watches what the
-/// display really does.
+/// In system logs (2026-11-13), `AVDisplayCriteria` is the hint that triggers a
+/// rate switch: setting it asserts content playback at 90, 96, 100, or 120 Hz
+/// to the system rate manager, and the displays switch roughly four seconds
+/// after the last assertion. Re-assigning identical criteria resets that
+/// four-second timer, so we deduplicate updates in `applyCriteria()`.
+///
+/// Because visionOS may ignore both hints, the streaming session still measures
+/// the actual display refresh interval directly.
 final class DisplayRate: NSObject {
     static let shared = DisplayRate()
     private var link: CADisplayLink?
@@ -48,7 +49,7 @@ final class DisplayRate: NSObject {
         }
     }
 
-    /// The format of the video being shown. Safe to call from any thread.
+    /// Updates the active video format description. Safe to call from any thread.
     func videoFormat(_ format: CMFormatDescription) {
         DispatchQueue.main.async { [self] in
             self.format = format

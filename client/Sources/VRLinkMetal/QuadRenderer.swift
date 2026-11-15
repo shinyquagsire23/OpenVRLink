@@ -8,12 +8,12 @@ import Metal
 import VRLinkCore
 import VRLinkVideoToolbox
 
-/// Draws quads through an eye view, sampling a VideoToolbox frame.
+/// Renders textured or solid-color quads from an eye view by sampling a VideoToolbox frame.
 ///
-/// It decides nothing about geometry: the core says where each quad stands in
-/// the world and the caller says where the eye is. This class turns those
-/// into clip-space vertices and a draw call, inside a render pass the caller
-/// owns - a window's on macOS, the compositor's on visionOS.
+/// `VRLinkCore` provides quad positions in world space and the caller supplies
+/// the eye pose and frustum. `QuadRenderer` projects the quads into clip-space
+/// vertices and issues draw calls into the caller's render pass (a window on
+/// macOS or a compositor drawable on visionOS).
 public final class QuadRenderer {
     private var pipeline: MTLRenderPipelineState
     private let device: MTLDevice
@@ -31,15 +31,16 @@ public final class QuadRenderer {
     private let reversedDepth: Bool
 
     /// - Parameters:
-    ///   - eyeCount: 1 for a window; 2 to draw both eyes in one pass with
-    ///     vertex amplification, as a layered compositor drawable needs.
-    ///   - depthFormat: when given, quads also write depth, reversed (1 near,
-    ///     0 far) - visionOS reprojects using it and treats unwritten depth as empty.
-    ///   - linearOutput: true when the render target expects linear light (an
-    ///     sRGB or floating-point target, as on visionOS): the decoded frame
-    ///     is then sampled through the sRGB variant of its texture format, so
-    ///     the sampler also undoes the stream's transfer curve. False passes
-    ///     the stream's encoded values straight through, for a plain 8-bit window.
+    ///   - eyeCount: `1` for a single-view window, or `2` to render both eyes in
+    ///     one pass using vertex amplification for a layered compositor drawable.
+    ///   - depthFormat: When set to a valid format, quads write reversed depth
+    ///     (`1` near, `0` far) for visionOS reprojection, which treats unwritten
+    ///     depth pixels as passthrough.
+    ///   - linearOutput: Set to `true` when the render target expects linear
+    ///     light (an sRGB or floating-point attachment, as on visionOS). Decoded
+    ///     frames are then wrapped in the sRGB variant of the YCbCr pixel format
+    ///     so the hardware sampler linearizes the encoded transfer curve. Set to
+    ///     `false` to pass encoded values straight through to a standard 8-bit window.
     public init?(device: MTLDevice, colorFormat: MTLPixelFormat, depthFormat: MTLPixelFormat = .invalid,
                  eyeCount: Int = 1, linearOutput: Bool = false) {
         self.linearOutput = linearOutput
@@ -57,8 +58,8 @@ public final class QuadRenderer {
         self.depthFormat = depthFormat
         self.eyeCount = eyeCount
         do {
-            // Quad.metal travels as source and is compiled here: building the
-            // package from the command line does not compile Metal files.
+            // Compile Quad.metal from bundled source at runtime because `swift build`
+            // from the command line does not compile Metal shaders.
             guard let url = Bundle.module.url(forResource: "Quad", withExtension: "metal") else {
                 Log.note("renderer: Quad.metal is missing from the bundle")
                 return nil
@@ -77,14 +78,14 @@ public final class QuadRenderer {
         guard let sampler = device.makeSamplerState(descriptor: samplerDescriptor) else { return nil }
         self.sampler = sampler
         CVMetalTextureCacheCreate(nil, nil, device, nil, &textureCache)
-        // Bound when there is no frame yet, so the shader always has a texture.
+        // Bound when no frame is available yet so fragment texture slots are always valid.
         placeholder = device.makeTexture(descriptor: MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba8Unorm, width: 1, height: 1, mipmapped: false))
     }
 
-    /// The color of the picture to see through, if any. Turning keying on
-    /// or off builds the pipeline again; changing the color or distances
-    /// costs nothing and shows in the next frame.
+    /// Optional chroma-key settings for making a target color transparent.
+    /// Toggling chroma keying on or off rebuilds the render pipeline, whereas
+    /// updating the key color or thresholds takes effect on the next frame at no cost.
     public var chromaKey: ChromaKey? {
         didSet {
             guard (chromaKey == nil) != (oldValue == nil) else { return }
@@ -112,12 +113,11 @@ public final class QuadRenderer {
         descriptor.depthAttachmentPixelFormat = depthFormat
         let target = descriptor.colorAttachments[0]!
         target.pixelFormat = colorFormat
-        // The shader gives the color to add (already multiplied by how
-        // opaque it is) and, separately, how much of the target it covers.
-        // Color and alpha are treated alike, so the target ends up holding
-        // what a compositor that lays the picture over the room wants
-        // (visionOS, mixed immersion): opaque where the fovea fades into the
-        // base tile, see-through only where the chroma key made it so.
+        // Dual-source blending: source 0 outputs premultiplied color/alpha to add,
+        // and source 1 outputs coverage (`source1Alpha`). Blending RGB and alpha
+        // identically produces the premultiplied alpha expected by mixed-immersion
+        // compositors on visionOS: feathered fovea-to-base transitions stay opaque,
+        // and only chroma-keyed or alpha-masked regions become transparent.
         target.isBlendingEnabled = true
         target.sourceRGBBlendFactor = .one
         target.destinationRGBBlendFactor = .oneMinusSource1Alpha
@@ -126,8 +126,8 @@ public final class QuadRenderer {
         return try device.makeRenderPipelineState(descriptor: descriptor)
     }
 
-    /// Metal's single-texture YCbCr formats, whose sampler does the YUV->RGB
-    /// conversion in hardware.
+    /// Returns Metal's combined biplanar YCbCr pixel format for hardware
+    /// YUV-to-RGB conversion in the sampler, if supported for `pixelFormat`.
     /// See also: https://github.com/WebKit/WebKit/blob/f86d3400c875519b3f3c368f1ea9a37ed8a1d11b/Source/WebGPU/WebGPU/BindGroup.mm#L43
     private static func samplerConvertedFormat(for pixelFormat: OSType) -> MTLPixelFormat? {
         switch pixelFormat {
@@ -157,7 +157,7 @@ public final class QuadRenderer {
             // The shader-conversion fallback is not written yet.
             return nil
         }
-        // Each of these formats has an sRGB twin 20 higher that returns linear light.
+        // Each of these formats has an sRGB variant at rawValue + 20 that returns linear light.
         if linearOutput, let linear = MTLPixelFormat(rawValue: format.rawValue + 20) { format = linear }
         var texture: CVMetalTexture?
         let status = CVMetalTextureCacheCreateTextureFromImage(
@@ -176,11 +176,11 @@ public final class QuadRenderer {
         draw(eyes: [(quads, view)], of: frame, near: 0.05, far: 100, with: encoder, commands: commands)
     }
 
-    /// Draw each eye's quads as seen from that eye, all in one pass. Every eye
-    /// must have the same number of quads; quad n of each eye is drawn together.
-    /// The caller has set viewports and vertex amplification on the encoder.
-    /// The frame is kept alive until `commands` has finished on the GPU.
-    /// Flat-colored quads need no frame; quads that show the frame are skipped without one.
+    /// Draws each eye's quads in a single render pass, pairing quad `i` across
+    /// eyes in each draw call. The caller must configure viewports and vertex
+    /// amplification on `encoder` beforehand. Pixel buffers from `frame` are
+    /// retained until `commands` completes on the GPU. Solid-color quads render
+    /// even when `frame` is `nil`, while textured quads are skipped without a frame.
     public func draw(eyes: [(quads: [Quad], view: EyeView)], of frame: DecodedFrame?, near: Float, far: Float,
                      with encoder: MTLRenderCommandEncoder, commands: MTLCommandBuffer) {
         guard !eyes.isEmpty, eyes.count <= 2 else { return }
@@ -190,13 +190,13 @@ public final class QuadRenderer {
         encoder.setRenderPipelineState(pipeline)
         if let depthState { encoder.setDepthStencilState(depthState) }
         encoder.setFragmentSamplerState(sampler, index: 0)
-        // The key color is compared with the picture as it is sampled:
-        // linear light for a linear target, encoded values otherwise.
+        // Match the chroma-key color space to the sampled texture values:
+        // linear light when linearOutput is enabled, or encoded sRGB values otherwise.
         let keyColor = (linearOutput ? chromaKey?.linearColor : chromaKey?.color) ?? [0, 0, 0]
-        // The eyes need not have the same quads, nor as many: a host that
-        // squeezes each eye's picture around where it looks cuts the two
-        // differently. Each draw carries one quad of each eye, and an eye
-        // that has run out draws nothing in it.
+        // Each eye can have a different quad layout or count (for example, when
+        // eye-tracked foveation splits each eye's tiles differently). Each draw
+        // call pairs one quad slot per eye; if one eye has fewer quads, its
+        // remaining slots emit degenerate triangles.
         func quad(_ slot: Int, _ index: Int) -> Quad? {
             let quads = eyes[min(slot, eyes.count - 1)].quads
             return quads.indices.contains(index) ? quads[index] : nil
@@ -204,18 +204,18 @@ public final class QuadRenderer {
         for index in 0..<(eyes.map { $0.quads.count }.max() ?? 0) {
             let pair = (0..<2).map { quad($0, index) }
             guard let style = pair[0] ?? pair[1] else { continue }
-            // The picture each eye's copy of this quad shows.
+            // Color texture for each eye's quad at this index.
             let shown = pair.map { $0.flatMap { picture($0.picture) } }
             if style.fill == nil, zip(pair, shown).contains(where: { $0 != nil && $1 == nil }) { continue }
             encoder.setFragmentTexture(shown[0] ?? placeholder, index: 0)
             encoder.setFragmentTexture(shown[1] ?? placeholder, index: 1)
-            // The picture of transparency for each eye's copy, when the frame has one.
+            // Optional alpha texture for each eye's quad when the frame carries separate alpha.
             let alphas = pair.map { $0?.alpha.flatMap { picture($0.picture) } }
             let hasAlpha = style.fill == nil && !zip(pair, alphas).contains(where: { $0 != nil && $1 == nil })
             encoder.setFragmentTexture(alphas[0] ?? placeholder, index: 2)
             encoder.setFragmentTexture(alphas[1] ?? placeholder, index: 3)
-            // Four corners; per corner: a clip position per eye, an atlas
-            // coordinate per eye, and the corner's place within the quad.
+            // Build 4 triangle-strip vertices, each containing per-eye clip-space
+            // positions, per-eye color and alpha UVs, and local quad UV coordinates.
             var vertices: [Float] = []
             for corner in 0..<4 {
                 let across: Float = corner % 2 == 0 ? 0 : 1, down: Float = corner < 2 ? 0 : 1
@@ -223,7 +223,7 @@ public final class QuadRenderer {
                 for slot in 0..<2 {
                     let eye = eyes[min(slot, eyes.count - 1)]
                     guard let quad = pair[slot] else {
-                        // All four corners at one point: no area, nothing drawn.
+                        // Collapse all four corners to a single point so this eye draws a zero-area quad.
                         positions += [0, 0, 0, 1]
                         coordinates += [0, 0]
                         alphaCoordinates += [0, 0]
@@ -238,8 +238,8 @@ public final class QuadRenderer {
                 }
                 vertices += positions + coordinates + alphaCoordinates + [across, down, 0, 0]
             }
-            // QuadStyle: the feather, padding to the color's alignment, the
-            // fill color, the key color (padded), the key distances (padded).
+            // Pack the `QuadStyle` uniform buffer: feather width, alpha flag,
+            // alignment padding, fill color, padded chroma-key color, and key thresholds.
             let styleValues: [Float] = [style.feather, hasAlpha ? 1 : 0, 0, 0] + (style.fill ?? [0, 0, 0, 0])
                 + keyColor + [0, chromaKey?.near ?? 0, chromaKey?.far ?? 1, 0, 0]
             encoder.setVertexBytes(vertices, length: vertices.count * MemoryLayout<Float>.size, index: 0)

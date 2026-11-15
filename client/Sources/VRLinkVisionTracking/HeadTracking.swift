@@ -8,11 +8,12 @@ import QuartzCore
 import VRLinkCore
 import simd
 
-/// Where the head is, from ARKit world tracking.
+/// Tracks the user's head pose using ARKit `WorldTrackingProvider`.
 ///
-/// visionOS splits what OpenXR keeps in one API: head (and hand) poses come
-/// from ARKit, controller buttons from GameController, frame timing from
-/// CompositorServices. This file is only the first of those.
+/// visionOS splits OpenXR's unified tracking and frame loop across several
+/// frameworks: ARKit provides head and hand poses, GameController provides
+/// button state, and CompositorServices drives frame timing. `HeadTracking`
+/// handles the ARKit world-tracking portion.
 public final class HeadTracking {
     public init() {}
 
@@ -21,18 +22,18 @@ public final class HeadTracking {
 
     private let lock = NSLock()
     private var previous: (pose: Pose, time: TimeInterval)?
-    /// The middle of the two eyes relative to the device anchor, in meters.
-    /// The host expects the head pose there (the OpenXR "view" convention).
+    /// Midpoint between the eyes in device-anchor coordinates (meters).
+    /// The host expects the head pose at this point (matching OpenXR's view space).
     private var eyeMidpoint = SIMD3<Float>(0, 0, 0)
-    /// The midpoint as it was when the session began. Velocities are measured
-    /// at this fixed point, so that a glance to the side, which moves the
-    /// live midpoint quickly, is not reported to the host as the head moving.
+    /// Eye midpoint captured at session start. Velocities are measured at this
+    /// fixed offset so rapid eye movements (which shift the live eye midpoint)
+    /// are not reported to the host as head velocity.
     private var steadyMidpoint = SIMD3<Float>(0, 0, 0)
 
-    /// The head pose last given out by `trackedHead`.
+    /// Most recent head pose returned by `trackedHead()`.
     private var latest: Pose?
 
-    /// Where the head was a moment ago, without asking ARKit again.
+    /// Returns the most recently sampled head pose without querying ARKit again.
     public func latestHead() -> Pose? {
         lock.lock()
         defer { lock.unlock() }
@@ -56,8 +57,9 @@ public final class HeadTracking {
         lock.unlock()
     }
 
-    /// The device anchor for a display time. ARKit answers nil beyond its
-    /// prediction horizon, so step back 5 ms at a time until it answers.
+    /// Queries the device anchor for a target display timestamp. ARKit returns
+    /// `nil` beyond its prediction horizon, so this steps back in 5 ms increments
+    /// until a valid anchor is returned.
     public func anchor(at time: TimeInterval) -> DeviceAnchor? {
         var target = time
         for _ in 0..<10 {
@@ -67,21 +69,20 @@ public final class HeadTracking {
         return nil
     }
 
-    /// A matrix whose columns are a frame's right, up and backward axes and
-    /// its position, as a pose.
+    /// Converts a right-handed transform matrix (columns: right, up, backward, position) into a `Pose`.
     public static func pose(_ m: simd_float4x4) -> Pose {
         func vector(_ column: SIMD4<Float>) -> Vec3 { Vec3(column.x, column.y, column.z) }
         return Pose(position: vector(m.columns.3), right: vector(m.columns.0), up: vector(m.columns.1),
                     forward: vector(m.columns.2) * -1)
     }
 
-    /// The head as it is right now, with velocities measured since the last call.
+    /// Samples the current head pose and computes velocities relative to the previous sample.
     public func trackedHead() -> TrackedPose? {
         let now = CACurrentMediaTime()
         guard let anchor = worldTracking.queryDeviceAnchor(atTimestamp: now) else { return nil }
         lock.lock()
         defer { lock.unlock() }
-        // Move from the device anchor to a point given along the device's own axes.
+        // Offset the device anchor position by a local-space vector.
         func head(at point: SIMD3<Float>) -> Pose {
             var m = anchor.originFromAnchorTransform
             m.columns.3 += m.columns.0 * point.x + m.columns.1 * point.y + m.columns.2 * point.z
@@ -92,7 +93,7 @@ public final class HeadTracking {
         if let previous, now > previous.time {
             tracked = tracked.withVelocities(since: previous.pose, seconds: Float(now - previous.time))
         }
-        // Where the head is: the middle of the eyes as they are now.
+        // Report position at the current live eye midpoint while keeping steady-point velocities.
         tracked.pose = head(at: eyeMidpoint)
         previous = (pose, now)
         latest = tracked.pose

@@ -5,27 +5,27 @@
 import Metal
 import VRLinkCore
 
-/// A texture both eyes are drawn into foveated (core `Foveation`): sharp
-/// around straight ahead and coarser towards the edges.
+/// Layout and rasterization rate maps for a shared foveated render target
+/// (using `Foveation` from `VRLinkCore`), keeping resolution high near the
+/// forward view direction and coarser toward the edges.
 ///
-/// Metal draws through a rasterization rate map: the caller draws as if
-/// into a large "screen" (6018 by 5814 for an eye), and the pixels really
-/// stored are fewer, squeezed together where the rates are low. `stored`
-/// says where a place on an eye's screen ended up in the texture, for
-/// whoever shows it.
+/// Metal renders through a rasterization rate map: the caller draws into a
+/// large virtual screen (6018x5814 per eye), while the physical texture stores
+/// fewer pixels by compressing low-rate regions. `stored` maps normalized
+/// virtual-screen coordinates for an eye to normalized coordinates in the
+/// physical texture.
 ///
-/// The right eye's picture is above the left's. The two need different
-/// rates across (each is sharp towards the nose) and a rate map has one
-/// set of rates across for its whole texture, so each eye has a map of its
-/// own: that eye's rates across, and the same rates down in both halves so
-/// that the two maps agree on where each half is. Each eye is drawn in a
-/// render pass of its own, with its map.
+/// The right eye is stacked above the left eye in the texture. Because each eye
+/// needs its own horizontal rate profile (sharper toward the nose) and a rate
+/// map applies a single horizontal profile across the whole texture, each eye
+/// gets its own rate map and render pass. Both maps repeat the same vertical
+/// rates for the top and bottom halves so they agree on where each half lands.
 public struct FoveatedTarget {
-    /// One per eye (left, right). Each covers the whole texture.
+    /// One rate map per eye (left, then right), each covering the full two-eye texture.
     public let maps: [MTLRasterizationRateMap]
-    /// One eye's picture as drawn, before squeezing, in pixels.
+    /// Virtual screen dimensions for a single eye before variable-rate compression, in pixels.
     public let screen = (width: Foveation.zonesAcross * Foveation.zoneSize, height: Foveation.zonesDown * Foveation.zoneSize)
-    /// The texture both eyes are squeezed into, in pixels.
+    /// Physical texture dimensions holding both eyes, in pixels.
     public let texture: (width: Int, height: Int)
 
     public init?(device: MTLDevice, frusta: [Frustum]) {
@@ -33,7 +33,7 @@ public struct FoveatedTarget {
         var maps: [MTLRasterizationRateMap] = []
         for eye in Eye.allCases {
             let rates = Foveation.rates(for: eye, frustum: frusta[eye.rawValue])
-            let down = rates.down + rates.down                    // the right eye's half, then the left's
+            let down = rates.down + rates.down                    // top half (right eye), then bottom half (left eye)
             let layer = MTLRasterizationRateLayerDescriptor(sampleCount: MTLSizeMake(rates.across.count, down.count, 1))
             for (zone, rate) in rates.across.enumerated() { layer.horizontal[zone] = rate }
             for (zone, rate) in down.enumerated() { layer.vertical[zone] = rate }
@@ -50,15 +50,14 @@ public struct FoveatedTarget {
         guard texture.width > 0, texture.height > 0 else { return nil }
     }
 
-    /// Where on the screen an eye's picture is drawn: the left eye in the lower half.
+    /// Returns the virtual-screen viewport for `eye` (right eye in the top half, left eye in the bottom half).
     public func viewport(_ eye: Eye) -> MTLViewport {
         MTLViewport(originX: 0, originY: eye == .left ? Double(screen.height) : 0,
                     width: Double(screen.width), height: Double(screen.height), znear: 0, zfar: 1)
     }
 
-    /// Where a place in an eye's picture (`x` from its left, `y` from its
-    /// top, both 0 ... 1) is stored: as fractions of the texture, from its
-    /// left and from its top.
+    /// Maps normalized coordinates (`x` from left, `y` from top, in `0...1`)
+    /// in an eye's virtual screen to normalized UV coordinates in the physical texture.
     public func stored(_ eye: Eye, x: Float, y: Float) -> (fromLeft: Float, fromTop: Float) {
         let top = eye == .left ? Float(screen.height) : 0
         let place = maps[eye.rawValue].physicalCoordinates(

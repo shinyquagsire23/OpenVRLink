@@ -6,15 +6,15 @@ import CoreMedia
 import VideoToolbox
 import VRLinkCore
 
-/// HEVC, H.264 or AV1 access units in, pixel buffers out, on VideoToolbox.
-/// The codec is read off the stream's first keyframe.
-///
-/// No output pixel format is requested: asking for one makes VideoToolbox
-/// convert (and on visionOS, copy). Whatever biplanar YCbCr the hardware
-/// produces goes to the GPU as it is, and the sampler converts it to RGB.
-/// A decoded frame as this platform's decoder and renderer agree to pass it:
-/// VideoToolbox pixel buffers, still on the GPU side. Steam's VR Link sends
-/// one picture a frame, with every tile in it; WiVRn one for each eye.
+// VideoToolbox decoding for HEVC, H.264, and AV1 streams. The active codec is
+// detected from the stream's first keyframe.
+//
+// We leave the output pixel format unspecified so VideoToolbox does not convert
+// formats (which also forces a buffer copy on visionOS). Native biplanar YCbCr
+// hardware buffers go straight to Metal, where the sampler converts them to RGB.
+/// A decoded video frame backed by GPU-resident VideoToolbox pixel buffers.
+/// VR Link sends a single atlas image per frame containing all tiles, while
+/// WiVRn sends one image per eye (plus optional alpha).
 public struct DecodedFrame {
     public let frameID: UInt16
     public let images: [CVPixelBuffer]
@@ -27,25 +27,25 @@ public struct DecodedFrame {
     }
 }
 
-/// Encoded pictures in, whole decoded frames out: one `PictureDecoder` for
-/// each picture a frame has, and a frame is handed on when all of its
-/// pictures are decoded.
+/// Decodes encoded video pictures into complete `DecodedFrame` values.
+/// Maintains one `PictureDecoder` per picture index in the stream layout and
+/// emits a frame once all of its constituent pictures have finished decoding.
 public final class VideoDecoder {
     public var onImage: ((DecodedFrame) -> Void)?
-    /// Called, on the thread that calls `decode`, when the format of a
-    /// frame's first picture becomes known and each time it changes.
+    /// Called on the `decode` caller's thread when picture 0's video format
+    /// description is first determined and whenever it changes.
     public var onFormat: ((CMVideoFormatDescription) -> Void)?
 
-    /// Called when a picture could not be decoded, with its frame and
-    /// which picture: the session can ask the host to start afresh.
+    /// Called with the frame ID and picture index when decoding fails so the
+    /// session can request a new keyframe from the host.
     public var onFailure: ((UInt16, Int) -> Void)?
 
     public init() {}
 
-    /// Forget everything about the stream decoded so far. A new stream
-    /// begins with a keyframe and gets decoders of its own: the system
-    /// may have ended the old ones while the app was put away, and one
-    /// ended that way takes frames and gives nothing back.
+    /// Resets all decoder state before starting a new stream. Each stream
+    /// starts from a keyframe with fresh decompression sessions, because
+    /// sessions invalidated by the system while the app was backgrounded
+    /// silently drop frames without producing output.
     public func reset() {
         decoders = []
         lock.lock()
@@ -55,10 +55,10 @@ public final class VideoDecoder {
 
     private var decoders: [PictureDecoder] = []
     private let lock = NSLock()
-    /// Frames some of whose pictures are decoded, oldest first.
+    /// Partially decoded multi-picture frames awaiting remaining pictures, oldest first.
     private var waiting: [(frameID: UInt16, images: [Int: CVPixelBuffer])] = []
-    /// A frame still short of a picture when this many newer ones have
-    /// begun will not get it: that picture was lost on the way.
+    /// Maximum number of in-flight partial frames to keep before dropping the
+    /// oldest incomplete frame as lost.
     static let framesWaiting = 4
 
     public func decode(_ frame: EncodedFrame) {
@@ -87,7 +87,7 @@ public final class VideoDecoder {
         var whole: [CVPixelBuffer]?
         if waiting[index].images.count == layout.pictures {
             whole = (0..<layout.pictures).compactMap { waiting[index].images[$0] }
-            waiting.removeFirst(index + 1)            // and with it, any older frame still short
+            waiting.removeFirst(index + 1)            // drop any older incomplete frames as well
         } else if waiting.count > VideoDecoder.framesWaiting {
             waiting.removeFirst()
         }
@@ -98,12 +98,12 @@ public final class VideoDecoder {
     }
 }
 
-/// One picture's decoder.
+/// VideoToolbox decoder for a single picture stream.
 final class PictureDecoder {
     var onImage: ((UInt16, CVPixelBuffer, FrameLayout) -> Void)?
     var onFailure: ((UInt16) -> Void)?
-    /// Called, on the thread that calls `decode`, when the stream's
-    /// format becomes known and each time it changes.
+    /// Called on the `decode` caller's thread when the stream format is first
+    /// determined and whenever it changes.
     var onFormat: ((CMVideoFormatDescription) -> Void)?
 
     init() {}
@@ -117,7 +117,7 @@ final class PictureDecoder {
     private var printedParameterSets = false
     private var av1Format: CMVideoFormatDescription?
 
-    /// The NAL type of a unit, and whether it is a parameter set, in the stream's codec.
+    /// Extracts the NAL unit type from `header` and indicates whether it is a parameter set.
     private static func classify(_ header: UInt8, _ codec: VideoCodec) -> (type: UInt8, isParameterSet: Bool) {
         switch codec {
         case .hevc:
@@ -162,9 +162,10 @@ final class PictureDecoder {
         return format
     }
 
-    /// Adopt new parameter sets. The host re-sends sets whose bytes differ
-    /// (rate control); rebuilding the session each time would throw away its
-    /// reference frames, so an existing session is asked to accept them first.
+    /// Updates the format description from the latest parameter sets. Hosts
+    /// may send updated parameter sets mid-stream (for example, during rate
+    /// control); if the existing decompression session can accept the new
+    /// format description, we reuse it to preserve reference frames.
     private func parameterSetsChanged() {
         guard let newFormat = makeFormat() else { return }
         format = newFormat
@@ -191,8 +192,9 @@ final class PictureDecoder {
         if failures == 1 || failures % 200 == 0 { Log.note("decoder: \(failures) frames could not be decoded (latest status \(status))") }
     }
 
-    /// Decode one frame. The frame's memory is taken over: it goes to
-    /// VideoToolbox as it is, with no copy, so a frame can be decoded once.
+    /// Decodes a single encoded frame. Takes ownership of `frame.data`'s
+    /// buffer and passes it directly to VideoToolbox without copying, so each
+    /// `EncodedFrame` can only be decoded once.
     func decode(_ frame: EncodedFrame) {
         let whole = UnsafeBufferPointer(frame.data.bytes)
         if let seen = AnnexB.keyframeCodec(whole), seen != codec {
@@ -201,7 +203,7 @@ final class PictureDecoder {
             codec = seen
             parameterSets = [:]
         }
-        // The first frames of a session, for the log: what each begins with.
+        // Log the leading bytes and NAL types of the first few frames in a session.
         if described < 6 {
             described += 1
             Log.note("decoder: frame \(frame.frameID), \(whole.count) bytes, begins "
@@ -216,14 +218,14 @@ final class PictureDecoder {
             }
             return
         }
-        // From here the frame's block of memory is ours; it ends up owned by
-        // the sample buffer, which frees it when the decoder has finished.
+        // Take ownership of the frame's buffer; CMBlockBuffer will free it once
+        // VideoToolbox finishes decoding.
         guard var memory = frame.data.takeMemory(), var base = memory.baseAddress else { return }
         var changed = false
         if codec == .av1 {
-            // AV1 goes as it arrived. Its configuration is the sequence
-            // header at the start of a keyframe, which AV1Parser.swift
-            // (from the ALVR visionOS client) turns into a format description.
+            // AV1 OBUs are passed directly to VideoToolbox without framing changes.
+            // Keyframes start with a sequence header OBU, which AV1Parser.swift
+            // (from the ALVR visionOS client) parses into a CMFormatDescription.
             if AnnexB.keyframeCodec(UnsafeBufferPointer(memory)) == .av1 {
                 let header = Bytes(memory.prefix(128))
                 if parameterSets[0] != header {
@@ -234,12 +236,11 @@ final class PictureDecoder {
                 }
             }
         } else {
-            // HEVC and H.264 arrive with a start code (00 00 00 01) in front
-            // of each unit; VideoToolbox wants the unit's length there
-            // instead. Both are four bytes, so the lengths are written over
-            // the start codes where they lie (the ALVR visionOS client's
-            // method). Parameter sets stay in the sample as well as going
-            // into the format description.
+            // HEVC and H.264 arrive in Annex B format with 4-byte start codes
+            // (00 00 00 01), whereas VideoToolbox expects 4-byte big-endian NAL
+            // lengths (AVCC/HVCC). When every start code is 4 bytes, we overwrite
+            // them in place (following the ALVR visionOS client). Parameter sets
+            // remain in the sample buffer in addition to building the format description.
             let units = AnnexB.units(in: UnsafeBufferPointer(memory))
             for unit in units where unit.size > 0 {
                 let (type, isParameterSet) = PictureDecoder.classify(memory[unit.payload], codec)
@@ -259,8 +260,8 @@ final class PictureDecoder {
             if units.first?.startCode == 0, units.allSatisfy({ $0.startCodeLength == 4 }) {
                 for unit in units { writeLength(unit.size, to: base + unit.startCode) }
             } else {
-                // Three-byte start codes leave no room for a length, so this
-                // one frame is copied, unit by unit, into a block with room.
+                // 3-byte start codes cannot hold a 4-byte length in place, so
+                // allocate a new buffer and copy each NAL unit with a 4-byte length prefix.
                 let total = units.reduce(0) { $0 + 4 + $1.size }
                 guard let copy = malloc(max(total, 1))?.assumingMemoryBound(to: UInt8.self) else {
                     free(base)
@@ -279,8 +280,8 @@ final class PictureDecoder {
         }
         let sampleLength = memory.count
         if changed, !printedParameterSets, codec != .av1 {
-            // Once: the stream's parameter sets, which say everything about
-            // its format, in a form that can be pasted into a bitstream tool.
+            // Log the hex-encoded parameter sets once so they can be inspected
+            // with external bitstream analysis tools.
             printedParameterSets = true
             for type in parameterSets.keys.sorted() {
                 Log.note("decoder: parameter set \(type): " + (parameterSets[type] ?? []).map { String(format: "%02x", $0) }.joined())
@@ -321,9 +322,10 @@ final class PictureDecoder {
             }
         }
         if accepted != noErr {
-            // The session would not take the frame at all (the system ends
-            // sessions when the app is put away): no answer will come for
-            // it. Drop the session; the next keyframe makes another.
+            // VideoToolbox rejected the frame synchronously (for example, because
+            // the system invalidated the session while the app was backgrounded),
+            // so the callback will not run. Invalidate the session and recreate it
+            // on the next keyframe.
             Log.note("decoder: the decompression session refused a frame (\(accepted)); starting another at the next keyframe")
             VTDecompressionSessionInvalidate(session)
             self.session = nil

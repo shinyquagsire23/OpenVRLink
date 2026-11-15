@@ -4,10 +4,10 @@
 
 import Foundation
 
-/// Which system this is running on and which build of the client this
-/// is, for the host to be told.
+/// Platform, device model, and client version strings reported to the host
+/// during pairing and session setup.
 public enum SystemVersion {
-    /// As in "visionOS".
+    /// Operating system name, e.g. `"visionOS"`.
     public static var name: String {
         #if os(visionOS)
         return "visionOS"
@@ -22,8 +22,8 @@ public enum SystemVersion {
 
     private static let product = "OpenVRLink"
 
-    /// What kind of device this is, as a host is told when pairing.
-    /// TODO: an Android shell has the real model to give (Build.MODEL).
+    /// Hardware model string sent to the host during pairing.
+    /// TODO: on Android, report `Build.MODEL` instead of a hardcoded string.
     public static var model: String {
         #if os(visionOS)
         return "Apple Vision Pro"
@@ -36,9 +36,8 @@ public enum SystemVersion {
         #endif
     }
 
-    /// The client and its bundle's version and build, as in "OpenVRLink
-    /// 0.1.0-2"; only "OpenVRLink" where it is not run from an app bundle
-    /// (the Mac viewer).
+    /// Client name and bundle version, e.g. `"OpenVRLink 0.1.0-2"`, or just
+    /// `"OpenVRLink"` when running outside an app bundle (such as the macOS CLI viewer).
     public static var client: String {
         let info = Bundle.main.infoDictionary
         guard let version = info?["CFBundleShortVersionString"] as? String,
@@ -47,7 +46,7 @@ public enum SystemVersion {
         return product + " " + version + "-" + build
     }
 
-    /// As in "visionOS 27.0.1".
+    /// OS name and version string, e.g. `"visionOS 27.0.1"`.
     public static var named: String {
         let version = ProcessInfo.processInfo.operatingSystemVersion
         var numbers = "\(version.majorVersion).\(version.minorVersion)"

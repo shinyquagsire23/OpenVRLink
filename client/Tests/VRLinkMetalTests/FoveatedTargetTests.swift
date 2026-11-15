@@ -7,18 +7,18 @@ import XCTest
 import VRLinkCore
 import VRLinkMetal
 
-/// Draws small colored patches at known places in each eye's picture,
-/// through that eye's rate map, and looks for them where `stored` says.
+/// Renders colored patches at known normalized positions in each eye's viewport using its
+/// rasterization rate map, then verifies those colors appear at the coordinates returned by `stored`.
 final class FoveatedTargetTests: XCTestCase {
     func testWhatIsDrawnIsFoundWhereStoredSays() throws {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        // A Vision Pro's frusta, as widened for the host.
+        // Asymmetric Vision Pro eye frusta.
         let frusta = [Frustum(left: -1.74, right: 1.01, down: -1.20, up: 1.01),
                       Frustum(left: -1.01, right: 1.74, down: -1.20, up: 1.01)]
         guard let target = FoveatedTarget(device: device, frusta: frusta) else {
             throw XCTSkip("no rasterization rate maps on this device")
         }
-        // Fewer pixels stored than drawn, and room for both eyes.
+        // The physical backing texture is smaller than the logical screen size while packing both eyes vertically.
         XCTAssertLessThan(target.texture.width, target.screen.width)
         XCTAssertLessThan(target.texture.height, target.screen.height * 2)
 
@@ -29,7 +29,7 @@ final class FoveatedTargetTests: XCTestCase {
         let texture = try XCTUnwrap(device.makeTexture(descriptor: descriptor))
         let commands = try XCTUnwrap(device.makeCommandQueue()?.makeCommandBuffer())
 
-        // Places in a picture (from its left and top, 0 ... 1) and a color for each: middle, towards corners.
+        // Normalized (x, y) test positions from top-left (center and off-center quadrants), each assigned a distinct color.
         let places: [(x: Float, y: Float)] = [(0.5, 0.5), (0.15, 0.2), (0.85, 0.8), (0.63, 0.46), (0.3, 0.9)]
         func color(_ eye: Eye, _ index: Int) -> [Float] {
             [eye == .left ? 1 : 0.25, Float(index + 1) / Float(places.count), eye == .left ? 0.25 : 1, 1]   // red, green, blue, alpha
@@ -45,7 +45,7 @@ final class FoveatedTargetTests: XCTestCase {
             let encoder = try XCTUnwrap(commands.makeRenderCommandEncoder(descriptor: pass))
             encoder.setViewport(target.viewport(eye))
             let frustum = frusta[eye.rawValue]
-            // A patch 4% of the picture wide around each place, 10 m out.
+            // Build a quad spanning 4% of the frustum around each test position at a depth of 10 m.
             let patches = places.enumerated().map { index, place -> Quad in
                 func corner(_ dx: Float, _ dy: Float) -> Vec3 {
                     let across = frustum.left + (place.x + dx) * (frustum.right - frustum.left)
@@ -75,15 +75,15 @@ final class FoveatedTargetTests: XCTestCase {
             for (index, place) in places.enumerated() {
                 let where_ = target.stored(eye, x: place.x, y: place.y)
                 let found = pixel(fromLeft: where_.fromLeft, fromTop: where_.fromTop), wanted = color(eye, index)
-                // Stored blue, green, red, alpha.
+                // Readback format is BGRA8.
                 XCTAssertEqual(Float(found[2]) / 255, wanted[0], accuracy: 0.02, "\(eye) eye, place \(index), red")
                 XCTAssertEqual(Float(found[1]) / 255, wanted[1], accuracy: 0.02, "\(eye) eye, place \(index), green")
                 XCTAssertEqual(Float(found[0]) / 255, wanted[2], accuracy: 0.02, "\(eye) eye, place \(index), blue")
-                // Just outside the patch there is nothing.
+                // Pixels just outside the patch remain transparent.
                 let beside = target.stored(eye, x: place.x + 0.05, y: place.y)
                 XCTAssertEqual(pixel(fromLeft: beside.fromLeft, fromTop: beside.fromTop)[3], 0, "\(eye) eye, beside place \(index)")
             }
-            // The left eye's picture is in the lower half, the right's in the upper.
+            // The left eye is packed into the lower half of the texture and the right eye into the upper half.
             let middle = target.stored(eye, x: 0.5, y: 0.5)
             XCTAssertEqual(middle.fromTop > 0.5, eye == .left)
         }

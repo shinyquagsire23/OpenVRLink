@@ -12,28 +12,28 @@ import VRLinkAppleSession
 import VRLinkVisionTracking
 import simd
 
-/// What the face calibration is asking for, shown in its space and (when it
-/// is over) in the Experiments tab.
+/// State for an active or completed face calibration run, displayed in the
+/// calibration space and in the Experiments tab.
 public final class FaceCalibrationRun: ObservableObject {
     public init() {}
     @Published public var open = false
-    /// The instruction of the moment, in large type.
+    /// Current pose instruction displayed in large text.
     @Published public var prompt = ""
-    /// Smaller: progress, or what went wrong.
+    /// Progress message or error details displayed in smaller text.
     @Published public var status = ""
     @Published public var finished = false
 }
 
-/// The face calibration, as an immersive space of its own.
+/// Runs face calibration in a dedicated immersive space.
 ///
-/// A panel in front of the wearer shows their Persona as the camera sees
-/// it and asks for one expression after another (`FacePose`). Each is
-/// counted in, then the face's measurements are averaged for a little over
-/// a second. From the set a `FaceCalibration` is made and saved in the
-/// settings; a run that is abandoned changes nothing.
+/// A panel in front of the user shows the live Persona camera feed and
+/// prompts for each `FacePose` expression in sequence. After a countdown,
+/// facial measurements are averaged for just over a second per pose. Once
+/// all poses are recorded, a `FaceCalibration` is built and saved to settings;
+/// canceling early leaves existing settings unchanged.
 ///
-/// It is drawn with RealityKit and arranged like the stream's space, so
-/// that the Persona's camera is in front of the face here too.
+/// Rendering uses RealityKit with the same layout as the streaming space so
+/// the Persona camera stays positioned in front of the user's face.
 @MainActor
 public final class FaceCalibrationSpace {
     private let head: HeadTracking
@@ -59,8 +59,8 @@ public final class FaceCalibrationSpace {
         run.finished = false
         run.open = true
         personaCamera = PersonaAttachments.add(to: &content, from: attachments, settings: store.settings)
-        // The panel goes a meter and a half in front of wherever the wearer
-        // is facing now, upright, turned to face them.
+        // Place the panel 1.5 meters in front of the user's current heading,
+        // upright and facing back toward them.
         if let panel = attachments.entity(for: PersonaAttachments.cameraView),
            let device = head.anchor(at: CACurrentMediaTime()) {
             let m = device.originFromAnchorTransform
@@ -119,9 +119,9 @@ public final class FaceCalibrationSpace {
                 }
                 run.status = "\(number + 1) of \(poses.count): hold it"
                 let began = CACurrentMediaTime()
-                // Longer with the eyes shut, since nobody can see when to stop.
+                // Hold longer when eyes are closed since the user cannot see the prompt change.
                 guard await pause(pose == .eyesClosed ? 2.6 : 1.6) else { return }
-                // The first moments are the face still getting there.
+                // Skip the initial 0.4 s while the user settles into the expression.
                 if let measures = persona.camera.faceMeasures(from: began + 0.4, to: CACurrentMediaTime()) {
                     recorded[pose] = measures
                     Log.note(String(format: "face calibration: %@: mouth open %.3f wide %.3f, corners %.3f %.3f, brows %.3f %.3f, eyes %.3f %.3f",
@@ -152,7 +152,7 @@ public final class FaceCalibrationSpace {
 
 public struct FaceCalibrationView: View {
     let space: FaceCalibrationSpace
-    /// Not observed here (see `GazeCalibrationView`); the panel observes it.
+    /// Stored without `@ObservedObject` so updates only re-evaluate the panel, not this view (see `GazeCalibrationView`).
     let run: FaceCalibrationRun
     let persona: PersonaTracking
     let settings: VRLinkCore.Settings
@@ -179,7 +179,7 @@ public struct FaceCalibrationView: View {
                 Text("").cameraAnchor(isActive: true)
             }
             Attachment(id: PersonaAttachments.cameraView) {
-                // The rules of thumb, not an earlier calibration, while measuring.
+                // Preview uncalibrated defaults rather than any previous calibration during capture.
                 PersonaCameraView(persona: persona, wanted: settings.faceFromCamera, showPicture: true,
                                   faceCalibration: nil, asking: run)
             }

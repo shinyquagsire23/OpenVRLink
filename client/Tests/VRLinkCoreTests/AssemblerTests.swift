@@ -6,7 +6,7 @@ import XCTest
 @testable import VRLinkCore
 
 final class AssemblerTests: XCTestCase {
-    /// A made-up keyframe: HEVC parameter sets, an IDR slice start, then filler that never looks like a start code.
+    /// Builds a synthetic HEVC keyframe with parameter sets, an IDR slice header, and filler bytes that cannot form a start code.
     private func frame(bytes count: Int, seed: UInt8) -> Bytes {
         var out: Bytes = [0, 0, 0, 1, 0x40, 0x01, 0x0C, 0, 0, 0, 1, 0x42, 0x01, 0x01, 0, 0, 0, 1, 0x44, 0x01, 0xC0, 0, 0, 0, 1, 0x26, 0x01]
         var value = seed
@@ -17,7 +17,7 @@ final class AssemblerTests: XCTestCase {
         return out
     }
 
-    /// The frame as the host would send it: 1024-byte data packets, and P and Q parity per stripe of eight.
+    /// Splits a frame into 1024-byte data packets and generates P and Q parity packets for each 8-packet stripe.
     private func packets(_ data: Bytes, id: UInt16) -> (data: [SVLElement], parity: [SVLElement]) {
         let count = (data.count + 1023) / 1024
         var dataPackets: [SVLElement] = [], parity: [SVLElement] = []
@@ -50,7 +50,7 @@ final class AssemblerTests: XCTestCase {
         let sent = packets(original, id: 0)
         let assembler = FrameAssembler(now: 0)
         assembler.accept(descriptor: descriptor(id: 0, size: original.count), group: 0, now: 0)
-        // Lose packets 1 and 6 of the first stripe, 9 of the second, and the short last one.
+        // Drop packets 1 and 6 from the first stripe, packet 9 from the second, and the short final packet.
         for packet in sent.data where ![1, 6, 9, 20].contains(Int(packet.index)) { assembler.accept(packet: packet, now: 1) }
         XCTAssertTrue(assembler.takeFrames().isEmpty)
         for packet in sent.parity { assembler.accept(packet: packet, now: 2) }
@@ -65,7 +65,7 @@ final class AssemblerTests: XCTestCase {
         let sent = packets(original, id: 0)
         let assembler = FrameAssembler(now: 0)
         assembler.accept(descriptor: descriptor(id: 0, size: original.count), group: 0, now: 0)
-        // Three lost from one stripe: more than its parity can repair.
+        // Drop three packets from the first stripe, which exceeds what FEC parity can repair alone.
         for packet in sent.data where ![1, 4, 6].contains(Int(packet.index)) { assembler.accept(packet: packet, now: 1) }
         for packet in sent.parity { assembler.accept(packet: packet, now: 2) }
         XCTAssertTrue(assembler.takeFrames().isEmpty)
@@ -73,7 +73,7 @@ final class AssemblerTests: XCTestCase {
         let requests = assembler.takeRequests()
         XCTAssertEqual(requests.count, 1)
         XCTAssertEqual(requests.first?.value, [1, 0, 4, 0, 6, 0])
-        // One of the three comes back: the other two can now be repaired.
+        // Once one retransmitted packet arrives, FEC can repair the remaining two.
         assembler.accept(packet: sent.data[4], now: 11_000)
         let frames = assembler.takeFrames()
         XCTAssertEqual(frames.count, 1)
@@ -84,7 +84,7 @@ final class AssemblerTests: XCTestCase {
         let original = frame(bytes: 3 * 1024, seed: 9)
         let sent = packets(original, id: 0)
         let assembler = FrameAssembler(now: 0)
-        for packet in sent.data { assembler.accept(packet: packet, now: 1) }      // size not known yet: all are full length
+        for packet in sent.data { assembler.accept(packet: packet, now: 1) }      // frame size is unknown yet, though all packets here are full-length
         assembler.accept(descriptor: descriptor(id: 0, size: original.count), group: 0, now: 2)
         let frames = assembler.takeFrames()
         XCTAssertEqual(frames.count, 1)

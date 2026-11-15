@@ -8,10 +8,10 @@ import VRLinkAppleSession
 import VRLinkCore
 import VRLinkVisionTracking
 
-/// Everything a stream is asked for with, and fed from, that has to exist
-/// before its immersive space does: the host is connected to first, and
-/// the space is opened only when there is a picture to show in it, so
-/// that whatever the wearer was in until then (an environment, say) stays.
+/// Shared tracking, configuration, and connection state created before opening
+/// an immersive space. The client connects to the host first and opens the
+/// immersive space only once video frames arrive, keeping the user's current
+/// visionOS environment visible while connecting.
 public final class StreamInputs {
     public let connection: Connection
     public let head: HeadTracking
@@ -19,9 +19,9 @@ public final class StreamInputs {
     public let hands: HandJoints
     public let settings: SettingsStore
     public let measured: MeasuredDisplay
-    /// Pinches made at a distance; whichever display is open reports them here.
+    /// Tracks spatial pinch events forwarded from whichever immersive display is active.
     public let pinches = PinchRays()
-    /// The gaze as a compositor layer's rate map shows it.
+    /// Gaze estimator driven by the compositor layer's rasterization rate map.
     let gaze = GazeFromFoveation()
 
     public init(connection: Connection, head: HeadTracking, controllers: ControllerTracking, hands: HandJoints,
@@ -34,22 +34,22 @@ public final class StreamInputs {
         self.measured = measured
     }
 
-    /// The rates an Apple Vision Pro's displays run at, in Hz (120 only on
-    /// the M5 model). An app cannot find out which its headset has, so the
-    /// host is offered them all; a rate the display will not go to is
-    /// withdrawn by the session when it is tried.
+    /// Refresh rates supported by Apple Vision Pro displays, in Hz (120 Hz is
+    /// available only on the M5 model). Because visionOS provides no API to
+    /// query which rates the current hardware supports, we advertise all of
+    /// them to the host and let the session drop any rate the display does not adopt.
     static let displayRates: [Float] = [90, 96, 100, 120]
 
-    /// The display as last measured, its frusta scaled as the person
-    /// chose (the field-of-view setting): more or less than the display
-    /// shows. The picture is still drawn where the host rendered it: a wider
-    /// one runs off the edge of the display, a narrower one leaves a margin.
+    /// Builds the `DeviceProfile` to send to the host from the latest display
+    /// measurement, scaling eye frusta by the user's FOV settings. Quads are
+    /// still rendered at the exact frustum angles the host drew: scales above
+    /// 1.0 extend past the edges of the display, while scales below 1.0 leave margins.
     public func profileForHost() -> DeviceProfile? {
         guard var profile = measured.value?.profile else { return nil }
         let chosen = settings.current
         profile.senseControllerModels = chosen.senseControllerModels
-        // Both renderers can say where the eyes look: one from the display's
-        // rate map, the other from the Persona's eyes.
+        // Both renderers provide gaze input: CompositorDisplay reads the
+        // rasterization rate map, and the RealityKit renderer uses Persona eye tracking.
         profile.tracksGaze = true
         profile.otherRefreshRates = StreamInputs.displayRates
         profile.eyeFrusta = profile.eyeFrusta.map {
@@ -58,8 +58,8 @@ public final class StreamInputs {
         return profile
     }
 
-    /// Each hand as the host should have it now: a hand holding a tracked
-    /// controller is that controller; otherwise it is itself.
+    /// Returns the current input state for each hand: a tracked controller when
+    /// one is held on that side, or optical hand tracking otherwise.
     public func handsNow() -> [HandInput?] {
         let chosen = settings.current
         let held = controllers.states(clackSwitching: chosen.clackSwitchesToHands, head: head.latestHead())
@@ -67,7 +67,7 @@ public final class StreamInputs {
         return Side.allCases.map { side in
             if let controller = held[side.rawValue] { return .controller(controller) }
             guard var hand = bare[side.rawValue] else { return nil }
-            // The system's pinches, aimed by the eyes, in place of ours aimed by the arm.
+            // Override wrist/arm aim rays with visionOS's gaze-targeted spatial pinch rays when enabled.
             if chosen.gazePinchRays { hand.systemPinch = pinches.pinch(side) }
             return .hand(hand)
         }

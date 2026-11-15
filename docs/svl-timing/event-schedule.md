@@ -1,10 +1,11 @@
-# The client's per-frame event schedule
+# Client per-frame event schedule
 
 Sources: `XrSceneStream::OnTopOfFrame(XRQContext&)` +0x11906c,
 `QSVLClient::OnTopOfFrame(int, int)` +0xf6270, `QSVLClient::VSyncEvent(int)`
 +0xf6630, `QSVLClient::HandleEvent(VRLinkPostedEvent_t const&)` +0xf4bec,
 `SVLRoot::HandleEvent` +0x165dbc, `SVLRoot::PostMultipleEvents` +0x165fbc,
-`QSVLClient::SendPoses` +0xf4d34. All **static** unless marked.
+`QSVLClient::SendPoses` +0xf4d34. All details below are **static** unless
+marked otherwise.
 
 ## `VRLinkPostedEvent_t` (internal, 16 bytes — never on the wire)
 
@@ -48,7 +49,7 @@ def on_top_of_frame(until_display_us, period_us):
     if self.host_version < 6:                                        # +0xba8, see phase-loop.md
         standoff = (until_display_us + 10*ft + self.phase_off) % ft
         delta = standoff - self.prev_standoff
-        if delta >  ft // 2: schedule(anchor = now)                  # phase wrapped backwards: extra batch
+        if delta >  ft // 2: schedule(anchor = now)                  # phase wrapped backward: extra batch
         if delta >= -(ft // 2): schedule(anchor = now + standoff)    # normal batch (skipped on forward wrap)
         set_value("cStandoff", standoff)
         self.prev_standoff = standoff
@@ -71,15 +72,15 @@ def schedule(anchor):
 incrementing the frame index; no static caller was found (**inferred**: an
 alternative entry for platforms with a real vsync callback).
 
-So the client sends **four pose packets per display frame**, a quarter frame
-apart, tagged with a sub-index 0..3 and the frame index (**captured** in
-`vr3`, below: the quarter is a quarter of the *reported* display period, not
-of the time the frame loop actually takes). With an old host
-(version < 6) the batch is delayed by `cStandoff` after the frame wait returns;
-`cStandoff` is simply `cPhaseOff` re-expressed relative to "now" given how far
-away the display time is.
+So the client sends **four pose packets per display frame**, spaced a quarter
+frame apart and tagged with sub-index 0..3 and the frame index (**captured** in
+`vr3` below, where the step is a quarter of the *reported* display period
+rather than the actual duration of the frame loop). With a host older than
+version 6, the batch is delayed by `cStandoff` after the frame wait returns;
+`cStandoff` is `cPhaseOff` re-expressed relative to "now" given the remaining
+time until display.
 
-## The pose packet's timing header
+## Pose packet timing header
 
 Only the timing-relevant front of the packet is listed here; the pose and
 controller body is in docs/svl-tracking-input/. Offsets are from the start of
@@ -108,58 +109,63 @@ counting its 8-byte element header, 24 bytes of value. After it, the client repo
 timing event `CN Send WaitGetPoses0` (0x40, sub-index 0) or
 `CN Send WaitGetPosesN` (0x41), with the frame index as argument.
 
-Log format, sub-index 0:
+On sub-index 0, `SendPoses` logs:
 `[SVLC] SendPoses: lnFrameID=%d(%d) (mod64=%d) (mod256=%d) rst=%d toff=%d`.
 
-## Confirmed against capture `vr3`
+## Capture verification (`vr3`)
 
-`vr3`: real client under Klepton, 40.26 s, every datagram timestamped. The
-display advertised 120 Hz (`frametime` 8,333 µs); the client's frame loop
-actually ran at 108.3 Hz. 17,423 pose elements parsed; the client made 17,446
-sends and used 17,446 sequence numbers, so 23 pose datagrams are missing from
-the parsed capture (they were sent). Video began 0.926 s after the first pose
-packet. Offsets here are dataset offsets as in the table above.
+Capture `vr3` records 40.26 s of `vrlink` under Klepton with per-datagram
+timestamps. Although the display advertised 120 Hz (`frametime` 8,333 µs),
+`vrlink`'s frame loop ran at 108.3 Hz. Out of 17,446 sends (and 17,446
+sequence numbers) transmitted by `vrlink`, 17,423 pose elements were parsed,
+leaving 23 pose datagrams missing from the parsed capture. Video began 0.926 s
+after the first pose packet. Offsets below are dataset offsets matching the
+table above.
 
 ### Layout
 
-- **captured**: all 17,423 pose elements have header bytes `03 01`, both
-  other header u16s 0, byte 8 = 10, byte 0x0a = 0x20, byte 0x0b = 0 (holdoff
-  never requested), byte 9 in 0..3. The reset counter at 0x20 stayed 0.
-- **captured**: payload length is 360 (= 0x168) in 17,015 packets; the other
-  408 are 396–731, i.e. 0x168 plus appended ValueTransportSystem bytes (the
-  largest, 731, is 371 bytes of VTS data against the 0x174 = 372 budget).
-- **captured**: the page's byte offsets were right throughout: 0x0c offset
-  estimate, 0x10 / 0x14 send / build timestamps (send − build 3–15 µs,
-  median 5), 0x18 target time, 0x1c frame index.
-- **captured**: the pose element is the last element of its datagram and the
-  order is `03 11` (17 bytes), `03 07` (96 bytes = three `TransportValue_t`,
-  `SendValues(3)`), `04 0f` (the frame report, 24 bytes of value — 32 with
-  its header, which is the "32-byte type-4 packet" this page predicted),
-  `03 01` (pose). 17,020 datagrams have all four; 401 lack the `03 11` and
-  2 are report + pose only — together the first 403 datagrams, up to 4 ms
-  after the first frame descriptor. vr1's 1233 / 401 / 3 were the same pattern, undercounted.
+- **captured**: All 17,423 pose elements have header bytes `03 01`, both
+  other header u16s set to 0, byte 8 = 10, byte 0x0a = 0x20, byte 0x0b = 0
+  (holdoff never requested), and byte 9 in 0..3. The reset counter at 0x20
+  stayed 0.
+- **captured**: Payload length is 360 (= 0x168) in 17,015 packets; the other
+  408 are 396–731 bytes, i.e. 0x168 plus appended ValueTransportSystem bytes
+  (the largest, 731, carries 371 bytes of VTS data within the 0x174 = 372-byte
+  budget).
+- **captured**: All byte offsets in the table above match the wire capture:
+  0x0c offset estimate, 0x10 / 0x14 send / build timestamps (send − build is
+  3–15 µs, median 5 µs), 0x18 target time, and 0x1c frame index.
+- **captured**: The pose element is the last element of its datagram, preceded
+  by `03 11` (17 bytes), `03 07` (96 bytes = three `TransportValue_t`,
+  `SendValues(3)`), and `04 0f` (the frame report: 24 bytes of value, or 32
+  bytes including its 8-byte header). Out of 17,423 datagrams, 17,020 contain
+  all four elements, 401 omit `03 11`, and 2 carry report + pose only —
+  accounting for the first 403 datagrams up to 4 ms after the first frame
+  descriptor. The 1233 / 401 / 3 counts in `vr1` reflected the same pattern
+  with torn datagrams omitted.
 
 ### Frame counter and sub-indices
 
-- **captured**: the frame index runs 0…4,361 and increases by exactly one per
-  group, 4,361 times out of 4,361. It is constant across the sub-indices of a
-  group. (vr1 listed it as "0, 0, 1, 1, 2, 2 …": it held only some of each
-  group's packets.)
-- **captured**: 4,339 groups are the full `0, 1, 2, 3`. Frame 0 is two
-  packets, both sub-index 0, with target time 0 (sent before the first top of
-  frame). The other 22 groups lack one or two sub-indices, 23 packets in all,
-  and each sits at one of the 23 one-datagram gaps in the outbound sequence
-  numbers — they are the unparsed datagrams, not skipped sends.
-- **captured**: frame groups per second: 108.3 while streaming (mean group
-  period 9,231 µs by the build timestamp; 5th–95th percentile 8.1–10.1 ms,
-  one 20 ms gap), 108.8 before video. This is the Klepton frame loop's real
-  rate; nothing in the capture is at 90 Hz or at the advertised 120 Hz.
+- **captured**: The frame index runs from 0 to 4,361, incrementing by 1 per
+  group in all 4,361 steps and staying constant across the sub-indices of a
+  group. (`vr1` saw "0, 0, 1, 1, 2, 2 …" because torn datagrams dropped part of
+  each group.)
+- **captured**: Out of 4,362 groups, 4,339 contain the full `0, 1, 2, 3`
+  sequence. Frame 0 consists of two packets, both sub-index 0 with target time
+  0 (sent before the first `OnTopOfFrame`). The remaining 22 groups lack one or
+  two sub-indices (23 packets total), and each aligns with one of the 23
+  single-datagram gaps in outbound sequence numbers — confirming they are
+  unparsed capture datagrams rather than skipped sends.
+- **captured**: Pose groups were sent at 108.3 groups/s while streaming (mean
+  group period 9,231 µs by build timestamp; 5th–95th percentile 8.1–10.1 ms,
+  with one 20 ms gap) and 108.8 groups/s before video started. That matches
+  Klepton's actual frame-loop rate rather than 90 Hz or the advertised 120 Hz.
 
 ### Schedule within a frame
 
-Times are the build timestamp (0x14) of each sub-index minus that of
-sub-index 0 of the same frame, µs. Capture timestamps give the same figures
-to within the tracer's jitter.
+Times below are the build timestamp (0x14) of each sub-index minus that of
+sub-index 0 of the same frame, in microseconds. Capture timestamps give the
+same figures to within tracer jitter.
 
 | | static prediction (`frametime` 8,333) | before video, 101 frames: median (5th–95th) | streaming, 4,212 frames: median (5th–95th) |
 |---|---|---|---|
@@ -168,63 +174,67 @@ to within the tracer's jitter.
 | sub 3 | 6,249 | 6,249 (6,016–6,674) | 6,382 (6,051–6,554) |
 | next frame's sub 0, after sub 3 | 2,084 if the loop kept 120 Hz | 2,996 (1,351–3,971) | 2,832 (1,752–3,832) |
 
-- **captured**: so the quarter-frame spacing is confirmed, and it is a quarter
-  of the 8,333 µs display period the runtime reports, not of the ~9,231 µs the
-  loop takes: the fourth gap absorbs the difference. Jitter of one sub-index
-  against sub 0 is ±0.2 ms (5th–95th); the worst case in the run was a
-  sub-packet 5 ms late.
-- **captured**, before video (the host-version field is still 0, so the
-  `< 6` path runs): the target-time field is the batch anchor. Sub-index 0 is
-  built a median 206 µs after it (the event thread's wake-up latency), and
-  the field changes about 3.5 ms *before* the frame index does, so sub 2 and
-  sub 3 of a frame usually already carry the next batch's anchor (only 23 of
-  101 groups have one target value). This comes from the `cStandoff`
-  delay: the anchor is set at top of frame to `now + cStandoff`
-  (`cStandoff` 3,490–3,500 on the wire).
-- **captured**, streaming (host version 14, the `≥ 6` path): target −
-  sub 0 build time is 8,314 µs at the median, 8,065–8,324 (5th–95th), never
-  above 8,330: the predicted display time is top of frame plus one 8,333 µs
-  period and sub 0 is built within 0.3 ms of top of frame — no stand-off.
-  The target advances by the real loop period from frame to frame (median
-  9,169 µs). It is the same in all sub-packets of a frame in 4,208 of 4,212
-  groups; in the other 4 a sub-packet went out after the next top of frame
-  (for example frame 2,723: sub 3 was built 5.3 ms after sub 2 and carries
-  the frame index 2,723 with the next frame's target).
+- **captured**: Quarter-frame spacing is confirmed at one quarter of the
+  8,333 µs display period reported by the runtime rather than the ~9,231 µs the
+  frame loop took, with the fourth gap absorbing the difference. Jitter of a
+  sub-index relative to sub 0 is ±0.2 ms (5th–95th percentile), with a
+  worst-case delay of 5 ms.
+- **captured**: Before video starts (while `host_version` is still 0, selecting
+  the `< 6` path), the target-time field holds the batch anchor. Sub-index 0 is
+  built a median 206 µs after the anchor (event-thread wake-up latency), and
+  the target field updates about 3.5 ms *before* the frame index increments, so
+  sub 2 and sub 3 usually carry the next batch's anchor (only 23 of 101 groups
+  have a single target value). This comes from the `cStandoff` delay, where top
+  of frame sets the anchor to `now + cStandoff` (`cStandoff` = 3,490–3,500 µs
+  on the wire).
+- **captured**: Once video is streaming (host version 14, selecting the `≥ 6`
+  path), target minus sub-0 build time has a median of 8,314 µs (5th–95th
+  percentile 8,065–8,324 µs, max 8,330 µs): predicted display time is top of
+  frame plus one 8,333 µs period, and sub 0 is built within 0.3 ms of top of
+  frame with no stand-off delay. The target advances by the actual loop period
+  from frame to frame (median 9,169 µs). All sub-packets of a frame carry the
+  same target time in 4,208 of 4,212 groups; in the remaining 4 groups, a
+  delayed sub-packet went out after the next top of frame (for example, in
+  frame 2,723, sub 3 was built 5.3 ms after sub 2 and carried frame index 2,723
+  with the next frame's target).
 
-### Relation to the video coming back
+### Timing relative to downlink video
 
-- **captured**: the host sent 4,260 frames in 39.33 s — 108.4 per second by
-  its own `tx_time`, the client's frame-loop rate and not the negotiated
-  120 Hz ([refresh-rate.md](refresh-rate.md)). One video frame begins to
-  arrive in each client frame in 3,927 of 4,199 frame periods (none in 135,
-  two in 137).
-- **captured**: a frame's first descriptor arrives a median 3.4 ms after the
+- **captured**: The host sent 4,260 frames in 39.33 s — 108.4 fps by its own
+  `tx_time`, matching the client's frame-loop rate rather than the negotiated
+  120 Hz ([refresh-rate.md](refresh-rate.md)). One video frame begins arriving
+  during each client frame in 3,927 of 4,199 frame periods (none in 135, two in
+  137).
+- **captured**: A frame's first descriptor arrives a median 3.4 ms after the
   most recent sub-index 0 send (5th–95th percentile 0.7–8.6 ms); the host's
   `tx_time`, mapped to the client clock, is a median 3.1 ms after it (IQR
-  2.5–3.8 ms; last 15 s). That is less than the host's own encode time
-  (`dbgEncTimeMS` about 4.6), so the frame that arrives was started from an
-  earlier group, at least one client frame back.
-- **captured**: the host's `tsLastWGP` key is its receive time for a
-  sub-index 0 packet (166 of 167 samples; see [clock-sync.md](clock-sync.md)).
-  With its event names `SN Got WaitGetPoses0` / `…N` this says the host
-  treats sub-index 0 as the frame's "WaitGetPoses" and the other three as
-  extra samples (**inferred** for what it does with them).
+  2.5–3.8 ms over the last 15 s). Because that interval is shorter than the
+  host's encode time (`dbgEncTimeMS` ≈ 4.6 ms), each arriving video frame was
+  started from an earlier pose group at least one client frame back.
+- **captured**: The host's `tsLastWGP` key matches its receive time for a
+  sub-index 0 packet in 166 of 167 samples (see [clock-sync.md](clock-sync.md)).
+  Combined with the host timing event names `SN Got WaitGetPoses0` and
+  `SN Got WaitGetPosesN`, this indicates that the host treats sub-index 0 as
+  the frame's `WaitGetPoses` trigger and sub-indices 1..3 as supplemental pose
+  samples (**inferred**).
 - A live probe (docs/svl-values/startup-exchange.md, "Refresh rate and
-  pacing (probe)") found the host's frame rate changes when the target-time
-  field is not constant within a frame; docs/svl-tracking-input/poses.md has
-  the field's full characterization.
+  pacing (probe)") found that the host's frame rate changes when the
+  target-time field varies within a frame; see docs/svl-tracking-input/poses.md
+  for full details on that field.
 
 ## Open questions
 
-- Whether the host needs all four sub-packets or only sub-index 0.
-- What the host does when the target time changes inside a frame index: the
-  real client does it in 4 of 4,212 streaming groups and in most groups
-  before video, with no visible effect in `vr3`.
-- Meaning of the constant bytes 10 and 0x20 at offsets 8 and 0x0a.
-- What "holdoff" makes the host do (never set in `vr3`).
-- Whether the "mod64 / mod256" in the log reflects narrower frame-id fields
-  elsewhere in the protocol (the frame-report path masks decoder frame ids
-  with 0x7f — see [frame-reports.md](frame-reports.md)).
-- The schedule on a display whose frame loop really runs at the advertised
-  rate: `vr3`'s loop was 10% slow, so "fourth gap absorbs the difference" was
-  seen but a true 4 × quarter cadence was not.
+- Test whether the host requires all four sub-packets per frame or operates
+  with sub-index 0 alone.
+- Determine how the host handles target-time changes within a single frame
+  index: `vrlink` changed target time mid-group in 4 of 4,212 streaming groups
+  and in most pre-video groups with no visible effect in `vr3`.
+- Identify the meaning of the constant bytes 10 and 0x20 at offsets 8 and 0x0a.
+- Determine what setting the "holdoff" flag at offset 0x0b causes the host to
+  do (never set in `vr3`).
+- Check whether `mod64` and `mod256` in the `SendPoses` log correspond to
+  narrower frame-id fields elsewhere in the protocol (the frame-report path
+  masks decoder frame ids with 0x7f; see [frame-reports.md](frame-reports.md)).
+- Capture the sub-packet schedule on a display whose frame loop runs at the
+  full advertised refresh rate (`vr3`'s loop ran ~10% slow, widening the fourth
+  sub-packet gap rather than running at an even 4 × quarter-frame cadence).

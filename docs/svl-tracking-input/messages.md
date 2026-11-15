@@ -1,7 +1,8 @@
-# Message envelope and type table (as seen above the transport)
+# Message envelope and type table
 
-The transport hands this layer a `dataset*`. Only the first 8 bytes are common;
-the layer documented here never looks at the UDP header (docs/svl-transport/).
+The transport layer hands this layer a `dataset*`. Only the first 8 bytes are
+common across message types; this layer never inspects the outer UDP header
+(docs/svl-transport/).
 
 ## `dataset` header
 
@@ -14,20 +15,22 @@ the layer documented here never looks at the UDP header (docs/svl-transport/).
 | 0x06 | u16 | per-type; 0 for poses/eye/hand; echo uses it as a byte count | **static** |
 | 0x08 | … | payload | |
 
-Little-endian throughout (**static**: plain arm64 stores).
+All multi-byte fields are little-endian (**static**, written with plain arm64
+stores).
 
 ## Message types seen in this layer
 
-Dispatch chain for received unreliable messages (**static**):
+Received unreliable messages pass through the dispatch chain
 `QSVLClientXR::RXUnreliableStream` (0xfab44) → `QSVLClient::RXUnreliableStream`
-(0xf5c00) → `SVLRoot::RXUnreliableStream` (0x164ae0). Reliable:
-`QSVLClientXR::RXReliableStream` (0xfab40) → `QSVLClient::RXReliableStream`
-(0xf5e40) → `SVLRoot::RXReliableStream` (0x164adc, empty).
+(0xf5c00) → `SVLRoot::RXUnreliableStream` (0x164ae0) (**static**). Reliable
+messages pass through `QSVLClientXR::RXReliableStream` (0xfab40) →
+`QSVLClient::RXReliableStream` (0xf5e40) → `SVLRoot::RXReliableStream`
+(0x164adc, empty).
 
 | type | dir | name / meaning | handled at | doc |
 |---|---|---|---|---|
 | 0x01 | C→H | pose + input packet (plus piggy-backed VTE bytes) | built in `QSVLClient::SendPoses` 0xf4d34 | [poses.md](poses.md) |
-| 0x01 | H→C | *any* type-1 message makes the client adopt the link it arrived on as its active `SVLDataLink` (`this+0x140 = link`); the body is not parsed here | `SVLRoot::RXUnreliableStream` 0x164ae0 | **inferred**: the host's mirror "frame/pose" packet; body unknown from this binary's upper layer |
+| 0x01 | H→C | *any* type-1 message makes `vrlink` adopt the link it arrived on as its active `SVLDataLink` (`this+0x140 = link`); the body is not parsed here | `SVLRoot::RXUnreliableStream` 0x164ae0 | **inferred**: the host's mirror "frame/pose" packet; body unknown from this binary's upper layer |
 | 0x07 | H→C | peer value settings: array of 32-byte `TransportValue_t`, count = len >> 5 | `SVLRoot::RXUnreliableStream` → `ParsePeerValueSettings` | docs/svl-values/ |
 | 0x0d | H→C | ValueTransportSystem bytes, `len` bytes at +8 | `SVLRoot::RXUnreliableStream` → `ValueTransportSystem::RXMessage` | docs/svl-values/ |
 | 0x0e | H→C | `SYST_SERVER_SHUTDOWN` (log string `Received SYST_SERVER_SHUTDOWN`); raises client event 1 with zero payload to the app callback at `this+0x3f20` | `QSVLClientXR::RXUnreliableStream` 0xfab44 | [events-prompts.md](events-prompts.md) |
@@ -38,15 +41,16 @@ Dispatch chain for received unreliable messages (**static**):
 | 0x15 | C→H | echo reply | same | below |
 | 0x16 | H→C | haptics, two 19-byte events | `QSVLClient::RXUnreliableStream` 0xf5c00 | [haptics.md](haptics.md) |
 | 0x17 | C→H | hand tracking skeleton (one message per hand) | `QSVLClientXR::HandleHandTracking` 0xfb794 | [skeleton.md](skeleton.md) |
-| 0x18 | H→C | host address list: 179 bytes in `vr3`, one record per host interface address (family, port 10400, prefix length, address), every 2 s once video runs. **captured** | **none** — no case for it in any of the three `RXUnreliableStream` functions (0xfab44 → 0xf5c00 → 0x164ae0); this client build drops it silently | docs/svl-transport/host-address-list.md |
+| 0x18 | H→C | host address list: 179 bytes in `vr3`, one record per host interface address (family, port 10400, prefix length, address), every 2 s once video runs. **captured** | **none** — no case for it in any of the three `RXUnreliableStream` functions (0xfab44 → 0xf5c00 → 0x164ae0); `vrlink` drops it silently | docs/svl-transport/host-address-list.md |
 
-Types not listed (video, audio, FEC, retransmit, timing) are dispatched below
-this layer or in other classes; see docs/svl-video/, docs/svl-audio/,
-docs/svl-timing/.
+Types not listed here (video, audio, FEC, retransmit, timing) are dispatched
+below this layer or under other class bytes; see docs/svl-video/,
+docs/svl-audio/, and docs/svl-timing/.
 
 ### 0x14 / 0x15 echo
 
-**static** (`SVLRoot::RXUnreliableStream` 0x164ae0):
+In `SVLRoot::RXUnreliableStream` (0x164ae0, **static**), `vrlink` handles
+`0x14` echo requests as follows:
 
 ```
 reply = zeroed 0x408 bytes
@@ -58,39 +62,40 @@ reply[8 : 8+n] = req[8 : 8+n]
 SubmitMessage(link, reply, false, true)
 ```
 
-So the request's `+6` field says how many bytes the host wants back and the
-reply is zero-padded to that length. **inferred**: an MTU / path / bandwidth
-probe (the SVLRoot string key `sNetworkTest` exists). Confirm by capture: a
-`03 14` message from the host answered by a `03 15` of length `req[6..8]`.
+The request's `+6` field specifies how many payload bytes the host wants echoed
+back, and `vrlink` zero-pads the reply to that length (capped at `0x400`). This
+is likely an MTU, path, or bandwidth probe (**inferred**; `SVLRoot` defines the
+string key `sNetworkTest`). A wire capture of a host `03 14` packet followed by
+a `03 15` reply of length `req[6..8]` would confirm it.
 
 ## Capture check
 
-**captured** (one macOS-hosted Klepton session; wire framing per
-docs/svl-transport/: datasets `[u8 class][u8 type][u16 a][u16 len][u16 b]`
-concatenated in a datagram):
+In an initial macOS-hosted Klepton session (**captured**, `vr1`; wire framing
+per docs/svl-transport/ concatenates `[u8 class][u8 type][u16 a][u16 len][u16 b]`
+datasets inside each UDP datagram; see individual pages for `vr3` counts):
 
-- Outbound datasets from this layer: `3/0x01` pose (1637), `3/0x11` eye
-  (1241), `3/0x07` values (1637); class byte 3 confirmed for all, and
+- Outbound datasets from this layer: `3/0x01` pose (1,637), `3/0x11` eye
+  (1,241), `3/0x07` values (1,637); class byte 3 is confirmed for all, with
   `a = b = 0` for pose and eye.
 - Inbound `3/0x0d` VTS (28) confirmed.
-- **Not seen** in this session: `0x12` prompt, `0x14`/`0x15` echo, `0x16`
-  haptics, `0x17` hand tracking, `0x0e` shutdown. Their layouts remain
-  **static** only.
-- An inbound class `8`, type `0x06` dataset was seen once: 27 payload bytes =
-  4 binary bytes followed by ASCII `[SVLS] ResetVideoStream`. This is a host
-  debug/log text message; see [events-prompts.md](events-prompts.md).
-- Typical outbound datagram order `[3/0x11] [3/0x07] [4/0x0f] [3/0x01]`:
-  eye is queued and flushed with the next pose, which supports reading the
-  second `SubmitMessage` boolean as "flush now".
+- `0x12` prompt, `0x14`/`0x15` echo, `0x16` haptics, `0x17` hand tracking, and
+  `0x0e` shutdown did not appear in this session (**captured** negatives), so
+  their layouts remain **static** only.
+- One inbound class `8`, type `0x06` dataset was captured: 27 payload bytes
+  consisting of 4 binary bytes followed by ASCII `[SVLS] ResetVideoStream`. This
+  is a host debug/log text message; see [events-prompts.md](events-prompts.md).
+- Typical outbound datagram order is `[3/0x11] [3/0x07] [4/0x0f] [3/0x01]`:
+  the eye packet is queued and flushed with the next pose packet, supporting
+  the interpretation of the second `SubmitMessage` boolean as "flush now".
 
 ## Open questions / to confirm on the wire
 
-- What byte 0 (class) is on H→C messages 0x0e/0x12/0x16 (the client never
-  checks it here; C→H class 3 is captured).
-- Whether `0x12` prompts actually arrive on the reliable stream, the unreliable
-  one, or both.
-- The body of the host's type-`0x01` message (only its arrival matters here).
-- The two booleans of `SVLDataLink::SubmitMessage(dataset*, bool, bool)`:
-  poses and echo use `(false, true)`, eye and hand use `(false, false)`.
-  **inferred**: the second is "flush now / high priority". The transport doc
-  owns this.
+- What byte 0 (class) is on H→C messages 0x0e/0x12/0x16 (`vrlink` never checks
+  it here; C→H class 3 is captured).
+- Whether `0x12` prompts arrive on the reliable stream, the unreliable stream,
+  or both.
+- The body of the host's type-`0x01` message (only its arrival is used here).
+- Clarify the two booleans of `SVLDataLink::SubmitMessage(dataset*, bool, bool)`:
+  poses and echo pass `(false, true)`, whereas eye and hand tracking pass
+  `(false, false)`. The second boolean appears to mean "flush now / high
+  priority" (**inferred**); see docs/svl-transport/.

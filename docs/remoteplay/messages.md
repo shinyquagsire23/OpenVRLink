@@ -1,30 +1,30 @@
 # Messages on UDP 27036
 
-The bodies of the broadcast protocol's datagrams ([broadcast-packet.md](broadcast-packet.md))
-are protobuf messages. This page lists the messages and fields the VR path
-uses, by field number and type: enough to build or parse them with any
-protobuf library, or by hand (`client/Sources/VRLinkCore/Protobuf.swift`
-does it by hand). The probe builds its message classes from the same table
-(`prototype/minimal/ovrlink/proto/__init__.py`), and this page is generated
-from it.
+Broadcast protocol datagram payloads ([broadcast-packet.md](broadcast-packet.md))
+are serialized protobuf messages. This page lists the messages and fields used
+by the VR Link path with their field numbers and wire types—enough to encode or
+decode them with any protobuf library or by hand (as
+`client/Sources/VRLinkCore/Protobuf.swift` does). The Python probe builds its
+message classes from the same schema table
+(`prototype/minimal/ovrlink/proto/__init__.py`), which also generates this page.
 
-This page covers only part of Steam's definition. Hosts send fields that are not
-listed here; a protobuf parser skips them. The full definitions are embedded
-in the Steam Link client as serialized descriptors, and
-`prototype/minimal/tools/extract_protos.py` will recover them from a copy of
-it for study; they are Valve's and are not kept in this repository. That is
-also where the flat (non-VR) Remote Play messages on port 27031 are to be
-found ([vr-vs-flat.md](vr-vs-flat.md)).
+Only the subset of Steam's schema used by VR Link is listed here; hosts send
+additional fields that standard protobuf parsers skip. Complete serialized
+protobuf descriptors are embedded in the Steam Link binary and can be extracted
+locally for study using `prototype/minimal/tools/extract_protos.py` (they belong
+to Valve and are not checked into this repository). Those descriptors also
+define the flat (non-VR) Remote Play messages used on UDP port 27031
+([vr-vs-flat.md](vr-vs-flat.md)).
 
-Evidence: field numbers and types are **static** (from those descriptors);
-which fields are used, and with what values, is **captured** and described
-on the pages for [discovery](discovery.md), [pairing](pairing.md) and the
-[session request](session-request.md). Every field is optional on the wire
-as far as a client need care.
+Field numbers and types come from **static** descriptor extraction, while active
+fields and concrete values are **captured** and documented in
+[discovery.md](discovery.md), [pairing.md](pairing.md), and
+[session-request.md](session-request.md). On the wire, a client can treat every
+field as optional.
 
 ## Message types
 
-The header's `msg_type` says what the body is.
+The header's `msg_type` field selects the body message type:
 
 | number | name | body |
 |---|---|---|
@@ -257,9 +257,10 @@ No fields.
 | 14 | `k_ERemoteDeviceStreamingGameLaunchFailed` |
 | 15 | `k_ERemoteDeviceStreamingSteamVRNotInstalled` |
 
-Three fields of `CMsgRemoteDeviceStreamingRequest` and one of the response
-are enumerations in the full definition and plain integers here; the values
-the VR path uses are: `supported_transport` 1 (UDP), 2 (UDP relay), 4 (SDR);
-`form_factor` 5 (VR headset); `stream_interface` 4 (SteamVR); the
-response's `transport` 0 (none: the VR session is not on the flat
-transport). The ticket's `usage` is 0 (streaming device).
+Three fields in `CMsgRemoteDeviceStreamingRequest` and one field in
+`CMsgRemoteDeviceStreamingResponse` are typed as enums in Valve's full schema
+and encoded as plain integers here. On the VR Link path, their values are:
+`supported_transport` `1` (UDP), `2` (UDP relay), `4` (SDR); `form_factor` `5`
+(VR headset); `stream_interface` `4` (SteamVR); and response `transport` `0`
+(none, since VR Link uses SVL rather than the flat Remote Play transport). In
+`CKeyEscrow_Ticket`, `usage` is `0` (streaming device).

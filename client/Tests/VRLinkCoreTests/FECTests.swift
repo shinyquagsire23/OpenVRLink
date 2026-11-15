@@ -16,8 +16,8 @@ final class FECTests: XCTestCase {
         bytes.reduce(0xcbf2_9ce4_8422_2325) { ($0 ^ UInt64($1)) &* 0x100_0000_01b3 }
     }
 
-    /// The expected hashes come from the Python in docs/svl-video/fec.md,
-    /// which reproduced all 8,404 parity packets of a real host's stream.
+    /// The expected hashes come from the Python reference script in docs/svl-video/fec.md,
+    /// which reproduced all 8,404 parity packets from a captured host stream.
     func testParityMatchesTheDocumentedCode() {
         let parity = FEC.encode(stripe())
         XCTAssertEqual(fnv(parity.p), 0x0fb8_6993_e7b4_0525)

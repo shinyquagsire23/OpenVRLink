@@ -4,8 +4,8 @@
 
 import Foundation
 
-/// The cryptography of Steam's pairing protocol (docs/remoteplay/crypto.md),
-/// built from standard operations that the system provides (`Primitives`).
+/// Cryptographic operations for Steam's Remote Play pairing protocol
+/// (docs/remoteplay/crypto.md), built on platform `Primitives`.
 public enum SteamCrypto {
     static let block = Primitives.block
 
@@ -20,7 +20,7 @@ public enum SteamCrypto {
         return wrappedIV + body
     }
 
-    /// Nil on a wrong key (bad padding) or malformed input.
+    /// Decrypts a payload produced by `encrypt`, returning nil on malformed input or invalid padding (wrong key).
     public static func decrypt(_ ciphertext: Bytes, key: Bytes) -> Bytes? {
         guard ciphertext.count >= 2 * block, ciphertext.count % block == 0,
               let iv = Primitives.aesBlock(Bytes(ciphertext.prefix(block)), key: key, encrypting: false)

@@ -11,8 +11,8 @@ import VRLinkVisionCompositor
 import VRLinkAppleSession
 import VRLinkVisionTracking
 
-/// OpenVRLink for visionOS, first draft: a small window to pick a host, and
-/// an immersive space that shows the stream.
+/// visionOS app entry point, providing a compact host-picker window and
+/// immersive spaces for streaming and calibration.
 
 struct StreamLayerConfiguration: CompositorLayerConfiguration {
     func makeConfiguration(capabilities: LayerRenderer.Capabilities, configuration: inout LayerRenderer.Configuration) {
@@ -20,13 +20,13 @@ struct StreamLayerConfiguration: CompositorLayerConfiguration {
         configuration.depthFormat = .depth32Float
         let foveated = capabilities.supportsFoveation
         configuration.isFoveationEnabled = foveated
-        // Room for drawing at the full quality the displays can show: this
-        // sets how large the drawable's textures may be, not the quality
-        // drawn at (the ALVR visionOS client does the same).
+        // Allow full-resolution drawable textures when foveation is active.
+        // This caps the maximum texture allocation rather than forcing the
+        // render resolution (matching the ALVR visionOS client).
         if foveated, #available(visionOS 26.0, *) {
             configuration.maxRenderQuality = .init(1.0)
         }
-        // Both eyes as layers of one texture, which the renderer draws in one pass.
+        // Prefer a layered texture array so both eyes can be rendered in a single pass.
         let layouts = capabilities.supportedLayouts(options: foveated ? [.foveationEnabled] : [])
         configuration.layout = layouts.contains(.layered) ? .layered : .dedicated
     }
@@ -47,7 +47,7 @@ struct OpenVRLinkApp: App {
     @StateObject private var faceCalibration = FaceCalibrationRun()
     @StateObject private var keptFaceCalibration = Kept<FaceCalibrationSpace>()
     private static var trackingStarted = false
-    /// What a stream is asked for with: made on first use, since it is made of the above.
+    /// Lazily initialized bundle of tracking and session dependencies passed to the renderer.
     private let keptInputs = Kept<StreamInputs>()
     private var streamInputs: StreamInputs {
         keptInputs.value {
@@ -55,20 +55,20 @@ struct OpenVRLinkApp: App {
                          settings: store, measured: measured)
         }
     }
-    /// The version this app was when it last ran here, to notice an update.
+    /// Tracks the last launched app version so we can show release notes after an update.
     @AppStorage("lastUsedAppVersion") private var lastUsedAppVersion = "never launched"
     @State private var showChanges = false
 
     init() {
-        // A log line written after the console that launched the app has
-        // gone away must not end the app (it did: "terminated due to signal 13").
+        // Ignore SIGPIPE so writing logs after a debugging console disconnects
+        // doesn't crash the app with signal 13.
         signal(SIGPIPE, SIG_IGN)
     }
 
     var body: some Scene {
         let inputs = streamInputs
         WindowGroup(id: "entry") {
-            // Two tabs, which visionOS shows as an ornament beside the window.
+            // visionOS renders the TabView bar as a floating ornament beside the window.
             TabView {
                 EntryView(connection: connection, homeButton: controllers.homeButton, store: store, inputs: inputs,
                           persona: persona)
@@ -79,18 +79,18 @@ struct OpenVRLinkApp: App {
                                 faceCalibration: faceCalibration, persona: persona)
                     .tabItem { Label("Experiments", systemImage: "flask") }
             }
-            // With the scene's `.contentSize` below, a window of one size.
+            // Combined with `.windowResizability(.contentSize)` below, locks the window to a fixed size.
             .frame(width: EntryView.windowSize.width, height: EntryView.windowSize.height)
             .onAppear {
-                // Once for each version of the app: say what is new in it.
+                // Show release notes on the first launch of a new version.
                 guard lastUsedAppVersion != AppVersion.current else { return }
                 lastUsedAppVersion = AppVersion.current
                 showChanges = true
             }
-            // A sheet: visionOS shows it as a window of its own in front of this one.
+            // Present release notes as a modal sheet in front of the main window.
             .sheet(isPresented: $showChanges) { ChangesView() }
             .task {
-                // Once, however often the window is closed and opened again.
+                // Start tracking providers once across window close/reopen cycles.
                 guard !OpenVRLinkApp.trackingStarted else { return }
                 OpenVRLinkApp.trackingStarted = true
                 head.start()
@@ -105,17 +105,17 @@ struct OpenVRLinkApp: App {
                 CompositorDisplay(layerRenderer, inputs: inputs)?.start()
             }
         }
-        // Mixed, so the system does not fence the wearer into the small area a
-        // fully immersive space allows; the picture itself still covers the view.
+        // Use `.mixed` immersion so visionOS doesn't enforce the tight movement
+        // boundary of `.full`, even though our video quad still fills the view.
         .immersionStyle(selection: .constant(.mixed), in: .mixed)
-        // The wearer's real hands, cut out of the cameras' view and laid over the picture.
+        // Optionally composite the user's real hands on top of the streamed video.
         .upperLimbVisibility(store.settings.showHandsOverlaid ? .visible : .hidden)
-        // The menu that appears on looking at a raised palm, among others.
+        // Optionally hide system overlays such as the palm-up hand menu.
         .persistentSystemOverlays(store.settings.hideSystemOverlays ? .hidden : .automatic)
 
-        // Experiment: the stream drawn by RealityKit.
+        // Experimental RealityKit-based stream renderer.
         ImmersiveSpace(id: "stream-realitykit") {
-            // The same display for as long as the space is open, however often this is asked.
+            // Reuse the same display instance across SwiftUI view evaluations while the space stays open.
             if let display = keptDisplay.value(unless: \.stopped, make: {
                 RealityKitDisplay(inputs: inputs, persona: persona)
             }) {
@@ -126,8 +126,8 @@ struct OpenVRLinkApp: App {
         .upperLimbVisibility(store.settings.showHandsOverlaid ? .visible : .hidden)
         .persistentSystemOverlays(store.settings.hideSystemOverlays ? .hidden : .automatic)
 
-        // A compositor layer opened only to learn what the displays are
-        // like, before the first connection (`MeasuredDisplay`).
+        // Temporary compositor space opened briefly before the first connection
+        // to query display FOV, resolution, and refresh rates (`MeasuredDisplay`).
         ImmersiveSpace(id: "measure") {
             CompositorLayer(configuration: StreamLayerConfiguration()) { layerRenderer in
                 CompositorDisplay(layerRenderer, inputs: inputs, measureOnly: true)?.start()
@@ -135,7 +135,7 @@ struct OpenVRLinkApp: App {
         }
         .immersionStyle(selection: .constant(.mixed), in: .mixed)
 
-        // The face calibration of the Persona experiment: expressions to hold.
+        // Immersive space for calibrating Persona-based facial expression tracking.
         ImmersiveSpace(id: "face-calibration") {
             if let space = keptFaceCalibration.value(unless: \.stopped, make: {
                 FaceCalibrationSpace(head: head, persona: persona, store: store, run: faceCalibration)
@@ -146,7 +146,7 @@ struct OpenVRLinkApp: App {
         .immersionStyle(selection: .constant(.mixed), in: .mixed)
         .upperLimbVisibility(.visible)
 
-        // The gaze calibration of the Persona experiment: dots to look at and pinch.
+        // Immersive space for calibrating Persona-based eye gaze tracking.
         ImmersiveSpace(id: "calibration") {
             if let space = keptCalibration.value(unless: \.stopped, make: {
                 GazeCalibrationSpace(head: head, persona: persona, store: store, run: calibration)
@@ -159,12 +159,11 @@ struct OpenVRLinkApp: App {
     }
 }
 
-/// Which version of the app this is, and what is new in it.
-/// What is new in this version, once after each update: a sheet a little
-/// narrower than the app's window, so that the lines read as a list.
+/// Modal sheet displaying release notes after an app update, sized slightly
+/// smaller than the main window.
 private struct ChangesView: View {
     @Environment(\.dismiss) private var dismiss
-    /// How much narrower and shorter than the window, in points.
+    /// Size reduction relative to `EntryView.windowSize`, in points.
     static let inset: CGFloat = 40
 
     var body: some View {
@@ -183,7 +182,7 @@ private struct ChangesView: View {
 }
 
 enum AppVersion {
-    /// As in "0.1.0 build 1".
+    /// Formatted version string, e.g. "0.1.0 build 1".
     static let current: String = {
         let info = Bundle.main.infoDictionary
         let version = info?["CFBundleShortVersionString"] as? String ?? "?"
@@ -217,8 +216,8 @@ enum AppVersion {
     """
 }
 
-/// The app's icon, flat: its three layers one over the other, cut round as
-/// visionOS shows it.
+/// Renders the three-layer app icon clipped to a circle, matching the visionOS
+/// home screen appearance.
 struct AppIconView: View {
     var body: some View {
         ZStack {
@@ -232,8 +231,8 @@ struct AppIconView: View {
     }
 }
 
-/// Holds on to one object across the many times SwiftUI asks a scene for
-/// its content, and makes a new one only when the old one is finished with.
+/// Caches an object instance across repeated SwiftUI scene body evaluations,
+/// recreating it only once it marks itself finished.
 @MainActor
 final class Kept<Value: AnyObject>: ObservableObject {
     private var kept: Value?
@@ -244,7 +243,7 @@ final class Kept<Value: AnyObject>: ObservableObject {
         return kept
     }
 
-    /// The one object, made the first time it is asked for.
+    /// Returns the cached instance, creating it on first access.
     func value(make: () -> Value) -> Value {
         if let kept { return kept }
         let made = make()
@@ -262,30 +261,29 @@ struct EntryView: View {
     @Environment(\.dismissWindow) private var dismissWindow
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
     @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
-    /// The window is this size and cannot be made another.
+    /// Fixed window dimensions in points.
     static let windowSize = CGSize(width: 640, height: 480) // God's intended resolution
     @AppStorage("typedAddress") private var typedAddress = ""
-    /// What the computer at the typed address runs: an address alone does not say.
+    /// Server protocol for manual IP connections, since we can't infer it from the address.
     @AppStorage("typedAddressKind") private var typedKind = HostKind.steam
     @State private var askingForAddress = false
     @State private var typedPin = ""
 
-    /// Connect to `address`, and open the immersive space when there is
-    /// a picture to show in it: until then the wearer stays where they
-    /// were, in an environment for one.
+    /// Connects to `address` and waits for the first decoded video frame before
+    /// opening the immersive space so the user isn't placed in a blank scene.
     private func stream(from address: String, kind: HostKind) {
         Task {
             connection.hostAddress = address
             connection.hostKind = kind
             connection.waitingForPicture = true
             defer { connection.waitingForPicture = false }
-            // Only a compositor layer is told what the displays are like:
-            // one is opened for a moment to find out, once.
+            // Display metrics are only exposed through a CompositorLayer, so we
+            // briefly open a measurement space once before the first connection.
             let measured = inputs.measured
             if measured.value == nil {
                 connection.status = "Measuring the displays"
                 if case .opened = await openImmersiveSpace(id: "measure") {
-                    // It waits for the views to settle, which takes a few seconds (`CompositorDisplay.settledWithin`).
+                    // Wait for the compositor view configuration to settle (`CompositorDisplay.settledWithin`).
                     for _ in 0..<200 where measured.value == nil && connection.waitingForPicture {
                         try? await Task.sleep(for: .milliseconds(50))
                     }
@@ -293,14 +291,14 @@ struct EntryView: View {
                     try? await Task.sleep(for: .milliseconds(300))
                 }
             }
-            // Stopped meanwhile.
+            // Bail out if the user canceled while measuring.
             guard connection.waitingForPicture else { return }
             let realityKit = store.settings.realityKitRenderer
             guard realityKit ? RealityKitDisplay.connect(inputs, persona: persona) : CompositorDisplay.connect(inputs) else {
                 connection.status = "Could not measure the displays"
                 return
             }
-            // Its progress, a pairing PIN and its failure are all shown in the window meanwhile.
+            // Connection progress, pairing PIN prompts, and errors are displayed in the window while waiting.
             while !connection.hasPicture {
                 guard connection.active, connection.waitingForPicture else { return }
                 try? await Task.sleep(for: .milliseconds(20))
@@ -315,20 +313,20 @@ struct EntryView: View {
         }
     }
 
-    /// What one button of the gallery of computers shows.
+    /// Renders a button tile for a discovered host.
     private func hostTile(_ name: String, glyph: String) -> some View {
         VStack(spacing: 12) {
             Image(systemName: glyph).font(.system(size: 56))
             Text(name).lineLimit(1).fixedSize()
         }
         .padding(.horizontal, 12)
-        // Wide, and wider still for a long name, so the name is never cut short.
+        // Enforce a minimum tile size while allowing wider tiles so long hostnames aren't truncated.
         .frame(minWidth: 240, minHeight: 135)
     }
 
     var body: some View {
         VStack(spacing: 10) {
-            // Name and version in the top left corner, the icon in the top right.
+            // Header with app title/version on the left and icon on the right.
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("OpenVRLink").font(.largeTitle)
@@ -342,8 +340,8 @@ struct EntryView: View {
                 Text(connection.status).font(.title3)
                 Button("Stop") {
                     Task {
-                        // The connection first: the space going away also
-                        // stops it, and that way the host is not told goodbye.
+                        // Stop the connection with `leaving: true` before dismissing the space;
+                        // dismissing first triggers a non-leaving stop that won't tell the host to exit.
                         connection.waitingForPicture = false
                         connection.stop(leaving: true)
                         if connection.immersed { await dismissImmersiveSpace() }
@@ -351,26 +349,26 @@ struct EntryView: View {
                     }
                 }
             } else {
-                // Blank until there is one, and keeping its place meanwhile.
+                // Use a space when empty to preserve vertical layout height before hosts appear.
                 Text(connection.hosts.isEmpty ? " " : "Found On Your Network:").font(.headline)
                 ScrollView(.horizontal) {
                     HStack(spacing: 16) {
                         ForEach(connection.hosts) { host in
                             Button { stream(from: host.address, kind: host.kind) } label: {
-                                // A computer may be found twice, once for each thing it runs.
+                                // A machine running both Steam and WiVRn will appear twice, so label WiVRn entries.
                                 hostTile(host.kind == .steam ? host.name : host.name + " (WiVRn)", glyph: "desktopcomputer")
                             }
                             .buttonBorderShape(.roundedRectangle(radius: 24))
                         }
                         if connection.hosts.isEmpty {
-                            // Stands where the first computer will, so nothing moves when it is found.
+                            // Placeholder tile matching host tile dimensions so the layout doesn't jump on discovery.
                             Button {} label: { hostTile("Searching...", glyph: "magnifyingglass") }
                                 .buttonBorderShape(.roundedRectangle(radius: 24))
                                 .disabled(true)
                         }
                     }
                     .padding(.horizontal, 32)
-                    // In the middle while they fit; scrolling once they do not.
+                    // Center tiles when they fit in the window, and scroll horizontally when they overflow.
                     .frame(minWidth: EntryView.windowSize.width)
                 }
                 .scrollIndicators(.hidden)
@@ -379,7 +377,7 @@ struct EntryView: View {
                     Label("Connect by IP Address", systemImage: "network")
                 }
                 if homeButton.delivery == .systemKeepsIt {
-                    // The controller's Home button only reaches the app if the person allows it.
+                    // Prompt the user if visionOS is still intercepting the controller Home button.
                     Button("Let the controller's Home button open SteamVR") { homeButton.openSettings() }
                         .font(.callout)
                 }
@@ -389,7 +387,7 @@ struct EntryView: View {
         }
         .padding(32)
         .task { connection.searchForHosts() }
-        // A WiVRn host that has not met this headset shows a PIN and waits for it.
+        // Prompt for the pairing PIN displayed on an unpaired WiVRn host.
         .sheet(isPresented: Binding(get: { connection.askingForPin },
                                     set: { if !$0, connection.askingForPin { connection.answerPin(nil) } })) {
             VStack(spacing: 20) {
@@ -440,11 +438,11 @@ struct EntryView: View {
     }
 }
 
-/// Everything the person can choose, saved as it is changed.
+/// User preferences form; changes are persisted immediately.
 struct SettingsView: View {
     @ObservedObject var store: SettingsStore
 
-    /// The chroma key color as a color picker wants it. Kept as sRGB values, the way the picker shows them.
+    /// Bridges the stored sRGB float array to a SwiftUI `Color` binding for `ColorPicker`.
     private var keyColor: Binding<Color> {
         Binding(
             get: {
@@ -483,7 +481,7 @@ struct SettingsView: View {
             Section("Chroma key") {
                 Toggle("Enable Chroma-keyed passthrough", isOn: $store.settings.chromaKey)
                 ColorPicker("Color", selection: keyColor, supportsOpacity: false)
-                // Below the first distance a color is all room; above the second, all picture.
+                // Colors closer than `chromaKeyNear` become fully transparent (passthrough); colors beyond `chromaKeyFar` stay opaque.
                 slider("Min Color Distance", $store.settings.chromaKeyNear,
                        in: 0...max(0.01, store.settings.chromaKeyFar - 0.01), step: 0.01)
                 slider("Max Color Distance", $store.settings.chromaKeyFar, in: 0.01...1, step: 0.01)
@@ -508,7 +506,7 @@ struct SettingsView: View {
 }
 
 
-/// Things that may not work: off unless asked for.
+/// Experimental features, disabled by default.
 struct ExperimentsView: View {
     @ObservedObject var store: SettingsStore
     @ObservedObject var connection: Connection

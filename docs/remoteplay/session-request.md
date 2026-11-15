@@ -1,8 +1,8 @@
-# Starting a session, and where `sArgs` comes from
+# Session request and `sArgs`
 
 ## Exchange
 
-**Captured** end to end with an already-paired device (times from one run):
+**Captured** end to end with an already-paired device (timestamps from one run):
 
 | t | direction | message |
 |---|---|---|
@@ -11,17 +11,18 @@
 | | → | `ProofResponse { response: 48 bytes, request_id, updated_secret: false }` |
 | +1 s | → | `StreamingRequest` again (new `device_token`, same `request_id`) |
 | | ← | `StreamingResponse { request_id, result: InProgress }` |
-| +2 s, +3 s | → | `StreamingRequest` again, once a second |
+| +2 s, +3 s | → | `StreamingRequest` again, once per second |
 | ~+4 s | ← | `StreamingResponse { request_id, result: Success, port: 0, encrypted_session_key: 48 bytes, transport: k_EStreamTransportNone, relay_server: "", cert: 192 hex chars }` |
 
-The client resends the request every second until a final answer arrives
-(`SendStartStreamingRequest`, +0xf94690: next send at `time() + 1`), and drops
-any message whose `request_id` is not the current one (`Received stale …`).
-The roughly four seconds is the host starting SteamVR.
+The client resends `StreamingRequest` once per second until a final response
+arrives (`SendStartStreamingRequest`, +0xf94690: schedules next send at
+`time() + 1`), ignoring any packet whose `request_id` does not match the active
+request (`Received stale …`). The ~4 s `InProgress` window corresponds to the
+host launching SteamVR.
 
 ### `StreamingRequest` (5)
 
-As sent by the VR client — **captured**:
+Fields sent by the Steam Link shell in VR mode — **captured**:
 
 ```
 request_id: <random u32>
@@ -40,19 +41,22 @@ gamepad_count: 0                  gameid: 0
 stream_interface: k_EStreamInterfaceSteamVR       (4)
 ```
 
-`stream_interface = 4` is what makes this a VR Link request rather than a flat
-Remote Play one. The resolution is the shell's 2D panel size and is
-**inferred** to be irrelevant to VR (the stream came up at 1536x6144).
+Setting `stream_interface = 4` (`k_EStreamInterfaceSteamVR`) selects a VR Link
+session instead of a flat Remote Play session. `maximum_resolution_x` and
+`maximum_resolution_y` come from the 2D Steam Link shell panel size and are
+**inferred** to be ignored for VR sessions (the resulting VR stream ran at
+1536x6144).
 
 ### Proof
 
-`response = symmetric_encrypt(challenge, secret)`
-(`HandleStreamingProofRequest`, +0xf99418). 16 bytes of challenge become 48
-bytes: wrapped IV, one data block, one block of padding — **captured** length.
-See [crypto.md](crypto.md) for `update_secret`.
+The client replies with `response = symmetric_encrypt(challenge, secret)`
+(`HandleStreamingProofRequest`, +0xf99418). Encrypting the 16-byte challenge
+produces 48 bytes (16-byte encrypted IV, one 16-byte ciphertext block, and one
+16-byte PKCS#7 padding block — **captured** length). See [crypto.md](crypto.md)
+for `update_secret`.
 
-A host that does not recognize the device answers
-`StreamingResponse { result: Unauthorized }` instead; go to
+If the host does not recognize `device_token`, it replies with
+`StreamingResponse { result: Unauthorized }` instead; see
 [pairing.md](pairing.md).
 
 ### `StreamingResponse` (6)
@@ -63,26 +67,28 @@ A host that does not recognize the device answers
 `PINRequired` 11, `TransportUnavailable` 12, `Invisible` 13,
 `GameLaunchFailed` 14, `SteamVRNotInstalled` 15.
 
-For a VR Link session the Remote Play fields are empty (`port: 0`,
-`transport: None`, no relay) and the session travels in two fields:
+For a VR Link session, the flat Remote Play connection fields are left empty
+(`port: 0`, `transport: None`, `relay_server: ""`), and the SVL session
+parameters are carried in `encrypted_session_key` and `cert`:
 
 1. `session_key = symmetric_decrypt(encrypted_session_key, secret)`
    (`BSaveEncryptedSessionKey`, +0xf98244).
 2. `text = symmetric_decrypt(unhex(cert), session_key)`
    (`CPanelConnect::StartStreaming`, +0xf6d498 region, the
    `stream_interface == SteamVR` branch).
-3. If `text` starts with `~`, the session string is the host's IP address (as
-   the client knows it, no port) followed by `text`; otherwise it is `text`
-   as given.
+3. If `text` starts with `~`, the client prepends the host's IP address (without
+   a port) to `text` to form the full session string; otherwise it uses `text`
+   verbatim.
 
 That string is passed to `CShellApplication::StartVRLink(char const*)`
-(+0xf80310), which on Android launches the VR activity with it as the `sArgs`
-intent extra.
+(+0xf80310), which on Android launches the `vrlink` activity with the string as
+the `sArgs` intent extra.
 
-`cert` is a misnomer inherited from Remote Play, where the field carries a
-certificate for the flat stream. Here it is the encrypted session string.
+The field name `cert` is inherited from flat Remote Play, where it holds a relay
+certificate; in VR Link mode, it carries the hex-encoded encrypted session
+string.
 
-## The session string
+## Session string format
 
 **Captured** (token redacted):
 
@@ -93,39 +99,40 @@ certificate for the flat stream. Here it is the encrypted session string.
 
 | field | meaning |
 |---|---|
-| 0 | host address (prepended by the client, see step 3) |
-| 1, 2 | UDP port, twice — 10400 both times in every capture. **Inferred**: one is the host's port and one the client's; see the transport docs |
-| 3 | `sStartInfo`, three comma-separated integers. `0,0,0` in this project's captures, `0,0,1` in an older Klepton record. Meaning unknown |
+| 0 | host IP address (prepended by the client in step 3) |
+| 1, 2 | UDP port, repeated twice — `10400` in both fields in every capture. **Inferred**: one is the host port and one is the client port; see [../svl-transport/](../svl-transport/) |
+| 3 | `sStartInfo`, three comma-separated integers. `0,0,0` in this project's captures, `0,0,1` in an older Klepton log. Meaning unknown |
 | 4–6 | empty |
-| 7 | transport key: a four-character identifier (`MID0`) then URL-safe base64 of 32 bytes. See [../svl-transport/](../svl-transport/) |
+| 7 | transport key: a four-character prefix (`MID0`) followed by 44 characters of URL-safe base64 encoding 32 bytes. See [../svl-transport/](../svl-transport/) |
 
-The host's part is 70 characters, which encrypts to the 96 bytes (192 hex
-characters) seen in `cert`.
+The host-supplied suffix is 70 ASCII bytes, which encrypts to 96 bytes (192 hex
+characters) in `cert`.
 
-A session string is good for about one connection: Klepton's record
-(STEAMLINK.md §2.3) is that reusing one gets no replies from the host at all.
+Each session string is single-use: per Klepton's notes (STEAMLINK.md §2.3),
+reusing a previously consumed session string elicits no replies from the host.
 
 ## Cancel
 
-`DeviceStreamingCancelRequest { request_id }` (10). The client also sends it in
-answer to an `InProgress` response that carries a stale `request_id`.
+To cancel a pending request, the client sends
+`DeviceStreamingCancelRequest { request_id }` (10). It also sends a cancel
+message when it receives an `InProgress` response with a stale `request_id`.
 
 ## To confirm
 
-- Steps 1–3 by actually decrypting: blocked so far only on a pairing secret
-  the probe owns (vrlink's stored secret was deliberately left
-  unread).
-- What the host does if SteamVR is already running, or a headset is already
-  connected (`VRActive`? `Busy`?).
-- The three integers of `sStartInfo`.
-- How long after `Success` the host waits for the first SVL packet before
-  discarding the session.
+- Verify decryption steps 1–3 directly (initially blocked only until the probe
+  had its own pairing secret, since `vrlink`'s stored secret was left unread).
+- Host behavior when SteamVR is already running or another headset is already
+  connected (`VRActive` vs. `Busy`).
+- Meaning of the three integers in `sStartInfo`.
+- How long after `Success` the host waits for the initial SVL packet before
+  expiring the session.
 
 ## Probe results (2026-11-10)
 
-`python3 -m ovrlink session` / `stream` with the probe's own pairing:
-steps 1-3 of the `StreamingResponse` handling produced a well-formed session
-string (`~10400~10400~0,0,0~~~~MID0` + 44 characters) and the SVL session it
-names worked. **Captured by probe.** Ending the probe abruptly after 20 s of
-streaming did *not* leave the host deaf to discovery this time, so the earlier
-outage is not simply "client vanished mid-stream".
+Running `python3 -m ovrlink session` and `stream` using the probe's own pairing
+key confirmed steps 1–3 of `StreamingResponse` handling: decryption yielded a
+well-formed session string (`~10400~10400~0,0,0~~~~MID0` + 44 characters) and
+the resulting SVL session connected normally (**captured by probe**). Stopping
+the probe abruptly after 20 s of streaming did *not* leave the host unresponsive
+to discovery probes, indicating that the earlier discovery outage is not caused
+solely by a client disconnecting mid-stream.

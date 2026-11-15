@@ -1,21 +1,24 @@
-# Video FEC - `SVLFECRAID6`
+# Video FEC: `SVLFECRAID6`
 
-The only FEC in this build. `SVLDataLink::SVLDataLink` (+0x15a000) constructs
-`SVLFECRAID6(root, 0x20)` unconditionally (**static**); the mode byte 0x20 is
-echoed in every frame descriptor (+0x15).
+`SVLFECRAID6` is the only FEC implementation in `libvrlink_scene.so`.
+`SVLDataLink::SVLDataLink` (+0x15a000) constructs `SVLFECRAID6(root, 0x20)`
+unconditionally (**static**), and every frame descriptor echoes the mode byte
+`0x20` at offset `+0x15`.
 
-It is a RAID-6 erasure code from the open-source **jerasure** library, using the
-**Liber8tion** bit-matrix code (Plank, "The RAID-6 Liber8tion Code"): XOR only,
-no Galois-field multiplication on this path. The `galois_*` exports in the
-library (`galois_single_multiply` +0x19fe40 etc.) are the rest of jerasure and
-are **not** called by the video FEC (**static**: the constructor calls only
-`liber8tion_coding_bitmatrix`, `jerasure_smart_bitmatrix_to_schedule`,
-`jerasure_generate_schedule_cache`; encode is `jerasure_schedule_encode`,
-decode is `jerasure_schedule_decode_cache`).
+It uses a RAID-6 erasure code from the open-source **jerasure** library based on
+Plank's **Liber8tion** bit-matrix code ("The RAID-6 Liber8tion Code"), which
+performs XOR operations only with no Galois-field multiplication. Although
+`libvrlink_scene.so` exports `galois_*` symbols from the rest of jerasure
+(`galois_single_multiply` +0x19fe40, etc.), the video FEC never calls them
+(**static**: the constructor calls only `liber8tion_coding_bitmatrix`,
+`jerasure_smart_bitmatrix_to_schedule`, and `jerasure_generate_schedule_cache`;
+encoding uses `jerasure_schedule_encode` and decoding uses
+`jerasure_schedule_decode_cache`).
 
 ## Geometry
 
-**static** - constants stored by `SVLFECRAID6::SVLFECRAID6` (+0x161e90):
+`SVLFECRAID6::SVLFECRAID6` (+0x161e90) stores the following geometry constants
+(**static**):
 
 | Field (SVLFEC+) | Value | Meaning |
 |---|---|---|
@@ -29,28 +32,30 @@ decode is `jerasure_schedule_decode_cache`).
 | 0xdb8 | 8 | w - word size (sub-blocks per packet) |
 | 0xdba | 128 | jerasure `packetsize` - bytes per sub-block |
 
-So each 1024-byte packet is one jerasure "device" made of w = 8 sub-blocks of
-128 bytes: sub-block `c` of a packet is bytes `[128*c, 128*c + 128)`.
-jerasure is called with `size = 128 * 8 = 1024`, `packetsize = 128`.
+Each 1024-byte packet is one jerasure "device" consisting of `w = 8` sub-blocks
+of 128 bytes, where sub-block `c` spans bytes `[128*c, 128*c + 128)`. jerasure
+is called with `size = 128 * 8 = 1024` and `packetsize = 128`.
 
-Stripe `s` = data packets `8s .. 8s+7` (devices 0..7) and parity packets
-`0x800 + 2s` (device 8, "P") and `0x800 + 2s + 1` (device 9, "Q").
+Stripe `s` consists of data packets `8s .. 8s+7` (devices 0..7) plus parity
+packets `0x800 + 2s` (device 8, "P") and `0x800 + 2s + 1` (device 9, "Q").
 
-## The code
+## Liber8tion bit-matrix code
 
-**static** - transcribed from `liber8tion_coding_bitmatrix` (+0x1a1da0) with
-k = 8, and checked by running the Python below over all 55 one- and two-erasure
-patterns (all recover). The matrix has 71 ones in the Q half, the Liber8tion
+The parity equations below are transcribed from `liber8tion_coding_bitmatrix`
+(+0x1a1da0) with `k = 8` (**static**) and verified by testing the Python
+implementation below across all 55 single- and double-erasure patterns (all
+recover). The Q half of the bit-matrix has 71 ones, matching the Liber8tion
 minimum (`k*w + k - 1`).
 
-Let `D[j][c]` be sub-block `c` of data packet `j` of the stripe.
+Let `D[j][c]` be sub-block `c` of data packet `j` within the stripe:
 
-- **P** is plain XOR: `P[i] = D[0][i] ^ D[1][i] ^ ... ^ D[7][i]`. In other words
-  parity packet `0x800 + 2s` is the byte-wise XOR of the stripe's eight data
-  packets. A client that only implements this can already repair any single
-  loss per stripe whenever P arrived.
-- **Q**: `Q[r] = XOR over j of D[j][ Q_PERM[j][r] ]`, plus one extra term per
-  device `j >= 1`: `Q[er] ^= D[j][ec]` with `(er, ec) = Q_EXTRA[j]`.
+- **P** is plain XOR: `P[i] = D[0][i] ^ D[1][i] ^ ... ^ D[7][i]`. Parity packet
+  `0x800 + 2s` is the byte-wise XOR of the stripe's eight data packets, so a
+  client implementing P alone can repair any single lost data packet per stripe
+  whenever P arrives.
+- **Q** is a permuted sub-block XOR: `Q[r] = XOR over j of D[j][ Q_PERM[j][r] ]`,
+  plus one extra term per device `j >= 1`: `Q[er] ^= D[j][ec]` where
+  `(er, ec) = Q_EXTRA[j]`.
 
 ```python
 K, M, W, PS = 8, 2, 8, 128
@@ -130,40 +135,42 @@ def decode(blocks):
     return out
 ```
 
-jerasure itself runs a precomputed XOR schedule
-(`jerasure_generate_schedule_cache(8, 2, 8, bitmatrix, 1)`); the result is the
-same linear system, so any correct GF(2) solver is wire-compatible.
+jerasure runs a precomputed XOR schedule
+(`jerasure_generate_schedule_cache(8, 2, 8, bitmatrix, 1)`), which solves the
+same linear system, so any valid GF(2) solver is wire-compatible.
 
-**captured** (details at the end): the host's parity bytes equal `encode()`
-above, for both P and Q.
+**captured** (details below): the host's parity packets match `encode()` byte
+for byte across both P and Q.
 
 ## Padding rules
 
-**static** unless marked:
+Padding on the final stripe works as follows (**static** unless marked):
 
-- Encode (`SVLFECRAID6TXFrame::PopulateFecBlocks` +0x161518): a stripe is encoded
-  only if its first data packet starts inside the frame. Data blocks that start
-  at or beyond `frame_size` are replaced by an all-zero 1024-byte block. The
-  last real data packet is zero-padded to 1024 in the sender's buffer
-  (`InitializeAndSend` memsets the tail) even though only `len` bytes are sent.
-- Decode (`SVLFECRAID6RXFrame::ReceivedVideoPacket` +0x160de0): before decoding,
-  for each *received* data packet of the stripe that is the frame's last
-  packet, the client zeroes the tail `[frame_size, next 1024 boundary)` in the
-  frame buffer. It does this only when `frame_size` is known.
-- **Consequence (inferred from the code, worth knowing):** the client counts
-  data packets of the stripe that lie entirely beyond the end of the frame as
-  *erased* - nothing ever marks them received. The last stripe of a frame
-  therefore has `8 - n_real` phantom erasures, and FEC can only help it when
-  `phantom + really_missing <= 2`, i.e. the last stripe is FEC-protected only if
-  it holds 6, 7 or 8 real packets. Otherwise losses there are repaired by
-  retransmission. A new client should instead treat phantom blocks as known
-  zeros (the `decode()` above does if you pass `bytes(1024)` for them), which
-  is strictly better and still compatible.
+- On encode (`SVLFECRAID6TXFrame::PopulateFecBlocks` +0x161518), a stripe is
+  encoded only if its first data packet starts within `frame_size`. Data blocks
+  starting at or beyond `frame_size` are replaced by all-zero 1024-byte blocks.
+  In the sender's buffer, the last real data packet is zero-padded out to 1024
+  bytes (`InitializeAndSend` memsets the tail) even though only `len` bytes are
+  transmitted on the wire.
+- On decode (`SVLFECRAID6RXFrame::ReceivedVideoPacket` +0x160de0), before
+  running jerasure, if `frame_size` is known and the frame's final data packet
+  is present in the stripe, `vrlink` zeroes its tail `[frame_size, next 1024
+  boundary)` in the frame buffer.
+- **Phantom erasures on the final stripe (**inferred** from static code):**
+  `vrlink` never marks data packets that lie completely beyond `frame_size` as
+  received, so it counts them as *erased*. The final stripe of a frame
+  therefore starts with `8 - n_real` phantom erasures, meaning `vrlink` can
+  only repair it via FEC when `(8 - n_real) + really_missing <= 2`—that is,
+  only when the final stripe holds 6, 7, or 8 real packets. Shorter final
+  stripes rely on retransmission in `vrlink`. A third-party client can improve
+  on this while remaining wire-compatible by passing known 1024-byte zero
+  blocks for out-of-range slots (as `decode()` above does when given
+  `bytes(1024)`).
 
 ## Receive algorithm
 
-**static** - `SVLFECRAID6RXFrame::ReceivedVideoPacket(packet_id, now)`, called
-after every stored data or parity packet:
+`SVLFECRAID6RXFrame::ReceivedVideoPacket(packet_id, now)` runs after storing
+every data or parity packet (**static**):
 
 ```python
 def received_video_packet(frame, packet_id, now):
@@ -190,26 +197,27 @@ def received_video_packet(frame, packet_id, now):
     return frame.check_rx_complete()
 ```
 
-- Decoding writes recovered data straight into the decoder input buffer at
-  `n * 1024` and regenerates missing parity in place.
-- `SVLFECRAID6RXFrame::CheckRXComplete` (+0x161264): the frame is complete when
-  it is not already accepted/submitted, `frame_size != 0`, and the contiguous
-  received prefix of data packets (`this+0x1a`) is at least
-  `ceil(frame_size / 1024)`. Then `SVLFEC::InternalAcceptFrameFromRX(size,
-  &buffer, frame_id)` and timing event 0x4c. See
-  [retransmit.md](retransmit.md) for ordering and [decode-handoff.md](decode-handoff.md).
+- Decoding writes recovered data directly into the decoder input buffer at
+  `n * 1024` and regenerates missing parity blocks in place.
+- `SVLFECRAID6RXFrame::CheckRXComplete` (+0x161264) considers a frame complete
+  when it has not yet been accepted or submitted, `frame_size != 0`, and the
+  contiguous received prefix of data packets (`this+0x1a`) is at least
+  `ceil(frame_size / 1024)`. Once complete, it calls
+  `SVLFEC::InternalAcceptFrameFromRX(size, &buffer, frame_id)` and records
+  timing event `0x4c`. See [retransmit.md](retransmit.md) for frame ordering
+  and [decode-handoff.md](decode-handoff.md) for decoder submission.
 
 ## Captured
 
-Capture `vr3` (not in the repo): 4,260 complete frames, no data packet lost,
-8,404 parity packets. The `encode()` / `decode()` above (the same code as the
-scratch file used for `vr1`) were run against every stripe of every frame.
-Everything here is **captured**.
+In `vr3` (not in the repo), all 4,260 frames arrived with zero lost data
+packets and 8,404 parity packets. Running `encode()` and `decode()` above
+against every stripe of every frame yields the following results (all
+**captured**):
 
-- Every stripe of every frame was checked: 6,082 stripes, each with its P
-  packet; 2,322 of them also have Q (the host sent Q only for the first
-  8.64 s, see [packets.md](packets.md)). The host's parity equals `encode()`
-  in every case:
+- Across all 6,082 stripes in the capture, every stripe has a P packet and
+  2,322 stripes also have a Q packet (the host sent Q only during the first
+  8.64 s; see [packets.md](packets.md)). The host's parity matches `encode()`
+  in every instance:
 
   | | stripes checked | equal to `encode()` |
   |---|---|---|
@@ -219,30 +227,32 @@ Everything here is **captured**.
   | Q, short last stripe | 322 | 322 |
   | **total parity packets** | **8,404** | **8,404** |
 
-  That confirms the geometry (8 + 2, 1024-byte packets, 128-byte
-  sub-blocks), the P/Q assignment to even/odd parity ids, `Q_PERM` /
-  `Q_EXTRA`, and the sub-block byte order, now over full stripes (vr1 only
-  had 4 P and 5 Q samples, none of them a full stripe with both parities).
-- Padding rule, over the 1,019 short last stripes (real data packets per
-  short stripe: 1 x332, 2 x211, 3 x147, 4 x15, 5 x11, 6 x25, 7 x278): the
-  short last packet is zero-extended to 1024 and data blocks beyond the end
-  of the frame are all-zero blocks. Parity packets are always 1024 bytes on
-  the wire, also for a single-packet frame of 302 bytes.
-- A stripe has parity exactly when its first data packet starts inside the
-  frame: in every frame the set of P ids is `0x800 + 2s` for
-  `s = 0 .. ceil(n_data / 8) - 1`, no more and no fewer.
-- Decode against host parity: nothing was lost in this capture, so erasures
-  were simulated. From 300 stripes that have both P and Q (sampled at
-  random), one and then two of the ten blocks were dropped at random and the
-  stripe rebuilt with `decode()` from the host's own parity: 300 of 300
-  single erasures and 300 of 300 double erasures recovered the original data
-  bytes. A real loss repaired by FEC and then matched against the decoder
-  input was seen once in `vr1` (one frame, one missing data packet).
-- `fec_mode` is 0x20 on all 8,631 descriptors.
+  This confirms the stripe geometry (`8 + 2`, 1024-byte packets, 128-byte
+  sub-blocks), the assignment of P and Q to even and odd parity ids, `Q_PERM`
+  and `Q_EXTRA`, and sub-block byte ordering across full stripes (`vr1` had
+  only 4 P and 5 Q intact samples, none of them a complete stripe carrying both
+  parities).
+- Across all 1,019 short final stripes (real data packet counts per short
+  stripe: `1` x332, `2` x211, `3` x147, `4` x15, `5` x11, `6` x25, `7` x278),
+  the short final packet is zero-extended to 1024 bytes and data blocks past
+  `frame_size` are treated as all-zero blocks. Parity packets are always 1024
+  bytes on the wire, even on a single-packet 302-byte frame.
+- A stripe carries parity if and only if its first data packet starts inside
+  `frame_size`: in every frame, the set of P packet ids is `0x800 + 2s` for
+  `s = 0 .. ceil(n_data / 8) - 1`, with no extra or missing stripes.
+- Because `vr3` had no lost data packets, decoding was verified by simulating
+  erasures against the host's captured parity. Across 300 randomly sampled
+  stripes carrying both P and Q, dropping one or two of the ten blocks at
+  random and running `decode()` recovered the exact original data bytes in 300
+  of 300 single-erasure trials and 300 of 300 double-erasure trials. Live FEC
+  repair of an actual wire loss verified against decoder input was observed
+  once in `vr1` (one frame with one missing data packet).
+- `fec_mode` is `0x20` on all 8,631 descriptors.
 
 ## Open questions / to confirm on the wire
 
-1. Whether any host build uses a `fec_mode` other than 0x20.
-2. A real (not simulated) two-erasure recovery, and what the client does
-   when the last stripe has "phantom" erasures (see "Padding rules") - needs a
-   lossy link or a probe that drops packets.
+1. Whether any host build uses a `fec_mode` value other than `0x20`.
+2. Observing a live (non-simulated) two-erasure recovery on `vrlink`, along
+   with `vrlink`'s behavior when the final stripe has phantom erasures (see
+   "Padding rules" above), which requires a lossy link or a packet-dropping
+   proxy.

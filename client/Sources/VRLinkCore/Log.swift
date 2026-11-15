@@ -4,11 +4,11 @@
 
 import Foundation
 
-/// Log lines from threads that must not wait.
+/// Non-blocking logger for latency-sensitive threads.
 ///
-/// Writing a line can block for a long time when the output is a debugger
-/// or a remote console. The session and display threads work to a deadline
-/// of a few milliseconds, so they hand their lines to a queue and carry on.
+/// Standard output can stall when attached to a debugger or remote console.
+/// Session and render threads run on tight millisecond budgets, so log messages
+/// are dispatched asynchronously to a background utility queue.
 public enum Log {
     private static let queue = DispatchQueue(label: "log", qos: .utility)
 

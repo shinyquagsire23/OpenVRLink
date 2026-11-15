@@ -14,7 +14,7 @@ final class MicrophoneTests: XCTestCase {
         XCTAssertEqual(packets.map(\.value.count), [1024, 300, 1024])
         XCTAssertEqual(packets[0].index, 0x4B00)                      // 48 kHz mono
         XCTAssertEqual(packets[2].index, 300)                         // the shorter packet's length
-        // The parity gives back either packet from the other.
+        // XORing the parity packet with the first packet recovers the second packet.
         var rebuilt = packets[2].value
         for index in packets[0].value.indices { rebuilt[index] ^= packets[0].value[index] }
         XCTAssertEqual(Bytes(rebuilt.prefix(300)), Bytes(packets[1].value))
@@ -22,7 +22,7 @@ final class MicrophoneTests: XCTestCase {
     }
 
     func testTheHostsReceiverLogicAcceptsThem() {
-        // Our own receiver implements the same scheme: feed it A and the parity, and it rebuilds B.
+        // AudioReceiver uses the same XOR FEC format and recovers packet B from packet A and the parity packet.
         let uplink = MicrophoneUplink()
         uplink.capture(Bytes((0..<1024).map { UInt8($0 & 0xFF) }) + Bytes(repeating: 7, count: 512))
         let packets = uplink.takePackets()

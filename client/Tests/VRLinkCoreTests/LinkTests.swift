@@ -7,7 +7,7 @@ import XCTest
 
 final class LinkTests: XCTestCase {
     private let elements = [SVLElement(.goodbye, value: []), SVLElement(.videoPacket, id: 7, index: 2, value: Bytes(1...100))]
-    // Made-up tokens: a kind, a digit, then 32 bytes as URL-safe base64.
+    // Synthetic 32-byte key encoded as URL-safe base64, prefixed with a 4-character token type in tests.
     private let payload = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
 
     func testBothFormsSurviveTheRoundTrip() throws {

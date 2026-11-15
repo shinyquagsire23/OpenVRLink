@@ -2,13 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-/// The video FEC (docs/svl-video/fec.md): a RAID-6 erasure code over stripes
-/// of eight 1024-byte data packets plus two parity packets, P and Q. It is
-/// jerasure's Liber8tion code, which needs only XOR.
+/// Video forward error correction (docs/svl-video/fec.md) using Jerasure's Liber8tion
+/// RAID-6 erasure code. Each stripe consists of eight 1024-byte data packets plus two
+/// parity packets (P and Q) computed using pure XOR operations.
 ///
-/// Each packet is eight 128-byte sub-blocks. Every parity sub-block is the XOR
-/// of a fixed set of data sub-blocks; repairing a stripe is solving those
-/// equations for the sub-blocks that are missing.
+/// Each packet is divided into eight 128-byte sub-blocks. Every parity sub-block is the
+/// XOR of a fixed subset of data sub-blocks, and stripe recovery solves that linear system
+/// over GF(2) for any missing sub-blocks.
 
 enum FEC {
     static let dataPerStripe = 8
@@ -61,14 +61,13 @@ enum FEC {
         }
     }
 
-    /// A packet is read wherever it is: an array, a part of a datagram, or
-    /// memory inside a frame.
+    /// Returns the `index`-th 128-byte sub-block slice of `packet` without copying.
     private static func subBlock<Packet: RandomAccessCollection>(_ packet: Packet, _ index: Int) -> Packet.SubSequence
     where Packet.Element == UInt8, Packet.Index == Int {
         packet[packet.startIndex + index * subBlockSize..<packet.startIndex + (index + 1) * subBlockSize]
     }
 
-    /// P and Q for eight full-size data packets.
+    /// Computes the P and Q parity packets for eight 1024-byte data packets.
     static func encode(_ data: [Bytes]) -> (p: Bytes, q: Bytes) {
         var parity = [Bytes(), Bytes()]
         for (row, terms) in equations.enumerated() {
@@ -79,11 +78,10 @@ enum FEC {
         return (parity[0], parity[1])
     }
 
-    /// Rebuild the missing data packets of a stripe. `data` has eight entries
-    /// and `p`, `q` are the parity packets; nil means not received. Every
-    /// present packet is 1024 bytes, and none is copied. Returns the
-    /// packets that were missing, by their place in the stripe, or nil when
-    /// what arrived is not enough.
+    /// Reconstructs missing data packets in an 8-packet stripe from the received data packets
+    /// and optional `p` and `q` parity packets (`nil` indicates a lost packet). Present packets
+    /// must be 1024 bytes and are read in place without copying. Returns recovered packets keyed
+    /// by stripe index, or `nil` if too many packets were lost to recover.
     static func repair<Data: RandomAccessCollection, Parity: RandomAccessCollection>(
         data: [Data?], p: Parity?, q: Parity?
     ) -> [Int: Bytes]? where Data.Element == UInt8, Data.Index == Int, Parity.Element == UInt8, Parity.Index == Int {

@@ -2,33 +2,42 @@
 
 ## Rendering
 
-A frame from the host is a set of pictures, each rendered from a known eye position through a known frustum. 
-The core turns each eye frame into a quad standing in the world, in meters, built from the rendering eye's 
-position and its right/up/forward axes.
+Each frame from the host consists of one or more images rendered from known eye
+positions through known frusta. `VRLinkCore` converts each eye's tiles into
+world-space quads (in meters) constructed from the rendered eye's position and
+its right, up, and forward axes.
 
-Since a world-space renderer is practically the default setup for XR runtimes, this allows VRLinkCore to be portable across platforms with minimal fuss:
+Because world-space rendering is standard across XR runtimes, keeping quad
+composition in `VRLinkCore` keeps platform backends thin:
 
-- Late-stage reprojection needs no special case. If the head has turned since the host rendered, the rectangle is just seen from a different pose.
-- The fovea is one more rectangle with a feathered edge.
-- The math one has to check by eye is the same code for all platforms.
+- Late-stage reprojection requires no special handling. If the user's head has
+  rotated since the host rendered the frame, the runtime simply views the
+  world-space quad from the updated eye pose.
+- The foveal inset is rendered as another quad with a feathered border.
+- All projection and quad-placement math lives in shared platform-independent
+  code.
 
-Transforms done by the different graphics backends should be kept minimal (space conversions, etc)
+Transforms inside each graphics backend should stay minimal (for example,
+coordinate-space conversions).
 
-What a session hands on with each frame is a `FrameLayout`: for each eye, where the
-host's eye was and a list of tiles, each a part of one decoded picture and the part of
-that eye's view it fills. Steam's VR Link gives two tiles an eye from one atlas (base and
-fovea); WiVRn gives each eye a picture of its own, squeezed in bands, which comes to a
-grid of tiles (`docs/wivrn/protocol.md`), and, when an application's picture has
-transparent parts, a third picture saying how opaque each tile's colors are. A frame
-with any transparency gets no black behind it on a headset: the room shows through. `Composition` turns tiles into quads and knows
-nothing of either protocol.
+With each decoded frame, a streaming session produces a `FrameLayout` containing
+the host's rendered eye pose and a list of tiles per eye, where each tile maps a
+sub-rect of a decoded texture onto a sub-frustum of that eye's view. Steam VR
+Link produces two tiles per eye from a single atlas texture (base and fovea).
+WiVRn decodes a separate video stream per eye compressed into rectilinear
+foveation bands, forming a grid of tiles (`docs/wivrn/protocol.md`), plus an
+optional third alpha stream when an OpenXR app submits transparent regions. When
+a frame includes alpha, the compositor clears to transparent rather than opaque
+black so passthrough remains visible behind the stream. `Composition` converts
+`FrameLayout` tiles into world-space `Quad` values independently of the
+streaming protocol:
 
 ```swift
-struct Quad {                    // produced by the core, per frame, per eye
+struct Quad {                    // produced by VRLinkCore, per frame, per eye
     var corners: [Vec3]          // world space, meters: top-left, top-right, bottom-left, bottom-right
-    var atlasRect: Rect          // which part of the decoded picture it shows
-    var picture: Int             // which of the frame's decoded pictures
-    var feather: Float           // soft border, as a fraction of its width
+    var atlasRect: Rect          // normalized UV sub-rect within the decoded texture
+    var picture: Int             // index into the frame's decoded textures
+    var feather: Float           // soft border, as a fraction of quad width
 }
 struct EyeView {                 // produced by the XR runtime (or a window), per displayed frame
     var eye: Pose                // world space
@@ -38,57 +47,66 @@ struct EyeView {                 // produced by the XR runtime (or a window), pe
 
 ## Protocols
 
-Both Valve's Steam VR Link (`StreamSession`) and WiVRn (`WiVRnSession`) are supported. 
-Displays, decoders and app shells see either as a `StreamingSession`, which provides a 
-common interface between both. Both Steam and WiVRn hosts are listed side-by-side in the
-host browser (WiVRn does its discovery via mDNS though, which means Apple devices will
-have to split functionality for discovery there).
+Both Valve's Steam VR Link (`StreamSession`) and WiVRn (`WiVRnSession`) are
+supported. Displays, decoders, and app shells interact with both through the
+common `StreamingSession` interface. Both Steam and WiVRn hosts appear side by
+side in the host browser (WiVRn uses mDNS for discovery, so Apple platforms use
+a separate mDNS/Bonjour discovery path alongside UDP subnet probing).
 
 ## Targets
 
 | library | handles | imports | current target |
 |---|---|---|---|
-| core | protocol, pairing, session, FEC, timing, geometry, frame composition (`[Quad]`), settings, calibration math | Foundation, POSIX sockets, the system's cryptography on Apple platforms and swift-crypto elsewhere | `VRLinkCore` |
-| XR runtime | where the eyes are and when the next frame will be displayed; the surfaces to draw into | CompositorServices *or* OpenXR | `VRLinkVisionCompositor` |
+| core | protocol, pairing, session, FEC, timing, geometry, frame composition (`[Quad]`), settings, calibration math | Foundation, POSIX sockets, system crypto frameworks on Apple platforms or swift-crypto elsewhere | `VRLinkCore` |
+| XR runtime | eye poses, predicted display time, and drawable render surfaces | CompositorServices *or* OpenXR | `VRLinkVisionCompositor` |
 | tracking and input | head pose, controller and hand poses, buttons and axes, haptics out | ARKit + GameController *or* OpenXR | `VRLinkVisionTracking` |
-| graphics | draw quads through eye views, from a decoded frame | Metal *or* Vulkan | `VRLinkMetal` |
+| graphics | drawing quads through eye views from a decoded frame | Metal *or* Vulkan | `VRLinkMetal` |
 | decoder | access units in, decoded frames out | VideoToolbox *or* a platform decoder | `VRLinkVideoToolbox` |
 | audio | PCM out, microphone in | CoreAudio *or* a platform API | `VRLinkAppleAudio` |
-| session glue | find a host, pair, start and stop a session with its decoder and audio; settings while the app runs | the backends of its platform | `VRLinkAppleSession` |
-| experiments | things that may not last, kept where nothing depends on them | whatever they need | `VRLinkVisionExperiments`, `VRLinkAppleFace` |
+| session glue | host discovery, pairing, starting and stopping a session with its decoder and audio, live settings updates | platform-specific backends | `VRLinkAppleSession` |
+| experiments | experimental features isolated so core targets do not depend on them | platform frameworks as needed | `VRLinkVisionExperiments`, `VRLinkAppleFace` |
 | app shells | wiring, window or immersive space, settings UI | the platform's app framework | `OpenVRLink` (macOS viewer), `client/visionOS` |
 
-Apple-specific frameworks are avoided outside of Apple-specific code, and further delineation happens either with ifdefs or separate libraries (ex, macOS vs visionOS).
+Apple-specific frameworks are avoided outside Apple-specific targets, and
+platform differences are isolated via `#if` conditionals or separate target
+libraries (for example, macOS versus visionOS).
 
 ## Libraries
 
 ### XR runtime core
 
-Provides the eye views, the predicted display time, and where to draw.
+The XR runtime layer provides per-eye views, the predicted display timestamp,
+and the render surfaces for each frame.
 
-The display's refresh rate can change while streaming--visionOS moves between 45, 60, 90, 96 and 120 Hz 
-depending on the performance state and environment, and gives applications very little control, so the 
-XR runtime has to report the current refresh period every frame and send it to the Core. 
-When the period changes, the session re-publishes its refresh-rate value with the new rate and the host 
-switches the stream without a restart (`docs/svl-timing/refresh-rate.md`, captured).
+Display refresh rate can change mid-stream: visionOS switches between 45, 60,
+90, 96, and 120 Hz based on thermal/performance state and environment, giving
+applications minimal control. The XR runtime reports the current refresh period
+every frame to `VRLinkCore`. When the period changes, the session publishes the
+updated refresh-rate value and the host adjusts the stream without restarting
+(`docs/svl-timing/refresh-rate.md`, **captured**).
 
-Eye positions are **not** constant on every headset, especially not those with pupil swim correction. 
-visionOS moves each view by a few millimeters as the eye behind it turns (a pupil swings around the 
-middle of its eyeball), and the host cannot be given new eye geometry mid-session. 
-The runtime needs to be careful not to accidentally return eye saccades as a rapid head velocity, and 
-some amount of the pupil swim correction can be merged into the sent head pose (and is still corrected
-from the worldspace-based rendering). 
+Eye positions are **not** fixed on every headset, particularly headsets with
+dynamic pupil-swim correction. visionOS shifts each eye view by a few
+millimeters as the user's eye rotates (since the pupil pivots around the center
+of the eyeball), while an SVL host cannot be given updated eye geometry
+mid-session. The runtime must avoid reporting eye saccades as spikes in head
+velocity; part of the pupil-swim offset can be folded into the reported head
+pose, and world-space rendering still uses the exact per-eye view at display
+time.
 
-The predicted display time is also tied to poses: the pose message's target-time field and the frame 
-reports the host receives both are derived from it (`docs/svl-tracking-input/poses.md`, `docs/svl-video/retransmit.md`).
+The predicted display time also drives pose prediction and timing reports: both
+the pose packet's target-time field and the per-frame timing telemetry sent to
+the host are derived from it (`docs/svl-tracking-input/poses.md`,
+`docs/svl-video/retransmit.md`).
 
 ### XR runtime inputs/outputs
 
-OpenXR puts head pose, controller poses, buttons and haptics behind one API.
-visionOS does not: world and hand tracking come from ARKit, controller buttons
-and haptics from GameController, and the frame timing from CompositorServices.
-So the core asks for three things independently instead of modeling a single
-"XR input API":
+OpenXR exposes head pose, controller poses, buttons, and haptics through a
+single API. visionOS splits them across three frameworks: world and hand
+tracking come from ARKit, controller buttons and haptics come from
+GameController, and frame timing comes from CompositorServices. Accordingly,
+`VRLinkCore` defines three separate protocols rather than a monolithic XR input
+interface:
 
 ```swift
 protocol HeadTracking   { func head(at time: DisplayTime) -> TrackedPose }      // pose + velocities
@@ -98,62 +116,75 @@ protocol ControllerInput { func state(_ side: Side) -> ControllerState          
                            func vibrate(_ side: Side, _ pulse: HapticPulse) }
 ```
 
-What crosses the seam for a controller is one `ControllerState` per hand (`VRLinkCore/Input.swift`),
-which contains the grip pose in world space plus buttons named for the Touch controller the host is 
-shown. 
-The platform maps whatever is really held onto those names, and the core owns the wire encoding and 
-publishes the controller's identity to the host the first time a hand holds one.
+Each hand reports a `ControllerState` (`VRLinkCore/Input.swift`) containing a
+world-space grip pose and button/axis states mapped to the Oculus Touch layout
+exposed to the host. The platform backend maps the physical controller inputs
+onto those fields, while `VRLinkCore` handles wire encoding and publishes the
+controller's device properties to the host the first time a controller appears.
 
-An OpenXR backend implements all three from one session. A visionOS backend implements the first two 
-from ARKit providers and the third from GameController, and is responsible for making the pose of a 
-controller and its buttons describe the same instant.
+An OpenXR backend implements `HeadTracking`, `HandTracking`, and
+`ControllerInput` from a single OpenXR session. On visionOS, `HeadTracking` and
+`HandTracking` are backed by ARKit providers while `ControllerInput` uses
+GameController, and the backend aligns controller poses and button states to the
+same timestamp.
 
-All poses cross this API seam in the same world space the quads use.
+All poses cross this API boundary in the same world coordinate space used by the
+render quads.
 
 ### Decoder -> graphics
 
-Zero-copy is a property of a decoder *and* a graphics backend together (VideoToolbox with Metal; 
-MediaCodec with Vulkan through AHardwareBuffer; a Windows decoder with Vulkan through a shared texture). 
-The decoder produces an opaque `DecodedFrame`, and the graphics backend declares which kinds it can 
-sample--the app shell pairs ones that match. Not every decoder works with every graphics backend, by design.
+Zero-copy video rendering requires pairing a compatible decoder and graphics
+backend (VideoToolbox with Metal, MediaCodec with Vulkan via
+`AHardwareBuffer`, or a Windows decoder with Vulkan via shared textures). The
+decoder outputs an opaque `DecodedFrame`, and the graphics backend declares
+which frame representations it can sample; the app shell wires up a matching
+pair. By design, not every decoder works with every graphics backend.
 
-In general, all-in-one graphics backends/decoder backends are to be avoided, in favor of platform-specific
-APIs which give much finer control over the final output.
+Cross-platform wrapper layers for graphics or video decoding are avoided in
+favor of native platform APIs, which provide direct control over memory layout,
+color spaces, and synchronization.
 
-Other guidelines:
+Additional decoder and rendering rules:
 
-- No color conversion must happen on the CPU.
-- Prefer a texture format whose sampler converts YCbCr to RGB (on Metal, the private formats 500/505/508, which the draft takes this path with VideoToolbox's `'&xf0'` output). A conversion in the fragment shader is the fallback.
-- Request no output pixel format from the decoder where the platform allows--asking for one costs a conversion which wastes bandwidth and power.
+- Do not perform color conversion on the CPU.
+- Prefer a hardware texture format whose sampler converts YCbCr to RGB directly
+  (on Metal, private pixel formats 500/505/508 with VideoToolbox `'&xf0'`
+  output). Fall back to YCbCr-to-RGB conversion in the fragment shader when
+  hardware sampler conversion is unavailable.
+- Leave the decoder's output pixel format unspecified where the platform allows;
+  requesting a specific format triggers an extra conversion pass that wastes
+  bandwidth and power.
 
-Lifecycle (not fully implemented yet):
+Frame buffer lifecycle (partially implemented):
 
-- Frames are decoded immediately after receiving and wait in a short queue. 
-  The client compositor takes frames from the queue and renders them, with some
-  bookkeeping to keep the queue from piling up too much.
-- The decoded frame must stay alive until the GPU has finished with it--the graphics 
-  backend holds it until its command buffer completes.
-- The decoder's buffer pool has to be at least the queue depth plus the frame on 
-  screen plus the decoder's own references (a minimum of 3).
-- The host sends parameter sets whose bytes change with rate control. The decoder must 
-  take them without being rebuilt, or it loses its reference frames
+- Access units are decoded immediately upon arrival and placed into a short
+  decoded-frame queue. The compositor pulls frames from the queue for rendering,
+  bounding queue depth so latency cannot accumulate.
+- Each `DecodedFrame` must stay alive until the GPU finishes sampling it—the
+  graphics backend retains the frame until its command buffer completes.
+- The decoder's buffer pool must hold at least the queue depth plus the
+  currently displayed frame plus the codec's reference frames (at least 3).
+- The host updates SPS/PPS/VPS bytes dynamically during rate control. The
+  decoder must ingest updated parameter sets in place without tearing down the
+  session, or it will lose its reference frames.
 
 ### Audio
 
-Raw 48 kHz stereo PCM both ways with XOR parity (`docs/svl-audio/`), with a jitter buffer,
-source and sink.
+Audio streams raw 48 kHz stereo PCM in both directions with XOR parity
+(`docs/svl-audio/`), backed by a jitter buffer, a microphone source, and a
+playback sink.
 
-The sink has one other function beyond playing: **keeping itself alive.** On visionOS, this
-means babysitting CoreAudio to make sure the OS doesn't randomly drop audio when the app is
-backgrounded, a notification happens, etc etc. Somehow it's wildly inconsistent about what
-kills the audio session versus what doesn't.
+On visionOS, the playback sink also has to keep the OS audio session alive:
+CoreAudio can drop or suspend the audio unit inconsistently across app
+backgrounding, system notifications, and other interruptions, so the sink
+monitors and restarts the session when interrupted.
 
 ## Session lifecycle
 
-A headset app can be backgrounded at any time: the headset comes off, the crown is
-pressed, another app takes over, etc. Instead of exiting on background, this client 
-is designed around the ability to be backgrounded at any time whatsoever, which means
-handling it in Core rather than just the app shell.
+A headset app can be interrupted at any time—the user removes the headset,
+presses the Digital Crown, or switches to another app. Rather than exiting on
+backgrounding, this client handles suspension and resumption directly in
+`VRLinkCore`:
 
 ```
 idle -> connecting -> streaming -> suspended -> connecting -> streaming ...
@@ -161,80 +192,83 @@ idle -> connecting -> streaming -> suspended -> connecting -> streaming ...
                            background / headset doffed     foreground / donned
 ```
 
-- **Suspend** (app backgrounded, immersive space dismissed, headset doffed):
-  say goodbye to the host, stop the session thread, flush the decoder and the
-  decoded-frame queue, stop audio. Nothing is kept that depends on the old
-  stream.
-- **Resume** (foregrounded and the immersive space is back): ask the host for
-  a session again and start a new one. A session string is only good for one
-  connection, so resuming is always a fresh streaming request on UDP 27036. 
-  Pairing is not repeated.
-- SteamVR stays up for about 30 s after a client drops
-  (`docs/svl-values/startup-exchange.md`), and while it is up a returning
-  client gets video within a quarter of a second and the running game is still
-  there. After that the host is cold and the resume takes a few seconds while
-  SteamVR starts.
-- The core exposes one object that owns "the connection to this host" and
-  can be told `suspend()` and `resume()`. The app shell maps its platform's
-  scene-phase and headset-worn signals onto those two calls. Decoder, graphics
-  and audio backends must all tolerate being stopped and started again in one
-  process.
+- **Suspend** (app backgrounded, immersive space dismissed, or headset removed):
+  send a disconnect notice to the host, stop the session thread, flush the
+  decoder and decoded-frame queue, and stop audio so all state from the previous
+  stream is cleared.
+- **Resume** (app foregrounded with the immersive space active): send a fresh
+  `StreamingRequest` on UDP 27036 and start a new streaming session. Because
+  each session string is single-use, resuming always requests a new session
+  string using the existing pairing secret without repeating PIN pairing.
+- SteamVR keeps running for roughly 30 s after a client disconnects
+  (`docs/svl-values/startup-exchange.md`). Reconnecting within that window
+  restores video within ~250 ms with the running VR application intact; after
+  SteamVR exits, resuming takes a few seconds for a cold start.
+- `VRLinkCore` exposes a single connection controller with `suspend()` and
+  `resume()` methods, which the app shell drives from platform scene-phase and
+  headset-worn events. Decoder, graphics, and audio backends must all support
+  stopping and restarting cleanly within a single process.
 
-Choosing a host is also part of this lifecycle:
+Host selection follows three rules across this lifecycle:
 
-- The first connection is always a choice made by the user: the entry
-  window lists the hosts that answered discovery and takes a typed address.
-- The chosen host stays chosen for as long as the app lives. A resume goes
-  back to that host without asking, and without the window having to be open.
-- Launching the app from its icon always shows the window, and does not
-  connect by itself, even if a host was chosen last time.
+- The initial connection is always chosen explicitly by the user in the entry
+  window, which lists discovered hosts and accepts a manually typed IP address.
+- Once selected, that host remains the active target for the lifetime of the app
+  process; resuming reconnects to it automatically without reopening the window.
+- Launching the app fresh always opens the entry window rather than
+  auto-connecting to a previously used host.
 
-On visionOS, there are no APIs to fetch display measurements outside of an immersive space.
-The host has to be told about the displays before starting the stream, so once per run of the 
-app a compositor layer is opened for a moment only to measure eye positions, frusta and refresh rate.
+On visionOS, display geometry APIs are unavailable outside an immersive space.
+Because the host needs display parameters before starting the stream, the app
+briefly opens a compositor layer once per launch to measure eye positions,
+frusta, and refresh rate.
 
-On visionOS, taking the headset off and putting it back on pauses and resumes 
-the immersive space, and the stream comes back by itself; backgrounding the app 
-does not disturb it.
-When the system closes the immersive space, the stream ends and the window offers 
-the list again.
-Frames of the ended stream are dropped at once, so a resume shows the waiting backdrop
-rather than the last picture of the old session.
+On visionOS, removing and putting the headset back on pauses and resumes the
+immersive space, automatically suspending and resuming the stream; backgrounding
+the 2D window does not disturb an active immersive session. If the system closes
+the immersive space entirely, the stream ends and the host-picker window
+reappears. Frames from an ended stream are discarded immediately so resuming
+shows the waiting backdrop rather than a stale frame from the prior session.
 
-Not handled yet: keeping the stream alive through a short interruption instead of dropping 
-it (the host's 30 s window might allow it), and what the user sees while a resume is in progress.
+Two lifecycle cases remain unimplemented: keeping a stream alive across brief
+interruptions within the host's 30 s grace window, and displaying connection
+status inside the immersive space while resuming.
 
 ## Networking quirks and minutiae
 
-Apple's platforms are strict about broadcast and multicast: on visionOS, iOS, iPadOS, etc
-a datagram to 255.255.255.255 or `ff02::1` fails with "No route to host" unless the app 
-holds the multicast entitlement, which is granted by request.
-The workaround is to send the same discovery probe as unicast to every address of the local 
-subnet by hand, taken from the interface's address and netmask, and the host answers as usual. 
-It refuses subnets wider than a /22 (1022 addresses) rather than sweep half of one silently, 
-and takes an explicit address list instead.
+Apple platforms restrict UDP broadcast and multicast: on visionOS, iOS, and
+iPadOS, sending to `255.255.255.255` or `ff02::1` fails with "No route to host"
+unless the app holds Apple's multicast entitlement. As a workaround, the client
+derives the local subnet from the network interface's IP address and netmask and
+sends unicast discovery probes to each host address, which Steam hosts answer
+normally. The client refuses to sweep subnets wider than `/22` (1022 usable
+addresses) rather than silently scanning a partial range, requiring explicit IP
+addresses instead.
 
-The client does discovery the same way on every platform, instead of branching the code on Apple/not-Apple:
+Rather than branching discovery logic per platform, the client uses the same
+approach everywhere:
 
-- sweep the local subnet with unicast probes (hosts answer a unicast probe from any source port)
-- always probe hosts paired before, by their last known address
-- let the user type an address, for subnets too wide to sweep and for hosts on another network
-  (or for routers and firewalls that drop discovery protocols)
+- sweep the local subnet with unicast probes (hosts answer unicast probes from
+  any source port)
+- directly probe previously paired hosts at their last known IP addresses
+- accept manually entered IP addresses for subnets wider than `/22`, routed
+  networks, or firewalls that drop discovery traffic
 
-Networking also prefers wired ethernet over wireless interfaces where possible. For visionOS, this
-is connected using a USB-C ethernet dongle via the developer strap. TBD how this will work on other
-platforms (it might be interesting to drive a Wi-Fi dongle from userspace). Figuring out which interfaces
-are wired is handled per-platform.
+Networking prefers wired Ethernet over Wi-Fi when available. On visionOS, wired
+Ethernet is available via a USB-C dongle attached to the Developer Strap;
+interface detection on other platforms is handled per platform (driving a USB
+Wi-Fi adapter from userspace may also be worth exploring).
 
-The app also needs the local-network permission prompt to be granted on Apple platforms, and early
-networking packets can be dropped until the user accepts the prompt. (TODO: maybe remind the user if
-things seem too silent).
+On Apple platforms, the OS displays a local-network permission prompt on first
+network use, and early UDP packets are dropped until the user grants access.
+(TODO: surface a hint in the UI if discovery receives no responses.)
 
 ## Configuration storage
 
-Settings and pairing secrets go in one folder named `OpenVRLink` in the platform's per-user data location 
-(See also `VRLinkCore/DataDirectory.swift`). These paths are roughly `XDG_DATA_HOME`-shaped, but I don't
-like `XDG_CONFIG_HOME` so we'll pretend it doesn't exist.
+Settings and pairing secrets are stored in an `OpenVRLink` directory inside the
+platform's per-user application data location (see
+`VRLinkCore/DataDirectory.swift`). On Linux and Android this follows
+`XDG_DATA_HOME` rather than splitting files across `XDG_CONFIG_HOME`:
 
 | platform | folder |
 |---|---|
@@ -243,153 +277,192 @@ like `XDG_CONFIG_HOME` so we'll pretend it doesn't exist.
 | macOS | `~/Library/Application Support/OpenVRLink` |
 | iOS, visionOS | `OpenVRLink` inside the app's Documents folder |
 
-These folders hold the client configuration as well as all the pairing keys gathered.
+This directory holds `settings.json` along with all saved host pairing secrets.
+(TODO: consider pruning stale pairing keys.)
 
-(TODO: garbage collection on the pairing keys?)
-
-Settings are stored to `settings.json` in the data folder, written by `Sources/VRLinkCore/Settings.swift`.
-The settings file is both backward and forward compatible, and **not** platform-unique, so not all settings
-will apply to all platforms.
+`Sources/VRLinkCore/Settings.swift` reads and writes `settings.json`. The schema
+is backward- and forward-compatible and shared across platforms, so individual
+fields may only apply to specific platforms.
 
 ## Experiments
 
-Off unless asked for, on their own tab, and expected to break.
+Experimental features live in their own settings tab, default to off, and may
+change or break between builds.
 
-### Face and eyes from a camera picture of the face
+### Camera-based face and eye tracking
 
-For platforms that give an app no face or eye tracking but do give it a picture of the user's face.
-On visionOS that picture is the Spatial Persona: the "front camera" delivers the Persona as the system 
-draws it, and its face and eyes move as the user's do.
+Platforms without dedicated eye- or face-tracking APIs can estimate both from a
+camera feed of the user's face. On visionOS, the "front camera" feed delivers
+the system-rendered Spatial Persona, whose facial expressions and eye movements
+track the user.
 
-| step | where |
+| step | location |
 |---|---|
-| camera pictures, Apple's face-landmark detector | `VRLinkAppleFace/FaceCamera.swift` (also runs on a Mac's camera) |
-| landmarks to the 70 FB expression weights and to pupil positions | core, `FaceFromLandmarks.swift` |
-| pupil positions to a gaze direction | core, `GazeCalibration.swift` |
-| joining camera, settings and calibration on visionOS | `Sources/VRLinkVisionExperiments/PersonaTracking.swift` |
-| the calibration space (RealityKit) | `Sources/VRLinkVisionExperiments/GazeCalibrationSpace.swift` |
-| the RealityKit renderer that lets the Persona's camera follow the head | `Sources/VRLinkVisionExperiments/RealityKitDisplay.swift` |
+| camera capture and Apple Vision face-landmark detection | `VRLinkAppleFace/FaceCamera.swift` (also runs against a Mac webcam) |
+| mapping landmarks to 70 `XR_FB_face_tracking2` weights and pupil positions | core, `FaceFromLandmarks.swift` |
+| mapping pupil positions to a gaze ray | core, `GazeCalibration.swift` |
+| combining camera capture, settings, and calibration on visionOS | `Sources/VRLinkVisionExperiments/PersonaTracking.swift` |
+| RealityKit gaze calibration space | `Sources/VRLinkVisionExperiments/GazeCalibrationSpace.swift` |
+| RealityKit stream renderer that anchors the Persona camera to the head | `Sources/VRLinkVisionExperiments/RealityKitDisplay.swift` |
 
-**Where the Persona's camera is:** The system pictures the Persona as seen from the SwiftUI view marked 
-`cameraAnchor`. With the ordinary renderer that can only be the app's window: a compositor layer cannot 
-hold a view. The exact rules for the Persona camera are a bit fiddly, but the gist is that a RealityKit 
-space with no windows can override where the Persona camera is placed, and the Persona camera will chase
-any new updates rapidly if the entity is enabled/disabled.
+visionOS renders the Spatial Persona from the viewpoint of a SwiftUI view tagged
+with `cameraAnchor`. Because a Metal `CompositorLayer` cannot host SwiftUI
+views, the standard compositor renderer leaves the Persona camera fixed at the
+2D app window. However, a RealityKit immersive space with no open 2D windows can
+attach the `cameraAnchor` to a head-tracked entity, and toggling that entity's
+enabled state prompts visionOS to update the Persona camera pose rapidly.
 
-### Drawing the stream with RealityKit
+### RealityKit stream renderer
 
-`Sources/VRLinkVisionExperiments/RealityKitDisplay.swift`, modeled after ALVR's renderer:
+`Sources/VRLinkVisionExperiments/RealityKitDisplay.swift`, modeled after ALVR's
+RealityKit renderer:
 
-- Each decoded frame is flattened by the ordinary quad renderer into one texture, the left eye 
-  in the lower half and the right in the upper: per eye the base tile with the foveal tile over 
-  it, seen from exactly where the host's eye was, so the pass only resamples. 1.6 texture pixels 
-  per tile pixel each way (at most 3072), to keep most of the fovea's detail.
-- Each eye has a plane in the world filling the host's frustum for that eye, 80 m out (70 m for 
-  the right, so the two do not fight). Its material (ALVR's `SBSMaterial.usda`, the `_L` and `_R`
-  variants) shows its half of the texture to its own eye and nothing to the other.
-  RealityKit then does what the compositor path does itself: it draws that world-space rectangle
-  from wherever the eyes are when the frame is shown.
-- Three textures and plane pairs are used in turn and only the newest is enabled, so that a texture 
-  and the place of its planes always change in the same RealityKit frame.
-- RealityKit says nothing about the displays: it relies on the measurement taken before the
-  first connection (`MeasuredDisplay`, see the lifecycle above).
-- RealityKit does not say when a change will be seen. A display link gives the time of each refresh, 
-  and what RealityKit is handed is shown a whole number of refreshes later, enough to cover its drawing 
-  time (a running average, about 14 ms): that is the display time the session is told, and so the 
-  time head and hand poses aim at (`VsyncPrediction`, ALVR's method).
+- The standard quad renderer flattens each decoded frame into a single
+  top-bottom stereo texture (left eye in the lower half, right eye in the upper
+  half), compositing the foveal tile over the base tile from the host's exact
+  rendered eye pose so this pass only resamples. Each axis uses 1.6 texture
+  pixels per source tile pixel (clamped to 3072) to retain foveal detail.
+- Each eye views a world-space plane spanning the host's frustum at 80 m out for
+  the left eye and 70 m out for the right eye (offset to prevent depth
+  fighting). Using ALVR's `SBSMaterial.usda` (`_L` and `_R` variants), each
+  plane displays its half of the texture to its matching eye and stays
+  invisible to the other eye. RealityKit then reprojects those world-space
+  planes from the live eye poses at display time, matching the Metal compositor
+  path.
+- Three texture-and-plane pairs are cycled in a ring with only the newest pair
+  enabled so texture contents and plane transforms update together in the same
+  RealityKit frame.
+- Because RealityKit does not report display geometry, this renderer reuses the
+  `MeasuredDisplay` measurements captured before the first connection (see
+  [Session lifecycle](#session-lifecycle)).
+- Because RealityKit does not expose exact presentation timestamps, a display
+  link tracks refresh times and `VsyncPrediction` (ALVR's method) advances by a
+  whole number of refresh intervals sufficient to cover RealityKit's ~14 ms
+  running-average render duration. That predicted display time is reported to
+  the session and used as the target timestamp for head and hand poses.
 
-It costs a second pass over every pixel, has no display foveation (yet) and no rate-map gaze (yet). 
-The calibration space is RealityKit too, so that the pupils are seen from the same camera position 
-when calibrating as when streaming; it puts the app's window away while it runs (the Persona's camera 
-stays at an open window whatever else is offered), shows its instructions under the dots, and brings 
-the window back when it ends.
+This path adds a second full-screen render pass and does not yet support display
+foveation or rate-map gaze. Gaze calibration also runs in a RealityKit space so
+the Persona camera views the pupils from the same head-relative position during
+calibration and streaming; it closes the app's 2D window while running (since
+any open window claims the Persona camera anchor), renders instructions beneath
+the target dots, and reopens the window afterward.
 
-**Gaze.** For each eye the estimator gives, after turning the face level:
+**Gaze estimation.** After leveling face roll, the landmark estimator computes
+four features per eye:
 
-- the pupil's place between the eye's corners (`across`, -0.5 ... 0.5)
-- its height against the middle of the eye's outline (`down`, in eye widths)
-- its height against the line through the two corners (`belowCorners`), and 
-- how open the lids are (`open`). 
+- horizontal pupil position between the eye corners (`across`, `-0.5 ... 0.5`)
+- vertical pupil offset relative to the center of the eye outline (`down`, in
+  eye widths)
+- vertical pupil offset relative to the line through the two eye corners
+  (`belowCorners`)
+- eyelid aperture (`open`)
 
-The last two are there because the lids follow the eye: the outline moves with 
-the pupil, so `down` alone hardly changes when looking up or down (seen on the 
-headset as a gaze that stuck vertically), while the corners stay put and the lids
-lower as the eye does. The two eyes are averaged. A calibration maps these to the 
-gaze's two tangents in the head's frame:
+`belowCorners` and `open` compensate for eyelid coupling: because the upper and
+lower eyelids move vertically with the pupil, `down` alone changes very little
+during upward or downward gaze (which previously caused vertical gaze to stick
+on the headset), whereas the eye corners stay fixed and the eyelids lower on
+downward gaze. Features are averaged across both eyes, and calibration fits a
+quadratic model mapping them to horizontal and vertical gaze tangents in head
+space:
 
 ```
     across = k . [1, a, d, a*a, a*d, d*d, c, o]        up = likewise, own k
 ```
 
-fitted by least squares to pairs of (features, true direction). 
+Calibration fits `k` via least squares from `(features, targetDirection)` sample
+pairs.
 
-The true direction comes from the one place visionOS reveals it: a pinch at a distance 
-arrives with a ray from the eyes to what they looked at. The calibration space shows 
-nineteen dots 1.5 m ahead that turn with the head (so that the eyes turn, not the head); 
-for each, the user looks and pinches, and the pinch's ray, moved into the head's frame, 
-is paired with the features averaged over the 0.4 s before. Everything past the plane is
-held back slightly (ridge) and left out altogether under ten samples. The fit and its error 
-on its own samples go into `settings.json`. The gaze sent is given a fixed 1.5 m length and smoothed. 
-It is held only while both eyes are fully shut: lids merely lowered, as when looking down, 
-used to count as a blink and froze it. With no calibration no gaze is sent from the RealityKit 
-renderer.
+Ground-truth gaze direction comes from the single visionOS interaction that
+reveals where the user is looking: a distant pinch delivers a ray from the eyes
+to the gazed target. The calibration space displays 19 head-locked dots 1.5 m
+ahead (forcing eye rotation rather than head rotation); as the user looks at
+each dot and pinches, the pinch ray—transformed into head space—is paired with
+the eye features averaged over the preceding 0.4 s. Quadratic terms receive
+mild ridge regularization and are omitted entirely when fewer than 10 samples
+are available. Both the fitted coefficients and residual sample error are stored
+in `settings.json`. At runtime, the estimated gaze vector is scaled to a fixed
+1.5 m distance and smoothed. Gaze freezes only when both eyes are completely
+closed, since treating partially lowered eyelids during downward gaze as blinks
+previously froze vertical tracking. Without a saved calibration, the RealityKit
+renderer sends no gaze data.
 
-**Continuous calibration** (setting `continuousGazeCalibration`, off by default; core
-`GazeCalibration.tuned`, joined up in `PersonaTracking.learn`). The fit of the headset shifts
-while it is worn and between wearings. With this on, every pinch made at a distance while
-streaming is one more pair, taken exactly as in the calibration space: the pinch's ray in the
-head's frame, with the features averaged over the 0.4 s before. The calibration keeps its
-samples (up to 60) and is fitted again with each new one:
+**Continuous calibration** (setting `continuousGazeCalibration`, off by default;
+implemented in `GazeCalibration.tuned` and wired in `PersonaTracking.learn`).
+Because headset fit shifts during and between sessions, enabling this mode
+records each distant pinch made while streaming as an additional calibration
+sample—pairing the head-space pinch ray with eye features averaged over the
+preceding 0.4 s. Up to 60 samples are retained, and the fit is recomputed on
+each new sample:
 
-- A pair more than 0.35 (tangent, about 19 degrees) from what the calibration expects is left
-  out: nobody was asked to hold their eyes still, so some readings are of eyes in motion.
-  A shift larger than that needs the calibration run again.
-- Once there are 60, the new pair replaces the old one that looked nearest to the same spot.
-  Pinches cluster in the middle; dropping the oldest instead would leave nothing at the edges.
-- Each sample counts 0.97 of the one after it, so the newest say most.
+- Any sample more than 0.35 in tangent space (~19 degrees) from the current
+  model's prediction is discarded as an outlier, since users do not hold their
+  eyes stationary during normal pinches; headset shifts larger than that require
+  re-running manual calibration.
+- Once 60 samples are stored, a new sample replaces the existing sample with the
+  nearest gaze direction rather than evicting the oldest sample, preserving edge
+  samples when pinches cluster near the center of the view.
+- Samples decay exponentially by a weight factor of 0.97 per step so recent
+  observations carry greater weight.
 
-The tuned calibration is used at once, and written to `settings.json` when the stream ends,
-not at each pinch (a settings change makes SwiftUI look at the stream's view again, which can
-cost the Persona's camera its place). A calibration saved before samples were kept cannot be
-tuned; it has to be run once more.
+Updated coefficients take effect immediately and are persisted to
+`settings.json` only when the stream ends rather than on every pinch (writing
+settings mid-stream triggers a SwiftUI view update that can displace the Persona
+camera anchor). Calibrations saved before sample history was added cannot be
+tuned incrementally and must be re-run once.
 
-Focal distance: only the ray's direction is used, and the features are the average of the two
-eyes, so the eyes turning in for something near should cancel. This is **inferred**; the whole
-mode is untried on the headset.
+For vergence and focal distance, only the ray direction is used and features are
+averaged across both eyes, so inward vergence on near targets should cancel out
+(**inferred**; untested on the headset).
 
-**Face calibration.**  A face calibration (core `FaceCalibration.swift`,
-`Sources/VRLinkVisionExperiments/FaceCalibrationSpace.swift`) replaces parameters tuned for just 
-me with the user's own: a panel shows their Persona and asks for nine expressions in turn 
-(rest, jaw open, smile, frown, pucker, brows up, brows down, eyes closed, eyes wide), and each is
-counted in and then measured for a little over a second. What is measured are ten lengths in the 
-picture over the face's size (`FaceMeasures`: mouth gap and width, each mouth corner's drop, each
-brow's lift, each eye's openness). Each weight sent is then how far the face has gone from its 
-resting measurement towards the one at that expression's fullest, 0 to 1. Expressions with no pose 
-of their own stay at zero. Where the eyes look (the eight `eyesLook` weights) is taken from the 
-calibrated gaze when there is one. Weights are smoothed with a 50 ms time constant.
+**Face calibration.** Face calibration (`FaceCalibration.swift`,
+`Sources/VRLinkVisionExperiments/FaceCalibrationSpace.swift`) replaces default
+author-tuned thresholds with per-user measurements. A panel displays the user's
+Persona and prompts for nine expressions in sequence (rest, jaw open, smile,
+frown, pucker, brows up, brows down, eyes closed, and eyes wide), counting down
+before sampling each expression for slightly over a second. Ten normalized
+landmark distances relative to face size are recorded (`FaceMeasures`: mouth gap
+and width, left/right mouth corner drop, left/right brow lift, and left/right
+eye openness). Each outgoing blendshape weight (`0` to `1`) interpolates from
+the resting baseline to that expression's peak calibration measurement;
+expressions without a dedicated calibration pose remain `0`. When calibrated
+gaze is available, it drives the eight `eyesLook` weights. Weights are smoothed
+with a 50 ms time constant.
 
 ## Dependencies
 
-- **Crypto: the operating system's on Apple platforms** (CryptoKit, CommonCrypto, Security), so
-  the app carries no cryptography of its own; **swift-crypto elsewhere**, and none of it is built
-  into an Apple build. The choice is made by `#if` in one file of the core (`Primitives`), the one
-  exception to backends being handed in; known-answer tests hold both halves to the same results.
-  swift-crypto builds for Windows and Android. Pairing uses its X25519, SHA-256, 
-  AES-CBC, single-block AES (for the wrapped IV) and RSA-OAEP with SHA-1 (`_RSA.Encryption.Padding.PKCS1_OAEP`);
-  all are present in 3.x
-- **Protobuf: No thanks.** It's only four messages, so we serialize by hand (`VRLinkCore/Protobuf.swift`)
+- **Crypto**: Uses operating-system frameworks on Apple platforms (CryptoKit,
+  CommonCrypto, Security) so Apple builds carry no bundled cryptography library,
+  and **swift-crypto** on Linux, Windows, and Android (excluded from Apple
+  builds). Platform selection uses `#if` in a single core file (`Primitives`),
+  the sole exception to injected backends, with shared known-answer tests
+  verifying both paths. Pairing uses X25519, SHA-256, AES-CBC, single-block
+  AES-ECB (for the encrypted IV), and RSA-OAEP with SHA-1
+  (`_RSA.Encryption.Padding.PKCS1_OAEP`), all included in swift-crypto 3.x.
+- **Protobuf**: Serialized by hand (`VRLinkCore/Protobuf.swift`) rather than
+  adding a protobuf dependency, since only four broadcast message flows are
+  needed.
 
 ## Remaining work
 
-1. **visionOS**: any remaining missing features
-2. **Windows helper**: Installs PSVR2 assets, maybe also patches driver_vrlink for features (better transport encoding)
-3. **Windows**: Vulkan, OpenXR, a platform decoder and audio (aka, Dis-integration Hell). Not a real user-facing target, but easier to debug.
-4. **Android**: reuses Vulkan and OpenXR, irons out all the visionOS-specifics.
+1. **visionOS**: finish remaining missing features.
+2. **Windows helper**: install PSVR2 assets and optionally patch
+   `driver_vrlink` for additional features (such as improved transport
+   encoding).
+3. **Windows**: Vulkan, OpenXR, platform video decoder, and audio backends
+   (primarily a desktop debugging target rather than an end-user build).
+4. **Android**: reuse the Vulkan and OpenXR backends and iron out remaining
+   visionOS-specific assumptions.
 
 ## Open questions
 
-- Which decoder on Windows (vendor SDKs, Media Foundation, or Vulkan Video), and how its output reaches Vulkan without extra copies.
-- Whether the host needs the client's display time to be exact, or only consistent (the delivered-versus-agreed frame rate question in
+- Which decoder API to target on Windows (vendor SDKs, Media Foundation, or
+  Vulkan Video), and how to import its output surfaces into Vulkan without extra
+  copies.
+- Whether the host requires exact client display timestamps or only consistent
+  frame intervals (see the delivered-versus-agreed frame rate discussion in
   `docs/svl-values/startup-exchange.md`).
-- The color pipeline: the stream signals BT.2020 primaries and gamma 2.2, and vrlink tells its decoder it's "linear".
-- How controller identity should be presented on platforms whose controllers are not the Quest Touch set vrlink describes.
+- Color pipeline handling: the stream signals BT.2020 primaries and gamma 2.2,
+  while `vrlink` configures its decoder output as linear.
+- How to report controller identity on platforms whose controllers differ from
+  the Quest Touch profile described by `vrlink`.

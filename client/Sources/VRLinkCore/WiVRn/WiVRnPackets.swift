@@ -4,31 +4,31 @@
 
 import Foundation
 
-/// WiVRn's packets (docs/wivrn/protocol.md), as its release 26.9 has them.
+/// Wire packet definitions for WiVRn release 26.9 (docs/wivrn/protocol.md).
 ///
-/// A packet is one byte saying which it is, then its fields one after
-/// another with nothing between them, numbers little-endian:
+/// Each packet starts with a 1-byte packet type ID followed by tightly packed,
+/// little-endian fields:
 ///
-/// - a list or a string is its length and then its elements; a length
-///   under 0x7fff is 16 bits, a longer one sets the top bit and puts the
-///   rest in 16 more
-/// - an optional is one byte, 0 or 1, and then the value if 1
-/// - a choice of types is one byte saying which, then that type
+/// - Lists and UTF-8 strings are prefixed by their byte or element count.
+///   Counts below `0x7fff` use a 16-bit integer; larger counts set bit 15 of
+///   the first 16-bit word and store the upper bits in a second 16-bit word.
+/// - Optionals use a 1-byte presence flag (`0` or `1`), followed by the payload when `1`.
+/// - Tagged unions (`std::variant`) use a 1-byte variant index followed by the payload.
 ///
-/// The two sides must agree on every packet exactly: the first thing a
-/// client sends is a number made from the whole set (`protocolVersion`),
-/// and a host with another number refuses. A new WiVRn release usually
-/// has a new number, and this file is then written again for it.
+/// Client and server packet schemas must match exactly. On connect, the client
+/// sends a hash of the packet definitions (`protocolVersion`), and the host
+/// rejects mismatched versions. New WiVRn releases typically change this hash
+/// and require updating the packet definitions here.
 public enum WiVRn {
-    /// Release 26.9. Made by WiVRn from the names and types of every field
-    /// of every packet; taken from what a 26.9 host announces.
+    /// Protocol version hash for WiVRn 26.9, computed by WiVRn over all packet
+    /// field names and types (captured from a 26.9 host announcement).
     public static let protocolVersion: UInt64 = 0xfc26_e619_b7ab_80f8
     public static let release = "26.9"
     public static let defaultPort: UInt16 = 9757
     /// Bonjour/mDNS service type advertised by WiVRn hosts on the local network.
     public static let serviceType = "_wivrn._tcp"
 
-    /// The host's answer to the first packet.
+    /// Server encryption and pairing state returned in response to the initial handshake.
     enum CryptoState: UInt8 {
         case encryptionDisabled, pinNeeded, alreadyPaired, pairingDisabled, incompatibleVersion
     }
@@ -37,57 +37,54 @@ public enum WiVRn {
         case h264, h265, av1, raw
     }
 
-    /// The devices this client reports and the inputs it sends, by their
-    /// place in WiVRn's list; the full list is far longer. Where a name
-    /// takes a side, the right hand's follows the left's.
+    /// Subset of WiVRn device IDs used by this client for pose and haptic
+    /// reporting. For sided devices, right-hand IDs follow left-hand IDs.
     enum Device {
         static let head: UInt8 = 0
-        /// Where the eyes look, as a pose on the head.
+        /// Eye gaze pose in head space.
         static let eyeGaze: UInt8 = 89
-        /// What the host asks to vibrate: a controller, its trigger, its thumb rest.
+        /// Maps haptic actuator IDs (grip, trigger, thumb rest) to controller side.
         static let haptics: [UInt8: Side] = [1: .left, 2: .right, 3: .left, 4: .right, 5: .left, 6: .right]
         static func grip(_ side: Side) -> UInt8 { side == .left ? 11 : 14 }
         static func aim(_ side: Side) -> UInt8 { side == .left ? 12 : 15 }
-        /// A bare hand: between thumb and index tip, and the index tip.
+        /// Pinch midpoint (between thumb and index tip) and index-tip poke poses for tracked hands.
         static func pinchPose(_ side: Side) -> UInt8 { side == .left ? 45 : 81 }
         static func poke(_ side: Side) -> UInt8 { side == .left ? 48 : 84 }
-        /// In the host's list of what to locate, a hand's joints.
+        /// Device IDs used in `tracking_control` requests when the host wants hand joint tracking.
         static func hand(_ side: Side) -> UInt8 { side == .left ? 90 : 91 }
     }
 
-    /// What a hand holds, as the host is told with every pose
-    /// (`interaction_profile`): nothing, the hand itself
-    /// (XR_EXT_hand_interaction), or a Touch controller.
+    /// OpenXR interaction profile IDs sent in each tracking packet (`interaction_profile`)
+    /// to report whether a hand is untracked, using `XR_EXT_hand_interaction`, or holding a Touch controller.
     enum InteractionProfile {
         static let none: UInt8 = 0, hand: UInt8 = 2, touch: UInt8 = 17
     }
 
-    /// Pose flags: orientation and position valid and tracked, with no velocities.
+    /// Pose bitmask indicating valid and tracked position and orientation, without velocity data.
     static let poseTrackedStill: UInt8 = 0x33
 
-    /// Pose flags: orientation and position valid, both velocities valid, both tracked.
+    /// Pose bitmask indicating valid and tracked position, orientation, and linear/angular velocities.
     static let poseFullyTracked: UInt8 = 0x3F
-    /// XrViewStateFlags: orientation and position valid and tracked.
+    /// `XrViewStateFlags` bitmask indicating valid and tracked view position and orientation.
     static let viewFullyTracked: UInt64 = 0xF
-    /// The kind of host message that says why it is about to close the connection.
+    /// Server message kind used to report a fatal error before closing the connection.
     static let serverMessageError: UInt8 = 2
-    /// Which feature a `feature_control` packet turns on or off.
+    /// Feature ID for microphone streaming in `feature_control` packets.
     static let featureMicrophone: Int32 = 1
-    /// How the face is described (`face_type`): not at all, or as the 70
-    /// weights of XR_FB_face_tracking2. The same number says which form
-    /// the face in a tracking packet takes.
+    /// Face tracking format (`face_type`) used in headset info and tracking packets,
+    /// where `faceNone` disables face tracking and `faceFB2` selects the 70 weights of `XR_FB_face_tracking2`.
     static let faceNone: UInt8 = 0, faceFB2: UInt8 = 2
-    /// XrSessionState.
+    /// Value of `XR_SESSION_STATE_FOCUSED` in OpenXR's `XrSessionState`.
     static let sessionStateFocused: Int32 = 5
 
-    /// Which packet, from the headset.
+    /// Packet type IDs sent from the headset to the host.
     enum FromHeadset: UInt8 {
         case cryptoHandshake = 0, pinCheck1 = 1, pinCheck3 = 2, headsetInfo = 3, feedback = 5, audio = 6, handshake = 7, tracking = 8
         case handTracking = 10, inputs = 15, battery = 17
         case timesyncResponse = 16, refreshRateChanged = 19, sessionStateChanged = 20
     }
 
-    /// Which packet, to the headset.
+    /// Packet type IDs sent from the host to the headset.
     enum ToHeadsetKind: UInt8 {
         case cryptoHandshake = 0, pinCheck2 = 1, pinCheck4 = 2, handshake = 3, serverMessage = 4, audioDescription = 5, videoDescription = 6
         case audio = 7, videoShard = 8, haptics = 9, timesyncQuery = 10, trackingControl = 11
@@ -95,20 +92,20 @@ public enum WiVRn {
     }
 }
 
-/// One eye's view as OpenXR gives it and WiVRn sends it.
+/// Per-eye view pose and frustum matching OpenXR and WiVRn's wire format.
 struct WiVRnView {
     var pose: Pose
     var frustum: Frustum
 }
 
-/// One tracked thing in a tracking packet. Velocities are along the world's axes.
+/// Pose and world-space velocities for a single tracked device in a tracking packet.
 struct WiVRnDevicePose {
     var device: UInt8
     var pose: Pose
     var linearVelocity = Vec3(0, 0, 0), angularVelocity = Vec3(0, 0, 0)
     var flags = WiVRn.poseTrackedStill
 
-    /// Something whose velocities are known.
+    /// Creates a device pose with valid linear and angular velocities.
     init(_ device: UInt8, _ tracked: TrackedPose) {
         self.device = device
         pose = tracked.pose
@@ -117,26 +114,26 @@ struct WiVRnDevicePose {
         flags = WiVRn.poseFullyTracked
     }
 
-    /// Something only located.
+    /// Creates a static device pose with position and orientation only.
     init(_ device: UInt8, _ pose: Pose) {
         self.device = device
         self.pose = pose
     }
 }
 
-/// How the host squeezed one eye's picture along each axis: how many
-/// encoded pixels each band has. The middle band is at full detail, and
-/// each band further out has one more source pixel per encoded pixel.
+/// Per-axis foveation layout for a single eye, listing the encoded pixel count
+/// of each band. The center band is encoded at 1:1 resolution, and each step
+/// outward increases the source-to-encoded pixel ratio by 1.
 struct WiVRnFoveation: Equatable {
     var across: [UInt16], down: [UInt16]
 
-    /// For one axis: each band's place in the encoded picture and in the
-    /// picture before it was squeezed, as fractions (0...1) of each.
+    /// Computes normalized `[0, 1]` UV ranges in both the encoded frame and the
+    /// full-resolution source image for each foveation band along one axis.
     static func bands(_ counts: [UInt16], encodedSize: Int) -> [(encoded: ClosedRange<Float>, source: ClosedRange<Float>)] {
         let middle = (counts.count - 1) / 2
         let ratios = counts.indices.map { abs(middle - $0) + 1 }
         let sourceSize = zip(counts, ratios).reduce(0) { $0 + Int($1.0) * $1.1 }
-        // The encoder's picture may be wider than what the bands fill.
+        // Encoded frame dimensions can be padded past the sum of the band sizes.
         let encodedSize = max(encodedSize, counts.reduce(0) { $0 + Int($1) })
         guard sourceSize > 0, encodedSize > 0 else { return [(0...1, 0...1)] }
         var out: [(encoded: ClosedRange<Float>, source: ClosedRange<Float>)] = []
@@ -151,39 +148,39 @@ struct WiVRnFoveation: Equatable {
         return out
     }
 
-    /// The length of one axis before it was squeezed, in pixels.
+    /// Returns the unscaled source resolution along one axis in pixels.
     static func sourceSize(_ counts: [UInt16]) -> Int {
         let middle = (counts.count - 1) / 2
         return counts.enumerated().reduce(0) { $0 + Int($1.element) * (abs(middle - $1.offset) + 1) }
     }
 }
 
-/// A part of one picture of one frame.
+/// A single UDP shard of an encoded video stream frame.
 struct WiVRnShard {
-    /// 0 the left eye, 1 the right, 2 transparency.
+    /// Stream index (`0` for left eye, `1` for right eye, `2` for alpha).
     var stream: UInt8
     var frame: UInt64
     var index: UInt16
-    /// With a frame's first shard: when it is meant to be seen (headset
-    /// clock, nanoseconds), and for each eye where it was rendered from
-    /// and how it was squeezed.
+    /// Metadata attached to a frame's first shard, containing the target display
+    /// time (headset clock, in nanoseconds), per-eye render views, foveation
+    /// parameters, and whether the frame includes an alpha channel.
     var views: (displayTime: Int64, views: [WiVRnView], foveation: [WiVRnFoveation], alpha: Bool)?
-    /// With a frame's last shard: when the host began and ended encoding and sending it.
+    /// Host encode and send timestamps attached to a frame's final shard.
     var timing: [Int64]?
     var payload: ByteSlice
 }
 
 struct WiVRnVideoDescription: Equatable {
-    /// One eye's encoded picture.
+    /// Encoded dimensions for a single eye in pixels.
     var width, height: Int
-    /// Left, right, transparency.
+    /// Codec IDs for the left eye, right eye, and alpha streams.
     var codecs: [Int32]
     var frameRate, refreshRate: Float
 }
 
 enum WiVRnToHeadset {
     case cryptoHandshake(publicKey: String, state: UInt8)
-    /// The host's halves of the PIN check: its second and fourth messages.
+    /// Server messages 2 and 4 of the PAKE PIN verification exchange.
     case pinCheck2([Natural])
     case pinCheck4([Natural])
     case handshake(streamPort: Int32)
@@ -194,14 +191,14 @@ enum WiVRnToHeadset {
     case videoShard(WiVRnShard)
     case haptics(device: UInt8, nanoseconds: Int64, frequency: Float, amplitude: Float)
     case timesyncQuery(Int64)
-    /// Which devices the host wants located, each how far ahead of the time it is asked.
+    /// Configures which device poses the host wants reported and each device's prediction offset.
     case trackingControl(pattern: [(device: UInt8, prediction: Int64)], motionToPhotons: Int64)
     case featureControl(feature: Int32, on: Bool)
     case refreshRateChange(Float)
-    /// A packet this client has no use for.
+    /// Unrecognized or unused packet type.
     case other(UInt8)
 
-    /// Nil for a packet cut short.
+    /// Parses a raw packet, returning `nil` if the buffer is truncated.
     init?(_ packet: Bytes) {
         var reader = WireReader(packet)
         let kind = reader.integer(UInt8.self)
@@ -263,12 +260,12 @@ enum WiVRnToHeadset {
     }
 }
 
-/// What the headset tells the host about itself before the stream starts.
+/// Capability and configuration packet sent by the headset before streaming begins.
 struct WiVRnHeadsetInfo {
-    /// One eye: what applications render, and what is encoded and sent.
+    /// Per-eye application render resolution and encoded video stream resolution.
     var renderPixels, streamPixels: (width: Int, height: Int)
     var refreshRates: [Float]
-    /// The rate the stream should run at; one of `refreshRates`.
+    /// Initial refresh rate requested for the stream (must be an entry in `refreshRates`).
     var preferredRate: Float
     var bitsPerSecond: UInt32
     var frusta: [Frustum]
@@ -276,7 +273,7 @@ struct WiVRnHeadsetInfo {
     var systemName: String
     var microphone = false, eyeGaze = false, face = false
 
-    /// The speaker offered: what `PlaybackBuffer` plays.
+    /// Stereo 48 kHz speaker output format matching `PlaybackBuffer`.
     static let speakerChannels: UInt8 = 2, speakerRate: UInt32 = 48_000
 
     var packet: Bytes {
@@ -286,40 +283,39 @@ struct WiVRnHeadsetInfo {
         }
         out.append(size: refreshRates.count)
         for rate in refreshRates { out.append(float: rate) }
-        // Settings that can be changed while streaming: the rate wanted,
-        // the least rate accepted, frames per refresh (as a divider), the
-        // bitrate, a gamepad mirrored to the host (no), body trackers (none).
+        // Write runtime-adjustable stream parameters (preferred and minimum
+        // refresh rates, frame divisor, bitrate, disabled gamepad, and 0 trackers).
         out.append(float: preferredRate)
         out.append(float: refreshRates.min() ?? 0)
         out.append(integer: UInt32(1))
         out.append(integer: bitsPerSecond)
         out.append(0)
         out.append(integer: UInt32(0))
-        // A speaker, and a microphone if there is one to send.
+        // Advertise stereo speaker output and optional mono microphone input.
         out.append(1)
         out.append(WiVRnHeadsetInfo.speakerChannels)
         out.append(integer: WiVRnHeadsetInfo.speakerRate)
         out.append(microphone ? 1 : 0)
         if microphone {
-            out.append(1)                           // one channel
+            out.append(1)                           // mono channel
             out.append(integer: UInt32(MicrophoneFormat.sampleRate))
         }
         for frustum in frusta { out.append(frustum: frustum) }
-        // Hand tracking: yes. Eye gaze: as said. Palm pose and user presence: no.
-        // Passthrough: yes, which lets applications ask for a transparent picture.
+        // Enable hand tracking, conditionally enable eye gaze, disable palm pose
+        // and user presence, and enable passthrough so apps can submit alpha.
         out.append(1)
         out.append(eyeGaze ? 1 : 0)
         out.append(zeros: 2)
         out.append(1)
-        // The face as FB's weights, or not at all; no body tracking; no other trackers.
+        // Advertise optional XR_FB_face_tracking2 support; disable body and generic trackers.
         out.append(face ? WiVRn.faceFB2 : WiVRn.faceNone)
         out.append(0)
         out.append(integer: UInt32(0))
         out.append(size: codecs.count)
         for codec in codecs { out.append(integer: codec.rawValue) }
-        out.append(0)                               // no bit depth asked for
+        out.append(0)                               // no preferred bit depth
         out.append(string: systemName)
-        // Language, country and variant, for the host's list of applications.
+        // Locale (language, country, variant) used by the host to localize app names.
         out.append(string: "en")
         out.append(string: "US")
         out.append(string: "")
@@ -327,12 +323,12 @@ struct WiVRnHeadsetInfo {
     }
 }
 
-/// How far one picture of one frame got, for the host. Times are the
-/// headset's clock in nanoseconds, zero for a step not reached.
+/// Per-stream frame timing report sent back to the host. Timestamps use the
+/// headset's monotonic clock in nanoseconds, or `0` for stages not yet reached.
 struct WiVRnFeedback {
     var frame: UInt64
     var stream: UInt8
-    /// When the host began and ended encoding and sending it, as it said itself.
+    /// Encode and send timestamps echoed from the host's final shard for this frame.
     var hostTiming: [Int64] = [0, 0, 0, 0]
     var firstPacket: Int64 = 0, lastPacket: Int64 = 0
     var sentToDecoder: Int64 = 0, decoded: Int64 = 0
@@ -352,7 +348,7 @@ struct WiVRnFeedback {
 }
 
 enum WiVRnPacket {
-    /// The first packet. The name is what the host lists this headset as.
+    /// Builds the initial handshake packet advertising the protocol version, public key, and display name.
     static func cryptoHandshake(publicKey: String, name: String) -> Bytes {
         var out: Bytes = [WiVRn.FromHeadset.cryptoHandshake.rawValue]
         out.append(integer: WiVRn.protocolVersion)
@@ -361,7 +357,7 @@ enum WiVRnPacket {
         return out
     }
 
-    /// The same packet with nothing in it: "ready to go on".
+    /// Empty `crypto_handshake` packet sent after pairing or encryption setup to complete the handshake.
     static let cryptoHandshakeDone: Bytes = {
         var out: Bytes = [WiVRn.FromHeadset.cryptoHandshake.rawValue]
         out.append(integer: UInt64(0))
@@ -370,8 +366,7 @@ enum WiVRnPacket {
         return out
     }()
 
-    /// The headset's first or third message of the PIN check. A fixed
-    /// number of numbers, each its bytes (most significant first) with their count in front.
+    /// Encodes message 1 or 3 of the PIN verification exchange as length-prefixed big-endian integers.
     static func pinCheck(_ kind: WiVRn.FromHeadset, _ numbers: [Natural]) -> Bytes {
         var out: Bytes = [kind.rawValue]
         for number in numbers {
@@ -391,7 +386,7 @@ enum WiVRnPacket {
         return out
     }
 
-    /// The display has gone from one refresh rate to another, in Hz.
+    /// Notifies the host that the display refresh rate changed from `from` to `to` Hz.
     static func refreshRateChanged(from: Float, to: Float) -> Bytes {
         var out: Bytes = [WiVRn.FromHeadset.refreshRateChanged.rawValue]
         out.append(float: from)
@@ -405,9 +400,9 @@ enum WiVRnPacket {
         return out
     }
 
-    /// Where the head and whatever the hands hold are expected to be at
-    /// `time`, worked out at `produced`; with it, each eye's place on the
-    /// head and its frustum. `holding` is an `InteractionProfile` for each hand.
+    /// Encodes a tracking packet with poses predicted for target timestamp `time`
+    /// (sampled at `produced`), per-eye view poses and frusta, and the active
+    /// `InteractionProfile` for each hand in `holding`.
     static func tracking(produced: Int64, time: Int64, views: [WiVRnView], holding: [UInt8],
                          poses: [WiVRnDevicePose], face: FaceExpressions? = nil) -> Bytes {
         var out: Bytes = [WiVRn.FromHeadset.tracking.rawValue]
@@ -416,7 +411,7 @@ enum WiVRnPacket {
         out.append(integer: produced)
         out.append(integer: time)
         out.append(integer: WiVRn.viewFullyTracked)
-        out.append(0)                               // state flags: not recentered
+        out.append(0)                               // view state flags (not recentered)
         for view in views {
             out.append(pose: view.pose)
             out.append(frustum: view.frustum)
@@ -433,9 +428,8 @@ enum WiVRnPacket {
             out.append(WiVRn.faceNone)
             return out
         }
-        // XR_FB_face_tracking2: when it was sampled, 70 weights, the
-        // confidence in the lower and the upper face, "valid", and "the
-        // eyes' weights follow the eyes" (they are not measured apart here).
+        // Serialize XR_FB_face_tracking2 sample time, 70 blendshape weights,
+        // lower/upper face confidences, is_valid = 1, and is_eye_following_blendshapes_valid = 0.
         out.append(WiVRn.faceFB2)
         out.append(integer: produced)
         for weight in face.weights { out.append(float: weight) }
@@ -446,10 +440,9 @@ enum WiVRnPacket {
         return out
     }
 
-    /// One hand's 26 joints in OpenXR's order, in world space, or nil for
-    /// a hand that is not tracked. A joint is its position, its rotation
-    /// packed into 32 bits, velocities (not given), its radius in tenths
-    /// of a millimeter, and pose flags.
+    /// Encodes a hand's 26 OpenXR world-space joints, or marks the hand untracked
+    /// when `joints` is `nil`. Each joint includes a position, a 32-bit smallest-three
+    /// quaternion, zeroed velocities, radius in 0.1 mm units, and pose flags.
     static func handTracking(produced: Int64, time: Int64, side: Side, joints: [Pose]?) -> Bytes {
         var out: Bytes = [WiVRn.FromHeadset.handTracking.rawValue]
         out.append(integer: produced)
@@ -470,12 +463,13 @@ enum WiVRnPacket {
         return out
     }
 
-    /// No platform here says how thick a finger is: 8 mm, in tenths of a millimeter.
+    /// Default joint radius (8 mm, in 0.1 mm units) used when the platform does not report finger thickness.
     static let jointRadius: UInt16 = 80
 
-    /// A unit quaternion (w, x, y, z) in 32 bits: two bits say which of
-    /// x, y, z, w is largest, and the other three follow in that order at
-    /// ten bits each, signed so that the largest is positive.
+    /// Packs a unit quaternion `(w, x, y, z)` into 32 bits using smallest-three
+    /// encoding. The top 2 bits store the index of the largest-magnitude component
+    /// (`x`, `y`, `z`, `w`), negated if needed so that component is positive, and
+    /// the remaining 3 components are quantized to 10 bits each.
     static func packedRotation(_ q: [Float]) -> UInt32 {
         let parts = [q[1], q[2], q[3], q[0]]                    // x, y, z, w
         var largest = 3
@@ -490,7 +484,7 @@ enum WiVRnPacket {
         return out
     }
 
-    /// Microphone audio: 16-bit samples at the format offered, and when they were captured.
+    /// Encodes captured 16-bit PCM microphone samples and their capture timestamp.
     static func audio(time: Int64, samples: ByteSlice) -> Bytes {
         var out: Bytes = [WiVRn.FromHeadset.audio.rawValue]
         out.append(integer: time)
@@ -499,7 +493,7 @@ enum WiVRnPacket {
         return out
     }
 
-    /// Buttons, triggers and sticks: each value with the time it last changed.
+    /// Encodes controller and hand gesture scalar inputs along with each input's last-change timestamp.
     static func inputs(_ values: [(id: UInt8, value: Float, changed: Int64)]) -> Bytes {
         var out: Bytes = [WiVRn.FromHeadset.inputs.rawValue]
         out.append(size: values.count)
@@ -511,19 +505,19 @@ enum WiVRnPacket {
         return out
     }
 
-    /// The headset's battery: 0 empty ... 1 full.
+    /// Encodes headset battery charge (`0.0` to `1.0`) and charging state.
     static func battery(_ power: PowerState) -> Bytes {
         var out: Bytes = [WiVRn.FromHeadset.battery.rawValue]
         out.append(float: power.level)
-        out.append(1)                               // there is a battery
+        out.append(1)                               // battery present
         out.append(power.charging ? 1 : 0)
         return out
     }
 
 }
 
-/// Reads a packet's fields in order. Reading past the end gives zeros and
-/// sets `overran`, so a packet cut short is noticed once, at the end.
+/// Sequential cursor for decoding WiVRn wire packets. Reads past the end of the
+/// buffer return zero and set `overran` so truncation can be checked once after parsing.
 struct WireReader {
     private let bytes: Bytes
     private var offset = 0
@@ -542,13 +536,13 @@ struct WireReader {
     mutating func float() -> Float { Float(bitPattern: integer(UInt32.self)) }
     mutating func present() -> Bool { integer(UInt8.self) != 0 }
 
-    /// A length: 16 bits, or 31 in two halves when the top bit of the first is set.
+    /// Reads a variable-length count (15-bit in one `UInt16`, or 31-bit across two `UInt16`s if bit 15 is set).
     mutating func size() -> Int {
         let first = Int(integer(UInt16.self))
         return first & 0x8000 == 0 ? first : (first & 0x7FFF) | Int(integer(UInt16.self)) << 15
     }
 
-    /// A run of bytes with its length in front: a part of the packet, not a copy.
+    /// Reads a length-prefixed byte slice directly referencing the underlying packet buffer.
     mutating func span() -> ByteSlice {
         let count = size()
         guard offset + count <= bytes.count else {
@@ -568,13 +562,13 @@ struct WireReader {
         return out
     }
 
-    /// XrPosef: orientation (x, y, z, w), then position.
+    /// Reads an `XrPosef` (quaternion `x, y, z, w` followed by 3D position).
     mutating func pose() -> Pose {
         let x = float(), y = float(), z = float(), w = float()
         return Pose(position: Vec3(float(), float(), float()), quaternion: [w, x, y, z])
     }
 
-    /// XrFovf: the angles to the left, right, upper and lower edges, in radians.
+    /// Reads an `XrFovf` (left, right, up, and down half-angles in radians) and converts to tangents.
     mutating func frustum() -> Frustum {
         let left = float(), right = float(), up = float(), down = float()
         return Frustum(left: Float(tan(Double(left))), right: Float(tan(Double(right))),

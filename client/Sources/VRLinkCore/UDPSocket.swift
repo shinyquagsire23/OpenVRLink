@@ -4,14 +4,15 @@
 
 import Foundation
 
-/// A blocking IPv4 UDP socket over the POSIX calls every target platform has.
+/// Blocking IPv4 UDP socket built on standard POSIX socket calls.
 public final class UDPSocket {
     let descriptor: Int32
 
-    /// `interface` names a network interface ("en5") that everything this
-    /// socket sends must leave by; nil lets the system's routing choose.
-    /// Fails if the interface does not exist. `localPort` asks for a
-    /// particular port to send from, and fails if it cannot be had.
+    /// Creates an IPv4 UDP socket. Pass `interface` (for example, `"en5"`) to
+    /// bind outgoing traffic to a specific network interface, or nil to use
+    /// default system routing. Pass `localPort` to bind a specific local port;
+    /// initialization fails if the interface does not exist or the port is
+    /// unavailable.
     public init?(interface: String? = nil, localPort: UInt16? = nil) {
         descriptor = socket(AF_INET, SOCK_DGRAM, 0)
         if descriptor < 0 { return nil }
@@ -26,7 +27,7 @@ public final class UDPSocket {
             }
             #else
             close(descriptor)
-            return nil      // binding to an interface is not written for this platform yet
+            return nil      // interface binding is not implemented on this platform
             #endif
         }
         if let localPort {
@@ -57,7 +58,7 @@ public final class UDPSocket {
         return address
     }
 
-    /// Fix the peer; `send` and `receive` then talk only to it.
+    /// Connects the UDP socket to a fixed peer so `send` and `receive` communicate only with that endpoint.
     public func connect(host: String, port: UInt16) -> Bool {
         var address = UDPSocket.address(host, port)
         return withUnsafePointer(to: &address) {
@@ -67,9 +68,8 @@ public final class UDPSocket {
         }
     }
 
-    /// Where this socket sends from, once connected: its IPv4 address
-    /// (four bytes, in network order), its port, and how many leading
-    /// bits of the address name its network.
+    /// Returns the connected socket's local IPv4 address (4 bytes in network
+    /// byte order), local port, and subnet prefix length.
     public func localEndpoint() -> (address: Bytes, port: UInt16, prefixLength: UInt8)? {
         var bound = sockaddr_in()
         var length = socklen_t(MemoryLayout<sockaddr_in>.size)
@@ -78,7 +78,7 @@ public final class UDPSocket {
         }
         guard result == 0, bound.sin_family == sa_family_t(AF_INET) else { return nil }
         let own = bound.sin_addr.s_addr
-        // The netmask of the interface that has this address.
+        // Look up the subnet mask on the network interface matching our local IP.
         var prefix: UInt8 = 24
         var list: UnsafeMutablePointer<ifaddrs>?
         if getifaddrs(&list) == 0 {
@@ -112,15 +112,15 @@ public final class UDPSocket {
         }
     }
 
-    /// No datagram of this protocol is longer.
+    /// Maximum datagram size used by the SVL protocol.
     static let largestDatagram = 2084
 
-    /// One datagram, or nil if none arrives within the timeout.
+    /// Receives a single datagram, or returns nil if the timeout expires.
     public func receive(timeout seconds: Double) -> Bytes? {
         receive(timeout: seconds, sender: nil)
     }
 
-    /// One datagram and the address it came from.
+    /// Receives a single datagram along with the sender's dotted-decimal IPv4 address.
     public func receiveFrom(timeout seconds: Double) -> (bytes: Bytes, sender: String)? {
         var address = sockaddr_in()
         guard let bytes = receive(timeout: seconds, sender: &address) else { return nil }
@@ -129,8 +129,8 @@ public final class UDPSocket {
         return (bytes, String(cString: text))
     }
 
-    /// The datagram is received straight into the array that is returned:
-    /// its memory is not filled first, and nothing is copied afterwards.
+    /// Reads directly into uninitialized `Bytes` storage to avoid zero-filling
+    /// or extra copies.
     private func receive(timeout seconds: Double, sender: UnsafeMutablePointer<sockaddr_in>?) -> Bytes? {
         var poller = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
         guard poll(&poller, 1, Int32(max(0, seconds) * 1000)) > 0 else { return nil }
@@ -149,8 +149,8 @@ public final class UDPSocket {
         return bytes.isEmpty ? nil : bytes
     }
 
-    /// Every address on the local IPv4 subnets, for sweeping. Subnets with
-    /// more than `limit` addresses are skipped rather than half-swept.
+    /// Enumerates host IPv4 addresses on active local subnets for discovery
+    /// sweeps, skipping subnets larger than `limit` hosts.
     public static func localSubnetAddresses(limit: Int = 1022) -> [String] {
         var addresses: [String] = []
         var list: UnsafeMutablePointer<ifaddrs>?

@@ -6,7 +6,7 @@ import XCTest
 @testable import VRLinkCore
 
 final class WiVRnTests: XCTestCase {
-    /// A video shard as a host would send it: the first of a frame carries the views.
+    /// Serializes a WiVRn video shard packet, including view poses and foveation tables on the first shard of a frame.
     private func shard(stream: UInt8 = 0, frame: UInt64, index: UInt16, first: Bool, last: Bool, payload: Bytes) -> Bytes {
         var out: Bytes = [WiVRn.ToHeadsetKind.videoShard.rawValue, stream]
         out.append(integer: frame)
@@ -52,44 +52,44 @@ final class WiVRnTests: XCTestCase {
         XCTAssertNil(WiVRnToHeadset(Bytes(packet.dropLast(2))))
     }
 
-    /// Sizes worked out from the fields of WiVRn 26.9's packets, laid end to end.
+    /// Verifies serialized packet lengths against the exact field sizes of the WiVRn 26.9 wire format.
     func testPacketsAreAsLongAsTheirFields() {
         let view = WiVRnView(pose: Pose(position: Vec3(0, 0, 0), quaternion: [1, 0, 0, 0]), frustum: .symmetric(halfAngleDegrees: 45))
         let tracking = WiVRnPacket.tracking(produced: 1, time: 2, views: [view, view], holding: [0, 0],
                                             poses: [WiVRnDevicePose(WiVRn.Device.head, TrackedPose(pose: view.pose))])
-        // kind, 3 profiles, 2 times, view flags, state flags, 2 views of 44, a count, one pose of 54, no face
+        // type, 3 interaction profiles, 2 timestamps, view flags, state flags, 2 views (44B each), pose count, 1 pose (54B), face-present flag
         XCTAssertEqual(tracking.count, 1 + 3 + 16 + 8 + 1 + 88 + 2 + 54 + 1)
-        // kind, frame, stream, ten times, a count
+        // type, frame ID, stream index, 10 timestamps, times-displayed count
         XCTAssertEqual(WiVRnFeedback(frame: 1, stream: 0).packet.count, 1 + 8 + 1 + 80 + 1)
         let info = WiVRnHeadsetInfo(renderPixels: (2048, 2048), streamPixels: (1536, 1536), refreshRates: [90, 120], preferredRate: 90,
                                     bitsPerSecond: 1, frusta: [view.frustum, view.frustum], codecs: [.h265], systemName: "abc")
-        // kind, 4 sizes, 2 rates, settings (21), speaker (6), no microphone,
-        // 2 frusta, 7 flags, trackers, 1 codec, no depth, name, language, country, variant
+        // type, 4 dimensions, 2 refresh rates, foveation/bitrate settings (21B), speaker config (6B), microphone flag,
+        // 2 frusta, 7 feature flags, tracker count, 1 codec, depth flag, system name, language, country, subvariant
         XCTAssertEqual(info.packet.count, 1 + 8 + 10 + 21 + 6 + 1 + 32 + 7 + 4 + 6 + 1 + 5 + 4 + 4 + 2)
-        // A microphone adds its channel count and rate.
+        // Enabling the microphone adds channel count and sample rate fields.
         var withMicrophone = info
         withMicrophone.microphone = true
         XCTAssertEqual(withMicrophone.packet.count, info.packet.count + 5)
-        // A face adds a time, 70 weights, two confidences and two flags.
+        // Face tracking adds a timestamp, 70 blendshape weights, two confidence values, and two flags.
         let face = FaceExpressions(weights: [Float](repeating: 0.5, count: 70))
         let withFace = WiVRnPacket.tracking(produced: 1, time: 2, views: [view, view], holding: [0, 0],
                                             poses: [WiVRnDevicePose(WiVRn.Device.head, TrackedPose(pose: view.pose))], face: face)
         XCTAssertEqual(withFace.count, tracking.count + 8 + 280 + 8 + 2)
-        // kind, a time, a length, the samples
+        // type, timestamp, payload length, PCM bytes
         XCTAssertEqual(WiVRnPacket.audio(time: 1, samples: [1, 2, 3, 4]).count, 1 + 8 + 2 + 4)
     }
 
     func testHandAndInputPacketsAreAsLongAsTheirFields() {
         let joints = TrackedHand.flat(wrist: HeadPose(position: Vec3(0, 1, 0)).pose, side: .left).joints
-        // kind, 2 times, which hand, present, 26 joints of 43
+        // type, 2 timestamps, hand ID, present flag, 26 joints (43B each)
         XCTAssertEqual(WiVRnPacket.handTracking(produced: 1, time: 2, side: .left, joints: joints).count, 1 + 16 + 1 + 1 + 26 * 43)
         XCTAssertEqual(WiVRnPacket.handTracking(produced: 1, time: 2, side: .right, joints: nil).count, 1 + 16 + 1 + 1)
-        // kind, a count, 2 inputs of 13
+        // type, input count, 2 inputs (13B each)
         XCTAssertEqual(WiVRnPacket.inputs([(17, 1, 5), (26, 0.5, 6)]).count, 1 + 2 + 26)
         XCTAssertEqual(WiVRnPacket.battery(PowerState(level: 0.5, charging: true)).count, 1 + 4 + 2)
     }
 
-    /// WiVRn's own unpacking, from its `packed_quaternion.h`, applied to what is packed here.
+    /// Verifies `packedRotation` round-trips through the unpacking formula from WiVRn's `packed_quaternion.h`.
     func testAPackedRotationUnpacksToItself() {
         func unpack(_ value: UInt32) -> [Float] {
             let scale = 1 / (511 * Float(2).squareRoot())
@@ -97,12 +97,12 @@ final class WiVRnTests: XCTestCase {
             let largest = (1 - q[0] * q[0] - q[1] * q[1] - q[2] * q[2]).squareRoot()
             var xyzw = q
             xyzw.insert(largest, at: Int(value >> 30))
-            return [xyzw[3], xyzw[0], xyzw[1], xyzw[2]]                 // w first, as this client keeps them
+            return [xyzw[3], xyzw[0], xyzw[1], xyzw[2]]                 // reorder to [w, x, y, z]
         }
         for (yaw, pitch) in [(Float(0), Float(0)), (0.7, -0.3), (2.9, 0.4), (-1.6, 1.2), (3.1, -1.4)] {
             let q = HeadPose(position: Vec3(0, 0, 0), yaw: yaw, pitch: pitch).pose.quaternion
             let back = unpack(WiVRnPacket.packedRotation(q))
-            // A rotation and its negative are the same turn.
+            // q and -q represent the same rotation.
             let sign: Float = zip(q, back).reduce(0) { $0 + $1.0 * $1.1 } < 0 ? -1 : 1
             for (a, b) in zip(q, back) { XCTAssertEqual(a, b * sign, accuracy: 0.003) }
         }
@@ -125,7 +125,7 @@ final class WiVRnTests: XCTestCase {
         XCTAssertEqual(right[72], 0)            // right thumb rest touch
     }
 
-    /// A host refuses a returning headset whose frusta differ at all, so one measured a little differently is told the old ones.
+    /// WiVRn rejects a returning headset if its reported frusta change slightly, so small measurement drift reuses the previously saved frusta.
     func testAHostIsToldTheSameFrustaAgain() {
         let file = FileManager.default.temporaryDirectory.appendingPathComponent("wivrn-displays-\(UUID().uuidString).json")
         defer { try? FileManager.default.removeItem(at: file) }
@@ -137,7 +137,7 @@ final class WiVRnTests: XCTestCase {
         let settled = WiVRnDisplayMemory.settled(again, host: "a", file: file)
         XCTAssertEqual(settled[0].left, -1)
         XCTAssertEqual(settled[1].up, 1)
-        // Another host has not been told anything yet; and a display that has really changed is taken as it is.
+        // A new host gets the current frusta directly, and a large frustum change updates the saved values.
         XCTAssertEqual(WiVRnDisplayMemory.settled(again, host: "b", file: file)[0].left, -1.01)
         again[0].left = -1.3
         XCTAssertEqual(WiVRnDisplayMemory.settled(again, host: "a", file: file)[0].left, -1.3)
@@ -168,7 +168,7 @@ final class WiVRnTests: XCTestCase {
         XCTAssertEqual(reader.size(), 0x12345)
     }
 
-    /// 10 pixels at 2:1, 60 at 1:1, 10 at 2:1: 100 source pixels in 80.
+    /// Tests a 3-band foveation profile (10 px at 2:1, 60 px at 1:1, 10 px at 2:1), mapping 100 source pixels into 80 encoded pixels.
     func testBandsCoverThePictureAndItsSource() {
         let bands = WiVRnFoveation.bands([10, 60, 10], encodedSize: 80)
         XCTAssertEqual(bands.count, 3)
@@ -177,7 +177,7 @@ final class WiVRnTests: XCTestCase {
         XCTAssertEqual(bands[1].source.upperBound, 0.8, accuracy: 1e-6)
         XCTAssertEqual(bands[2].encoded.upperBound, 1, accuracy: 1e-6)
         XCTAssertEqual(WiVRnFoveation.sourceSize([10, 60, 10]), 100)
-        // A picture not squeezed is one band.
+        // Without foveation, the entire axis is a single 1:1 band.
         XCTAssertEqual(WiVRnFoveation.bands([], encodedSize: 80).count, 1)
     }
 
@@ -192,14 +192,14 @@ final class WiVRnTests: XCTestCase {
         XCTAssertEqual(tiles.count, 3)
         XCTAssertTrue(tiles.allSatisfy { $0.picture == 1 })
         XCTAssertEqual(tiles[0].frustum.left, -1, accuracy: 1e-6)
-        XCTAssertEqual(tiles[0].frustum.right, -0.7, accuracy: 1e-6)           // a fifth of the way across
+        XCTAssertEqual(tiles[0].frustum.right, -0.7, accuracy: 1e-6)           // 20% across the [-1, 0.5] frustum
         XCTAssertEqual(tiles[1].frustum.left, tiles[0].frustum.right, accuracy: 1e-6)
         XCTAssertEqual(tiles[2].frustum.right, 0.5, accuracy: 1e-6)
         XCTAssertEqual(tiles[0].frustum.up, 1, accuracy: 1e-6)
         XCTAssertEqual(tiles[0].frustum.down, -0.8, accuracy: 1e-6)
     }
 
-    /// The picture of transparency has the left eye in its left half and the right eye in its right.
+    /// In alpha-packed streams, the third image stores left-eye alpha in its left half and right-eye alpha in its right half.
     func testTransparencyIsFoundInItsHalfOfTheThirdPicture() {
         let view = WiVRnView(pose: Pose(position: Vec3(0, 0, 0), quaternion: [1, 0, 0, 0]), frustum: .symmetric(halfAngleDegrees: 45))
         let squeeze = WiVRnFoveation(across: [10, 60, 10], down: [80])
@@ -211,7 +211,7 @@ final class WiVRnTests: XCTestCase {
         XCTAssertEqual(layout.pictures, 3)
         let left = layout.views[0].tiles[1].alpha, right = layout.views[1].tiles[1].alpha
         XCTAssertEqual(left?.picture, 2)
-        XCTAssertEqual(left?.left ?? -1, 0.0625, accuracy: 1e-6)          // 10 of 80 pixels in, halved
+        XCTAssertEqual(left?.left ?? -1, 0.0625, accuracy: 1e-6)          // (10 / 80) * 0.5 within the left half of the alpha image
         XCTAssertEqual(left?.right ?? -1, 0.4375, accuracy: 1e-6)
         XCTAssertEqual(right?.left ?? -1, 0.5625, accuracy: 1e-6)
         XCTAssertEqual(right?.bottom ?? -1, 1, accuracy: 1e-6)
@@ -243,7 +243,7 @@ final class WiVRnTests: XCTestCase {
         XCTAssertEqual(result.complete?.frame, 4)
         XCTAssertEqual(result.abandoned.map(\.frame), [3])
         XCTAssertEqual(result.abandoned.first?.sentToDecoder, 0)
-        // What comes late for the frame given up is ignored.
+        // Late shards for an already-abandoned frame are ignored.
         XCTAssertNil(assembler.accept(parsed(shard(frame: 3, index: 1, first: false, last: true, payload: [9])), now: 3).complete)
     }
 
@@ -268,7 +268,7 @@ final class WiVRnTests: XCTestCase {
         }
     }
 
-    /// Turning left at one radian a second for half a second faces half a radian left.
+    /// Turning left at 1 rad/s for 0.5 s rotates the forward vector 0.5 radians to the left.
     func testAPoseIsCarriedForwardByItsVelocities() {
         var head = HeadPose(position: Vec3(0, 1.6, 0))
         head.yawRate = 1

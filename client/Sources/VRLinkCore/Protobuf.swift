@@ -2,8 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-/// Just enough protobuf for the handful of messages the pairing protocol
-/// needs (docs/remoteplay/)
+/// Minimal Protocol Buffers wire encoder and decoder for Remote Play discovery
+/// and pairing messages (see `docs/remoteplay/`).
 
 public enum ProtoValue {
     case varint(UInt64)

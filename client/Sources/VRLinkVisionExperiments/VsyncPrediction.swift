@@ -5,20 +5,20 @@
 #if os(visionOS)
 import QuartzCore
 
-/// When what RealityKit is given now will be seen, from the display's own
-/// refresh signal. (The ALVR visionOS client's method.)
+/// Estimates display presentation timestamps for RealityKit updates using
+/// `CADisplayLink`, following the approach used in the ALVR visionOS client.
 ///
-/// RealityKit does not say when a change will reach the eyes, but a display
-/// link says when each refresh happens, and what RealityKit is handed is
-/// shown a whole number of refreshes later: as many as it takes to cover
-/// its own drawing time (about 14 ms, so two refreshes at 90 Hz).
+/// RealityKit does not expose per-frame presentation timestamps directly.
+/// `CADisplayLink` provides the display refresh cadence, and scene changes
+/// appear a whole number of refresh intervals later based on RealityKit's
+/// render latency (roughly 14 ms, or two refreshes at 90 Hz).
 @MainActor
 final class VsyncPrediction: NSObject {
-    /// When what is set in the current update will be seen, on the `CACurrentMediaTime` clock.
+    /// Predicted presentation time (`CACurrentMediaTime`) for changes made in the current scene update.
     private(set) var nextFrameTime: TimeInterval = 0
-    /// The time between two refreshes, in seconds; 0 before the first one.
+    /// Display refresh interval in seconds, or `0` before the first display link callback.
     private(set) var refreshPeriod: TimeInterval = 0
-    /// How long an update takes to reach the display, a running average, in seconds.
+    /// Exponentially smoothed estimate of total update-to-display latency, in seconds.
     private var averageDrawTime: TimeInterval = 0.014
     private var link: CADisplayLink?
 
@@ -37,13 +37,13 @@ final class VsyncPrediction: NSObject {
     @objc private func refreshed(_ link: CADisplayLink) {
         let period = link.targetTimestamp - link.timestamp
         guard period > 0 else { return }
-        // The drawing time, rounded up to whole refreshes.
+        // Round estimated draw latency up to the next whole refresh interval.
         let latency = (averageDrawTime / period).rounded(.up) * period
         refreshPeriod = period
         nextFrameTime = link.targetTimestamp + latency
     }
 
-    /// Tell it how long this update's own work took, in seconds.
+    /// Records the CPU/GPU duration of the current update pass, in seconds.
     func updateTook(_ seconds: TimeInterval) {
         averageDrawTime = (averageDrawTime + seconds + refreshPeriod) * 0.5
     }

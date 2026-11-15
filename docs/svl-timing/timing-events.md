@@ -5,26 +5,27 @@ Sources: `GetTimingEventString(timingevent)` +0x156890 and its table
 `SVLRoot::ReportTimingEvent(timingevent, int, int)` +0x164f84,
 `QSVLClient::ReportTimingEventWithTimestamp(timingevent, int, int, int)`
 +0xf7378, `QSVLClient::ReceivedBookend(SVLVideoFrameDescriptor_t*)` +0xf6cf8.
-All **static** unless marked.
+All details below are **static** unless marked otherwise.
 
-Timing events are a shared host/client vocabulary of "this happened at time
-t" marks. The prefix of each name says who raises it: `SC` server compositor
-(custom), `SR` server render, `SE` server encode, `SN` server network, `CN`
-client network, `CR` client render.
+Timing events are a shared host/client vocabulary of timestamped trace
+markers. Each event name's prefix indicates the subsystem that raises it: `SC`
+server compositor (custom), `SR` server render, `SE` server encode, `SN` server
+network, `CN` client network, and `CR` client render.
 
-## How they travel
+## Transport and logging
 
-- **Client-raised events stay on the client.** `ReportTimingEvent` (only when
-  the debug flag `SVLRoot+0xc69` is set) stamps the event with the local
+- **Client-raised events stay on the client.** `ReportTimingEvent` (active only
+  when the debug flag `SVLRoot+0xc69` is set) stamps the event with the local
   timestamp and calls `ReportTimingEventWithTimestamp`, which stores
   `{u8 event, u8 arg, i32 time}` in a 512-entry ring for the debug overlay and
-  formats a log line `"<name> # dtime=%d"`. No client→host timing-event
-  message was found, and **captured** (`vr3`): the client sent only four
-  kinds of element in 40 s (pose, key/value, frame report, class 3 type
-  0x11), none of them a timing-event carrier. What the client does send per frame is the fixed report
-  in [frame-reports.md](frame-reports.md).
+  formats a log line `"<name> # dtime=%d"`. No client-to-host timing-event
+  message was found statically, and **captured** (`vr3`): `vrlink` sent only
+  four kinds of elements in 40 s (pose, key/value, frame report, and class 3
+  type 0x11), none of which carries timing events. For per-frame upstream
+  latency reporting, the client instead sends the fixed type-4 packet
+  documented in [frame-reports.md](frame-reports.md).
 - **Host-raised events arrive in the tail of the video frame descriptor
-  ("bookend")**, below.
+  ("bookend")**, as shown below.
 
 ## Host events in the bookend tail
 
@@ -48,7 +49,7 @@ in docs/svl-video/). `QSVLClient::ReceivedBookend` parses it as:
 binary) returns `T − desc + 0x10`, i.e. a descriptor with an empty tail is
 `T + 16` bytes long.
 
-Timing-event record (8 bytes):
+Each timing-event record is 8 bytes:
 
 | off | type | field |
 |---|---|---|
@@ -64,7 +65,7 @@ id **0x24** (`SE Encode Data Wait Complete`) increments the "host generated a
 frame" counter for the display slot the converted time falls in
 (the same bookkeeping as `GotNoteFromServerThatFrameWasGenerated` +0xf6fd4).
 
-## The enum
+## Timing event IDs
 
 | id | name / format | id | name / format |
 |---|---|---|---|
@@ -101,7 +102,7 @@ frame" counter for the display slot the converted time falls in
 
 Ids ≥ 0x6c format as `Unknown Event [id=%d]`.
 
-Events this pass saw the client raise, with their argument:
+Client-raised events observed during static analysis:
 
 | id | raised in | argument |
 |---|---|---|
@@ -111,45 +112,47 @@ Events this pass saw the client raise, with their argument:
 | 0x5e | `PhaseEventControlLoop`, `AdjustPhaseOffset` | −step (µs) / delta |
 | 0x5f | `PhaseEventDecodeComplete` | phase error (µs) |
 
-The names `SN Got WaitGetPoses*` show the host thinks of the client's pose
-packet as the client's "WaitGetPoses" call, and `SN SendBookend0..7/N` that a
-frame's descriptor is sent several times ("bookends"), matching
+The `SN Got WaitGetPoses*` names indicate that the host treats the client's
+pose packet as a `WaitGetPoses` event, and `SN SendBookend0..7/N` reflect that
+a video frame's descriptor is sent multiple times ("bookends"), matching
 `CN Got Bookend0..8` on the client (see docs/svl-video/).
 
-## Confirmed against capture `vr3`
+## Capture verification (`vr3`)
 
-All 8,631 frame descriptors of `vr3` (40 s, real client, SteamVR host
+All 8,631 frame descriptors in `vr3` (40 s of `vrlink` against a SteamVR host
 reporting descriptor version 14) were parsed with the layout above. Every
 descriptor is a fixed 1,024-byte element (1,016-byte value) with the short
-0xf0 metadata, so `T` is at dataset offset 0x28 + 0xf0 = 0x118 and the tail
-region is 744 bytes long.
+0xf0 metadata, placing `T` at dataset offset `0x28 + 0xf0 = 0x118` with a
+744-byte tail region.
 
-- **captured**: `T+0x0c` (tail version) is 3 in 8,631 of 8,631.
-- **captured**: the two haptic records (`T+0x00..0x0b`) are all zero in every
-  descriptor, as expected for a host version ≥ 5.
+- **captured**: `T+0x0c` (tail version) is 3 in all 8,631 descriptors.
+- **captured**: The two haptic records (`T+0x00..0x0b`) are all zero in every
+  descriptor, as expected for host version ≥ 5.
 - **captured**: `nValues` is 4 in every descriptor: 34,524 `TransportValue_t`
-  records, 51 distinct keys, cycling through the host's table (its per-frame
-  keys recur every other frame, an echoed client key about every 0.23 s).
+  records across 51 distinct keys, cycling through the host's table (per-frame
+  keys recur every other frame, and an echoed client key recurs about every
+  0.23 s).
 - **captured**: **`nEvents` is 0 in every descriptor.** This production host
   never sent a timing-event record, so the 8-byte record layout and the 0x24
   side effect remain **static** only.
-- **captured**: `nVteBytes` is 0 in 8,602 descriptors and 224 (12), 244 (1) or
-  252 (16) in the other 29; in all 29 the bytes parse as whole
-  ValueTransportSystem records ending exactly at `nVteBytes`.
-- **captured**: the three counts account for the *used* part of the tail
-  (`0x10 + 32·4 + nVteBytes` = 144…396 bytes) but not for the element's
-  length: the remaining 348…600 bytes are not described by anything and are
-  **not zero** in 8,072 of 8,631 descriptors — they hold what looks like
-  stale host memory, unrelated to the stream. A parser must stop at the
-  counts and ignore the rest; the vr1 pass's "zero-padded to the end"
-  (docs/svl-video/) does not hold.
+- **captured**: `nVteBytes` is 0 in 8,602 descriptors and 224 (12 times), 244
+  (once), or 252 (16 times) in the remaining 29 descriptors; in all 29 cases
+  the bytes parse as complete ValueTransportSystem records ending right at
+  `nVteBytes`.
+- **captured**: The three counts account for the *used* portion of the tail
+  (`0x10 + 32·4 + nVteBytes` = 144…396 bytes), while the remaining 348…600
+  bytes up to the 1,024-byte element size are unreferenced and **non-zero** in
+  8,072 of 8,631 descriptors — containing what appears to be uninitialized host
+  memory unrelated to the stream. A parser must stop at the header counts and
+  ignore trailing bytes; the earlier `vr1` assumption that tails are
+  zero-padded to the end (docs/svl-video/) does not hold.
 
 ## Open questions
 
-- Whether any host build or debug setting produces `nEvents > 0` (none in
-  `vr3`). A client must still step over `8·nEvents` bytes to find the
-  embedded VTE message.
-- Whether the client is expected to send any timing events upstream (none
-  found statically, none sent in `vr3`).
-- Meaning of byte 0 of each haptic record, and haptic delivery for host
-  version ≥ 5 (docs/svl-tracking-input/).
+- Check whether any host build or debug setting produces `nEvents > 0` (all
+  descriptors in `vr3` had `nEvents == 0`). Clients must still skip
+  `8 · nEvents` bytes to reach any embedded VTE message.
+- Confirm whether the client ever sends timing events upstream (none were found
+  statically or in `vr3`).
+- Identify byte 0 of each legacy haptic record, and see
+  docs/svl-tracking-input/ for haptic delivery on host version ≥ 5.

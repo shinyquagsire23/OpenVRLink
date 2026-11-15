@@ -9,8 +9,8 @@ import XCTest
 import VRLinkCore
 @testable import VRLinkVideoToolbox
 
-/// One keyframe of a 128x128 test pattern in each codec, made with
-/// `ffmpeg -f lavfi -i testsrc=size=128x128 -frames:v 1 -c:v {h264,hevc}_videotoolbox`.
+/// Tests Annex B / OBU keyframe detection and VideoToolbox decoding using 128x128 single-frame test vectors
+/// generated with `ffmpeg -f lavfi -i testsrc=size=128x128 -frames:v 1 -c:v {h264,hevc}_videotoolbox`.
 final class DecoderTests: XCTestCase {
     private static func bytes(_ hex: String) -> Bytes {
         var out = Bytes(), index = hex.startIndex
@@ -84,7 +84,7 @@ final class DecoderTests: XCTestCase {
         "2ed7672d918d8ae62e37f504f9db90527aa2e1cfc17e2041ce3800a3a8348c4b533c18d4f7d71063ea9b502a54cf46dd039c4e33805be05030852649" +
         "6a9a5a73c27a10135ebd4b09ed000ff4e0f1f12ceaf0c508a513d71ea096a4eda92cf55d2c62a6a3fb5259cc8fc7fc4024f8")
 
-    /// `ffmpeg ... -c:v libsvtav1 -f obu`, the same test pattern.
+    /// Same 128x128 test pattern encoded as AV1 OBUs via `ffmpeg ... -c:v libsvtav1 -f obu`.
     private static let av1Keyframe = bytes(
         "12000a0a0000000337ffe357cc0232ad07140023a02082041013ef0080d8005aab2513fdfc997ca18c8795205c6e3bcf9513b505e10efd01f9060f5e" +
         "669d784ffd88d3826efbcdbd02b9d8dab594f9e3ac75f9b43b509404d3dca59fff88941ea0714ceaff5d0b34b0f7113b73bc6d5fe73e40d161659427" +
@@ -121,19 +121,19 @@ final class DecoderTests: XCTestCase {
     func testCodecIsReadFromTheStream() {
         XCTAssertEqual(AnnexB.keyframeCodec(DecoderTests.h264Keyframe), .h264)
         XCTAssertEqual(AnnexB.keyframeCodec(DecoderTests.hevcKeyframe), .hevc)
-        // An access-unit delimiter in front does not hide it.
+        // Leading access-unit delimiters do not prevent keyframe detection.
         XCTAssertEqual(AnnexB.keyframeCodec([0, 0, 0, 1, 0x09, 0xF0] + DecoderTests.h264Keyframe), .h264)
         XCTAssertEqual(AnnexB.keyframeCodec([0, 0, 0, 1, 0x46, 0x01, 0x50] + DecoderTests.hevcKeyframe), .hevc)
-        // AV1: a temporal delimiter then a sequence header; then a delimiter and a frame.
+        // For AV1, a temporal delimiter followed by a sequence header OBU is a keyframe, whereas a frame OBU without a sequence header is not.
         XCTAssertEqual(AnnexB.keyframeCodec([0x12, 0x00, 0x0A, 0x0B, 0x00, 0x00]), .av1)
         XCTAssertNil(AnnexB.keyframeCodec([0x12, 0x00, 0x32, 0x10]))
-        // Parameter sets in front of an ordinary slice are not a keyframe (HEVC: VPS, SPS, PPS, then a trailing slice).
+        // HEVC parameter sets (VPS, SPS, PPS) followed by a non-IDR trailing slice are not a keyframe.
         XCTAssertNil(AnnexB.keyframeCodec([0, 0, 0, 1, 0x40, 0x01, 0x0C, 0, 0, 0, 1, 0x42, 0x01, 0x01, 0, 0, 0, 1, 0x44, 0x01, 0xC0,
                                            0, 0, 0, 1, 0x02, 0x01, 0xD0, 0x10]))
-        // ... but in front of an IDR slice they are.
+        // HEVC parameter sets followed by an IDR slice are detected as a keyframe.
         XCTAssertEqual(AnnexB.keyframeCodec([0, 0, 0, 1, 0x40, 0x01, 0x0C, 0, 0, 0, 1, 0x42, 0x01, 0x01, 0, 0, 0, 1, 0x44, 0x01, 0xC0,
                                              0, 0, 0, 1, 0x26, 0x01, 0xAF, 0x10]), .hevc)
-        // Slices alone are not keyframes: an H.264 non-IDR slice, an HEVC trailing slice.
+        // Standalone H.264 non-IDR and HEVC trailing slices without parameter sets are not keyframes.
         XCTAssertNil(AnnexB.keyframeCodec([0, 0, 0, 1, 0x41, 0x9A, 0x00]))
         XCTAssertNil(AnnexB.keyframeCodec([0, 0, 0, 1, 0x02, 0x01, 0xD0]))
     }

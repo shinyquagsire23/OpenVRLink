@@ -8,7 +8,7 @@ import XCTest
 final class HandTests: XCTestCase {
     private let wrist = Pose(position: Vec3(0.1, 1.2, -0.3), right: Vec3(1, 0, 0), up: Vec3(0, 1, 0), forward: Vec3(0, 0, -1))
 
-    /// Undo `compressedSkeleton`, the way the reference client's decompressor does.
+    /// Unpacks `compressedSkeleton` using the same quantization constants as `vrlink`.
     private func decompress(_ data: Bytes) -> [(position: [Float], orientation: [Float])] {
         (0..<data.count / 8).map { bone in
             let first: UInt32 = data.integer(at: bone * 8), second: UInt32 = data.integer(at: bone * 8 + 4)
@@ -45,7 +45,7 @@ final class HandTests: XCTestCase {
 
     func testStraightFingerBonesLieAlongTheirParents() {
         let bones = TrackedHand.flat(wrist: wrist, side: .left).bones(.left)
-        // Index finger, second joint: 4 cm from the first, not bent.
+        // The second index-finger joint sits 4 cm along its parent bone with identity rotation.
         XCTAssertEqual(bones[8].position.x, 0.04, accuracy: 1e-5)
         XCTAssertEqual(bones[8].orientation[0], 1, accuracy: 1e-5)
         let mirrored = TrackedHand.flat(wrist: wrist, side: .right).bones(.right)
@@ -65,7 +65,7 @@ final class HandTests: XCTestCase {
         XCTAssertEqual(gestures.inputBlock().count, 28)
         XCTAssertEqual(gestures.inputBlock()[0], 1)
 
-        // Curl every fingertip back towards the wrist: a fist.
+        // Curl every fingertip back toward the wrist to form a fist.
         for finger in 0..<4 {
             hand.joints[TrackedHand.tip(finger)].forward = wrist.forward * -1
         }
@@ -84,12 +84,12 @@ final class HandTests: XCTestCase {
         }
         let before = hand.aim(.right, head: head), after = moved.aim(.right, head: head)
         XCTAssertEqual(length(before.forward - after.forward), 0, accuracy: 1e-6)
-        // Where the ray starts does follow the thumb.
+        // The ray origin still shifts when the thumb moves.
         XCTAssertGreaterThan(length(before.position - after.position), 0.005)
     }
 
     func testPowerProps() {
-        // The reference client's two constants, and a controller that is charging.
+        // Test `vrlink`'s fixed property bytes for devices without and with battery reporting, plus charging state.
         XCTAssertEqual(DeviceProfile.powerProps(nil, reportsBattery: false), [0x3F, 0, 0, 0, 0x1A, 0, 0, 0, 0, 0, 0, 0])
         XCTAssertEqual(DeviceProfile.powerProps(PowerState(level: 0.5, charging: false), reportsBattery: true),
                        [0x3F, 0, 0, 0, 0x1B, 0, 0, 0, 0, 0, 0, 0x3F])
@@ -105,14 +105,14 @@ final class HandTests: XCTestCase {
 
     func testOneEuroFilterSteadiesJitterAndFollowsMotion() {
         var filter = OneEuroFilterVec3(slowestCutoff: 1.5, speedGain: 20)
-        // A still point with 1 mm of jitter at 480 samples a second comes out steadier.
+        // Smooths 1 mm of 480 Hz jitter on a stationary point below 0.3 mm.
         var worst: Float = 0
         for step in 0..<480 {
             let out = filter.smooth(Vec3(step % 2 == 0 ? 0.001 : -0.001, 0, 0), seconds: 1.0 / 480)
             if step > 240 { worst = max(worst, abs(out.x)) }
         }
         XCTAssertLessThan(worst, 0.0003)
-        // Moving at 1 m/s it stays within a centimeter of the truth.
+        // Tracks a point moving at 1 m/s within 1 cm.
         var x: Float = 0, out = Vec3(0, 0, 0)
         for _ in 0..<480 {
             x += 1.0 / 480

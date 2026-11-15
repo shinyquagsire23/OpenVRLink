@@ -4,14 +4,14 @@
 
 import Foundation
 
-/// A TCP connection that is written to whole and read as it comes.
+/// IPv4 TCP client socket with blocking full-buffer writes and non-blocking reads.
 public final class TCPSocket {
     let descriptor: Int32
     private let sendLock = NSLock()
 
-    /// Connects to `address` (IPv4, in numbers), giving up after `timeout` seconds.
-    /// `interface` names a network interface the connection must use; nil
-    /// lets the system's routing choose.
+    /// Connects to a dotted-decimal IPv4 `address` and `port`, timing out after
+    /// `timeout` seconds. Pass `interface` to bind the socket to a specific
+    /// network interface, or nil to use default system routing.
     public init?(address: String, port: UInt16, timeout: Double = 5, interface: String? = nil) {
         descriptor = socket(AF_INET, SOCK_STREAM, 0)
         if descriptor < 0 { return nil }
@@ -26,14 +26,14 @@ public final class TCPSocket {
             }
             #else
             close(descriptor)
-            return nil      // binding to an interface is not written for this platform yet
+            return nil      // interface binding is not implemented on this platform
             #endif
         }
         var target = sockaddr_in()
         target.sin_family = sa_family_t(AF_INET)
         target.sin_port = port.bigEndian
         inet_pton(AF_INET, address, &target.sin_addr)
-        // Connect without blocking, so that an address nobody answers at does not hold the caller for minutes.
+        // Use a non-blocking connect with poll() so unreachable hosts time out promptly.
         let flags = fcntl(descriptor, F_GETFL)
         _ = fcntl(descriptor, F_SETFL, flags | O_NONBLOCK)
         let started = withUnsafePointer(to: &target) {
@@ -56,19 +56,19 @@ public final class TCPSocket {
         var on: Int32 = 1
         setsockopt(descriptor, IPPROTO_TCP, TCP_NODELAY, &on, socklen_t(MemoryLayout<Int32>.size))
         #if canImport(Darwin)
-        // A write to a connection the peer has closed is an error here, not a signal that ends the process.
+        // Return EPIPE on writes to a closed peer instead of raising SIGPIPE.
         setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
         #endif
     }
 
     deinit { close(descriptor) }
 
-    /// End the connection now, without waiting for this object to go: the peer sees it close.
+    /// Shuts down both directions of the socket immediately so the peer sees EOF before deallocation.
     public func shutDown() {
         _ = shutdown(descriptor, SHUT_RDWR)
     }
 
-    /// All of `bytes`, or false if the connection is gone. Safe to call from any thread.
+    /// Writes all of `bytes` to the socket, returning false if the connection fails. Thread-safe.
     @discardableResult
     public func send(_ bytes: Bytes) -> Bool {
         sendLock.lock()
@@ -82,7 +82,7 @@ public final class TCPSocket {
         return true
     }
 
-    /// Whatever has arrived, without waiting. Nil when the peer has closed the connection.
+    /// Reads any immediately available bytes without blocking, or returns nil if the connection is closed or errored.
     public func receiveAvailable() -> Bytes? {
         var closed = false
         let bytes = Bytes(unsafeUninitializedCapacity: 64 << 10) { buffer, count in
@@ -93,7 +93,7 @@ public final class TCPSocket {
         return closed ? nil : bytes
     }
 
-    /// The IPv4 address of `host`, a name or an address, in numbers.
+    /// Resolves a hostname or IPv4 string to a dotted-decimal IPv4 address.
     public static func resolve(_ host: String) -> String? {
         var hints = addrinfo()
         hints.ai_family = AF_INET
@@ -110,9 +110,9 @@ public final class TCPSocket {
     }
 }
 
-/// Waiting on several sockets at once.
+/// Multiplexed readiness polling across multiple file descriptors.
 enum Sockets {
-    /// Which of `descriptors` can be read, after waiting up to `timeout` seconds for any of them.
+    /// Polls `descriptors` for up to `timeout` seconds and returns a boolean per descriptor indicating read/close readiness.
     static func readable(_ descriptors: [Int32], timeout: Double) -> [Bool] {
         var pollers = descriptors.map { pollfd(fd: $0, events: Int16(POLLIN), revents: 0) }
         _ = poll(&pollers, nfds_t(pollers.count), Int32(max(0, timeout) * 1000))

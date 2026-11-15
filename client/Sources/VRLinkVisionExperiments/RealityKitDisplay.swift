@@ -17,25 +17,24 @@ import VRLinkMetal
 import VRLinkVideoToolbox
 import simd
 
-/// Experiment: the stream shown with RealityKit instead of a compositor layer.
+/// Experimental RealityKit-based stream renderer used instead of a CompositorServices layer.
 ///
-/// It exists for one reason: RealityKit content can carry the view that
-/// the Persona's camera sits at, so that camera can be kept in front of the
-/// face (see `PersonaTracking`). The method is the ALVR visionOS client's:
+/// RealityKit is used here because a RealityView can host the SwiftUI camera
+/// anchor needed to keep the Spatial Persona camera positioned in front of the
+/// user's face (see `PersonaTracking`). The rendering pipeline follows the
+/// ALVR visionOS client:
 ///
-/// - Each decoded frame is flattened by the ordinary quad renderer into one
-///   texture, one eye above the other: for each eye, the base tile with the
-///   foveal tile over it, exactly as the host's eye saw them.
-/// - Each eye has a flat rectangle ("plane") far away in the world, placed
-///   where that eye's picture belongs: it fills the host's frustum for that
-///   eye as seen from where the host rendered. Its material shows its half
-///   of the texture to its own eye and nothing to the other.
-/// - There are three sets of texture and planes, used in turn, with only
-///   the newest shown: a texture and the place of its planes then always
-///   change together, never one a frame before the other.
+/// - Each decoded frame is composited by `QuadRenderer` into a single stacked
+///   texture (one eye per vertical half), blending the foveal tile over the
+///   base tile from the host's rendered eye pose.
+/// - Each eye views a distant quad plane sized and positioned to fill that
+///   eye's host frustum from the rendered eye pose. A stereo ShaderGraph
+///   material displays each half of the stacked texture only to the matching eye.
+/// - Textures and plane entities are triple-buffered, enabling only the newest
+///   set each frame so texture contents and plane poses always update atomically.
 ///
-/// Against the compositor layer this costs a second pass over every pixel
-/// and loses the display's own foveation.
+/// Compared with the CompositorServices path, this requires an extra full-frame
+/// render pass and forfeits system compositor foveation.
 @MainActor
 public final class RealityKitDisplay {
     private let connection: Connection
@@ -62,19 +61,18 @@ public final class RealityKitDisplay {
     private var vsync: VsyncPrediction?
     private var eyeSize = (width: 0, height: 0)
     private var framesDrawn = 0, updatesSeen = 0
-    /// Black, behind the planes, for a picture that is not keyed (`showBackdrop`).
+    /// Opaque black backdrop placed behind the eye planes when chroma keying is inactive (`showBackdrop`).
     private var backdrop: ModelEntity?
     public private(set) var stopped = false
 
-    /// How far away the planes stand, in meters, left then right. Far, so
-    /// that everything else RealityKit draws is in front; not the same, so
-    /// that the two do not fight over which is in front.
+    /// Distance in meters to the left and right eye planes. Placed far out so
+    /// other RealityKit content renders in front, and staggered to avoid z-fighting.
     private static let planeDistance: [Float] = [80, 70]
-    /// The black behind the planes stands this far from the head, in
-    /// meters, and is twenty times as wide: far more than the eyes see.
+    /// Distance in meters from the head to the black backdrop plane, which is
+    /// scaled to 20x this distance so it covers the entire field of view.
     private static let backdropDistance: Float = 90
-    /// The flattened picture has this many pixels for each one of a tile,
-    /// each way, so that the sharper foveal tile keeps most of its detail.
+    /// Per-axis resolution multiplier applied to eye tile dimensions when
+    /// flattening without foveation, preserving detail from the higher-density foveal tile.
     private static let flattenScale = 1.6
     private static let largestSide = 3072
 
@@ -91,7 +89,7 @@ public final class RealityKitDisplay {
         self.renderer = renderer
     }
 
-    /// Build the scene. `personaCamera` is the entity of the view the Persona's camera sits at.
+    /// Populates the RealityKit scene and attaches the Persona camera anchor entity.
     func setup(_ content: inout RealityViewContent, attachments: RealityViewAttachments) async {
         content.add(root)
         pinches.onGaze = { [persona, head, settings] direction in
@@ -99,8 +97,8 @@ public final class RealityKitDisplay {
         }
         personaCamera = PersonaAttachments.add(to: &content, from: attachments, settings: settings.current)
 
-        // Pinches made at a distance are only reported if the eyes' ray
-        // hits something that takes input: an unseen sheet that turns with the head.
+        // Add a head-locked invisible collision plane because visionOS only reports
+        // indirect pinches when the gaze ray intersects an input target entity.
         let headAnchor = AnchorEntity(.head)
         headAnchor.anchoring.trackingMode = .continuous
         var unseen = UnlitMaterial(color: .init(red: 0, green: 0, blue: 0, alpha: 0))
@@ -115,8 +113,8 @@ public final class RealityKitDisplay {
         catcher.scale = [6, 6, 6]
         headAnchor.addChild(catcher)
 
-        // Opaque, so it is drawn before the planes, which do not look at
-        // depth and so are drawn over it though they are nearer.
+        // Keep the backdrop opaque so RealityKit renders it before the eye
+        // planes, which disable depth testing and composite on top of it.
         let black = ModelEntity(mesh: sheet, materials: [UnlitMaterial(color: .black)])
         black.position = [0, 0, -RealityKitDisplay.backdropDistance]
         black.orientation = simd_quatf(angle: .pi / 2, axis: [1, 0, 0])
@@ -143,7 +141,7 @@ public final class RealityKitDisplay {
         Log.note("realitykit: scene ready")
     }
 
-    /// The end of this display: the space has gone, or is out of sight.
+    /// Stops streaming and tears down tracking when the immersive space closes or moves to the background.
     func stop() {
         guard !stopped else { return }
         stopped = true
@@ -155,20 +153,20 @@ public final class RealityKitDisplay {
         connection.immersed = false
         persona.leave()
         pinches.forgetAll()
-        // What this stream's pinches taught the gaze calibration, unless it was forgotten meanwhile.
+        // Persist any continuous gaze calibration updates from this session unless calibration was cleared.
         if let tuned = persona.takeTunedCalibration(), settings.settings.gazeCalibration != nil {
             settings.settings.gazeCalibration = tuned
         }
     }
 
-    /// Describe the display to the host as it was last measured, and ask
-    /// for a stream to show with RealityKit. The space need not be open
-    /// yet. False if the display has not been measured.
+    /// Starts a host streaming session configured for RealityKit display using
+    /// the last measured display profile. Can be called before the immersive
+    /// space opens; returns `false` if no display measurements are available.
     @discardableResult
     public static func connect(_ inputs: StreamInputs, persona: PersonaTracking) -> Bool {
         guard let measured = inputs.measured.value, var profile = inputs.profileForHost() else { return false }
         let chosen = inputs.settings.current
-        // This renderer can send the eyes and the face (`PersonaTracking`).
+        // RealityKit mode supports Persona-based eye and face tracking (`PersonaTracking`).
         profile.tracksEyesOrFace = true
         inputs.head.setEyeMidpoint(measured.eyeMidpoint, atConnect: true)
         inputs.controllers.gripsAsRendered = false
@@ -177,28 +175,27 @@ public final class RealityKitDisplay {
         inputs.connection.start(profile: profile, microphone: chosen.microphone,
                                 headProvider: { [head = inputs.head] in head.trackedHead() },
                                 handsProvider: { [inputs] in inputs.handsNow() },
-                                // There is no rate map to read the gaze from here: the Persona's eyes or nothing.
+                                // RealityKit provides no compositor rasterization rate map, so gaze comes solely from PersonaTracking.
                                 gazeProvider: { [persona, settings = inputs.settings] in persona.gaze(settings.current) },
                                 faceProvider: { [persona, settings = inputs.settings] in persona.face(settings.current) },
                                 onHaptic: { [controllers = inputs.controllers] in controllers.vibrate($0) })
         return true
     }
 
-    /// Black behind a picture that is not keyed, so that one narrower
-    /// than the display (the field-of-view setting) has a black margin and
-    /// not the room. With keying, or with no picture, the room shows.
-    /// Whether the frame now shown has transparent parts of its own: the room shows through them.
+    /// Whether the current frame carries its own alpha transparency, allowing passthrough to show through.
+    /// When false and chroma keying is off, `showBackdrop` enables a black surround so reduced-FOV frames
+    /// show black margins instead of the passthrough room.
     private var pictureTransparent = false
 
     private func showBackdrop(_ pictureShown: Bool) {
         backdrop?.isEnabled = pictureShown && renderer.chromaKey == nil && !pictureTransparent
     }
 
-    /// Three textures and their planes, for a frame like this one shown through `frusta`.
+    /// Allocates or resizes the three buffered render targets and eye planes for `eyePixels` and `frusta`.
     private func makeSets(for eyePixels: (width: Int, height: Int), frusta: [Frustum]) {
         guard materials.count == 2 else { return }
-        // Foveated when the device can (`FoveatedFlatten`); otherwise a
-        // plain texture of a size that keeps most of the foveal tile's detail.
+        // Use a foveated target when supported (`FoveatedFlatten`), falling back
+        // to a scaled uniform texture large enough to preserve foveal tile detail.
         var scale = RealityKitDisplay.flattenScale
         scale = min(scale, Double(RealityKitDisplay.largestSide) / Double(max(eyePixels.width, eyePixels.height, 1)))
         var size = (width: max(16, Int(Double(eyePixels.width) * scale)), height: max(16, Int(Double(eyePixels.height) * scale)))
@@ -219,7 +216,7 @@ public final class RealityKitDisplay {
         let stored = foveated?.target.texture ?? (width: size.width, height: size.height * 2)
         let sheet = MeshResource.generatePlane(width: 1, depth: 1)
         for _ in 0..<3 {
-            // One eye above the other.
+            // Stack both eyes vertically in a single 2D texture.
             let descriptor = LowLevelTexture.Descriptor(textureType: .type2D, pixelFormat: .bgra8Unorm_srgb,
                                                         width: stored.width, height: stored.height, depth: 1, mipmapLevelCount: 1,
                                                         textureUsage: [.renderTarget, .shaderRead])
@@ -253,20 +250,19 @@ public final class RealityKitDisplay {
         defer { vsync?.updateTook(CACurrentMediaTime() - began) }
         updatesSeen += 1
         placePersonaCamera()
-        // The stream being shown was asked for with this, before this space opened.
+        // Display profile negotiated with the host before the immersive space opened.
         let profile = connection.profile
         renderer.chromaKey = settings.current.chromaKeying(inGame: connection.session?.sceneApplicationRunning ?? false)
 
         let picked = connection.frames.next()
         if let session = connection.session, let profile {
-            // When what is set now will be seen, and how long a refresh
-            // lasts, from the display's own refresh signal (`VsyncPrediction`).
+            // Estimate next presentation time and refresh period from `VsyncPrediction`.
             var period = 1 / Double(profile.refreshHz), displayTime = began + period
             if let vsync, vsync.refreshPeriod > 0 {
                 period = vsync.refreshPeriod
                 displayTime = vsync.nextFrameTime
             }
-            // The display's times are on the media clock; the session wants the system's uptime.
+            // Convert `CACurrentMediaTime` timestamps to monotonic system uptime nanoseconds for the session.
             func uptime(_ time: TimeInterval) -> UInt64 {
                 UInt64(max(0, Double(Uptime.nanoseconds) + (time - CACurrentMediaTime()) * 1e9))
             }
@@ -276,12 +272,12 @@ public final class RealityKitDisplay {
             }
         }
         guard let picked, picked.isNew, let profile else {
-            // No stream: show nothing stale.
+            // Hide planes and backdrop when disconnected so stale frames do not remain visible.
             if connection.session == nil {
                 for set in sets { set.planes.forEach { $0.isEnabled = false } }
                 showBackdrop(false)
             } else {
-                // The keying setting may have changed with the picture standing still.
+                // Update the backdrop in case chroma key settings changed between new frames.
                 showBackdrop(sets.contains { $0.planes.contains(where: \.isEnabled) })
             }
             return
@@ -292,17 +288,16 @@ public final class RealityKitDisplay {
         framesDrawn += 1
         let set = sets[framesDrawn % 3]
 
-        // Flatten: each eye's quads, seen from exactly where the host's eye
-        // was. A pass for each eye, since each has a rate map of its own
-        // (`FoveatedFlatten`); the second keeps what the first drew.
+        // Composite each eye's quads from the host's rendered eye pose. Run a
+        // separate render pass per eye because each eye uses its own rasterization
+        // rate map (`FoveatedFlatten`), loading the first eye's output on the second pass.
         let target = set.texture.replace(using: commands)
         var hostEyes: [Pose] = []
         for eye in Eye.allCases {
             let pass = MTLRenderPassDescriptor()
             pass.colorAttachments[0].texture = target
             pass.colorAttachments[0].loadAction = eye == Eye.allCases.first ? .clear : .load
-            // Where the picture fades out at its edge it fades to black, unless
-            // it is keyed or has transparent parts of its own.
+            // Clear to opaque black so edge feathering blends to black unless chroma keying or frame alpha is active.
             pictureTransparent = frame.layout.transparent
             pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0,
                                                                 alpha: renderer.chromaKey == nil && !pictureTransparent ? 1 : 0)
@@ -322,13 +317,13 @@ public final class RealityKitDisplay {
             encoder.endEncoding()
         }
         commands.commit()
-        // The texture changes hands when the drawing is done; waiting here
-        // keeps it in step with the planes moved below.
+        // Wait for rendering to finish so the updated texture swaps in on the
+        // same RealityKit update as the plane transforms below.
         commands.waitUntilCompleted()
 
         for eye in Eye.allCases {
-            // The plane fills the host's frustum for this eye, `distance` meters out:
-            // its middle is off the eye's axis when the frustum is lopsided.
+            // Size and center the plane to fill this eye's host frustum at `distance`
+            // meters; asymmetric frusta shift the plane center off the forward axis.
             let hostEye = hostEyes[eye.rawValue], frustum = profile.eyeFrusta[eye.rawValue]
             let distance = RealityKitDisplay.planeDistance[eye.rawValue]
             let middle = hostEye.position + hostEye.forward * distance
@@ -336,8 +331,8 @@ public final class RealityKitDisplay {
                 + hostEye.up * ((frustum.down + frustum.up) / 2 * distance)
             let plane = set.planes[eye.rawValue]
             plane.position = [middle.x, middle.y, middle.z]
-            // The eye's own axes as a rotation; the sheet lies flat (in x and
-            // z) until it is stood up by a quarter turn about x.
+            // Build a rotation from the eye's basis vectors, then pitch +90 degrees
+            // around X to stand the XZ plane upright facing the eye.
             let facing = simd_quatf(simd_float3x3(columns: (
                 [hostEye.right.x, hostEye.right.y, hostEye.right.z],
                 [hostEye.up.x, hostEye.up.y, hostEye.up.z],
@@ -351,15 +346,14 @@ public final class RealityKitDisplay {
         showBackdrop(true)
     }
 
-    /// Keep the Persona's camera one meter in front of the face, facing as
-    /// the head faces.
+    /// Updates the Persona camera anchor to stay one meter in front of the user's head.
     private func placePersonaCamera() {
         guard let personaCamera, let device = head.anchor(at: CACurrentMediaTime()) else { return }
         placePersonaCameraEntity(personaCamera, originFromDevice: device.originFromAnchorTransform, tick: updatesSeen)
     }
 }
 
-/// The RealityKit stream as an immersive space's content.
+/// Immersive space content view for the RealityKit streaming renderer.
 public struct RealityKitStreamView: View {
     let display: RealityKitDisplay
     let persona: PersonaTracking
@@ -393,17 +387,15 @@ public struct RealityKitStreamView: View {
             .onEnded { value in
                 display.pinches.handle(value.gestureValue) { value.convert($0, from: .local, to: .scene) }
             })
-        // Without this a SwiftUI view in front leaves the controllers'
-        // buttons and sticks to the system, and the app is told nothing.
-        // (A compositor layer is given them without asking.)
+        // Required so SwiftUI routes gamepad button and thumbstick input to the
+        // app instead of consuming it for system UI navigation (CompositorServices
+        // layers receive controller input automatically).
         .handlesGameControllerEvents(matching: .gamepad)
-        // When the space goes out of sight (the crown pressed, the headset
-        // taken off) the stream is over, and the space is closed with it:
-        // RealityKit goes on updating a space that is merely hidden, and the
-        // stream and the Persona's camera were found still running, behind
-        // the app's window, when the app was opened again. Only when it is
-        // really out of sight: it is briefly "inactive" whenever the app's
-        // window closes, which is no reason to leave the stream.
+        // Stop streaming and dismiss the immersive space when backgrounded
+        // (for example, when the user presses the Digital Crown or removes the
+        // headset). RealityKit continues updating hidden spaces, which otherwise
+        // leaves the stream and Persona camera running behind the reopened main
+        // window. Ignore `.inactive`, which fires briefly whenever an app window closes.
         .onChange(of: scenePhase) {
             guard scenePhase == .background else { return }
             display.stop()

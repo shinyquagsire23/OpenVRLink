@@ -4,15 +4,13 @@
 
 import Foundation
 
-/// The standard cryptographic operations the protocols are made of
-/// (docs/remoteplay/crypto.md, docs/svl-transport/session-args-and-crypto.md,
-/// docs/wivrn/protocol.md), and nothing of the protocols themselves.
+/// Low-level cryptographic primitives shared across pairing and transport protocols
+/// (`docs/remoteplay/crypto.md`, `docs/svl-transport/session-args-and-crypto.md`,
+/// `docs/wivrn/protocol.md`).
 ///
-/// On Apple's systems they are the operating system's own (CryptoKit,
-/// CommonCrypto and Security), so that the app encrypts nothing with code
-/// of its own. Elsewhere they are swift-crypto's. This is the one place where
-/// the core chooses by platform instead of being handed a backend: the two
-/// halves below must stay the same, function for function.
+/// Uses system frameworks (`CryptoKit`, `CommonCrypto`, and `Security`) on Apple
+/// platforms and `swift-crypto` elsewhere. Keep the `#if canImport(CommonCrypto)`
+/// and `#else` extensions signature-identical.
 enum Primitives {
     static let block = 16
 }
@@ -25,14 +23,15 @@ import Security
 extension Primitives {
     static func sha256(_ bytes: Bytes) -> Bytes { Bytes(SHA256.hash(data: bytes)) }
 
-    /// AES on one 16-byte block, as it is (ECB). The key is 16 or 32 bytes.
+    /// Single-block 16-byte AES-ECB permutation using a 16- or 32-byte key.
     static func aesBlock(_ block: Bytes, key: Bytes, encrypting: Bool) -> Bytes? {
         guard block.count == Primitives.block else { return nil }
         return crypt(block, key: key, iv: nil, encrypting: encrypting, options: CCOptions(kCCOptionECBMode))
     }
 
-    /// AES in CBC mode. `padded` is PKCS#7 padding; without it the length
-    /// must be a multiple of 16. Nil on a bad length, or bad padding when decrypting.
+    /// AES-CBC encryption or decryption. Uses PKCS#7 padding when `padded` is true;
+    /// otherwise `bytes.count` must be a multiple of 16. Returns `nil` on invalid
+    /// input lengths or bad padding.
     static func aesCBC(_ bytes: Bytes, key: Bytes, iv: Bytes, encrypting: Bool, padded: Bool) -> Bytes? {
         guard iv.count == Primitives.block, padded || bytes.count % Primitives.block == 0 else { return nil }
         return crypt(bytes, key: key, iv: iv, encrypting: encrypting, options: padded ? CCOptions(kCCOptionPKCS7Padding) : 0)
@@ -40,8 +39,8 @@ extension Primitives {
 
     private static func crypt(_ bytes: Bytes, key: Bytes, iv: Bytes?, encrypting: Bool, options: CCOptions) -> Bytes? {
         guard key.count == kCCKeySizeAES128 || key.count == kCCKeySizeAES256 else { return nil }
-        // Written straight into the array that is returned, which is neither
-        // filled first nor copied afterwards: this runs for every datagram.
+        // Encrypt or decrypt directly into uninitialized output storage to avoid
+        // zero-filling or extra copies on the per-datagram hot path.
         var status = CCCryptorStatus(kCCSuccess)
         let out = Bytes(unsafeUninitializedCapacity: bytes.count + Primitives.block) { buffer, count in
             var moved = 0
@@ -52,10 +51,10 @@ extension Primitives {
         return status == kCCSuccess ? out : nil
     }
 
-    /// RSA-OAEP with SHA-1, to a public key given as a DER
-    /// SubjectPublicKeyInfo. `bytes` is at most the modulus less 42 bytes.
+    /// Encrypts `bytes` using RSA-OAEP-SHA1 with a DER-encoded `SubjectPublicKeyInfo`
+    /// key (`bytes.count` must be at most `modulusBytes - 42`).
     static func rsaOAEPSHA1(_ bytes: Bytes, publicKey: Bytes) -> Bytes? {
-        // Security wants the bare RSA key that the SubjectPublicKeyInfo wraps.
+        // Security.framework expects the inner PKCS#1 RSAPublicKey payload rather than SubjectPublicKeyInfo.
         guard let bare = bareRSAKey(publicKey) else { return nil }
         let attributes: [CFString: Any] = [kSecAttrKeyType: kSecAttrKeyTypeRSA, kSecAttrKeyClass: kSecAttrKeyClassPublic]
         guard let key = SecKeyCreateWithData(Data(bare) as CFData, attributes as CFDictionary, nil),
@@ -64,11 +63,10 @@ extension Primitives {
         return Bytes(encrypted as Data)
     }
 
-    /// What a SubjectPublicKeyInfo holds: a sequence of the algorithm's
-    /// name and a bit string, whose content (after a byte counting unused
-    /// bits) is the key itself.
+    /// Extracts the inner PKCS#1 public key bytes from a DER `SubjectPublicKeyInfo`
+    /// (`SEQUENCE { algorithm SEQUENCE, subjectPublicKey BIT STRING }` with 0 unused bits).
     private static func bareRSAKey(_ info: Bytes) -> Bytes? {
-        /// The content of the DER element at `start`, if it has this tag.
+        /// Returns the payload byte range of the DER TLV at `start` if its tag matches `tag`.
         func content(at start: Int, in bytes: Bytes, tag: UInt8) -> Range<Int>? {
             guard start + 2 <= bytes.count, bytes[start] == tag else { return nil }
             var length = Int(bytes[start + 1]), at = start + 2
@@ -90,7 +88,7 @@ extension Primitives {
         return Bytes(info[(bits.lowerBound + 1)..<bits.upperBound])
     }
 
-    /// PBKDF2 with HMAC-SHA1: `count` bytes from a password and a salt.
+    /// Derives `count` key bytes from `password` and `salt` using PBKDF2-HMAC-SHA1.
     static func pbkdf2SHA1(password: Bytes, salt: Bytes, rounds: Int, count: Int) -> Bytes? {
         var out = Bytes(repeating: 0, count: count)
         let status = password.withUnsafeBytes { secret in
@@ -100,9 +98,8 @@ extension Primitives {
         return status == Int32(kCCSuccess) ? out : nil
     }
 
-    /// AES in counter mode: a run of bytes that is the same to encrypt and
-    /// to decrypt, and carries on from one call to the next. The counter is
-    /// a whole block of 16 bytes, counted up as one number, most significant byte first.
+    /// Stateful AES-CTR stream cipher (identical for encryption and decryption)
+    /// using a 16-byte big-endian counter incremented across calls.
     final class CounterCipher {
         private var cryptor: CCCryptorRef?
 
@@ -127,13 +124,13 @@ extension Primitives {
         }
     }
 
-    /// One side of an X25519 key agreement.
+    /// Ephemeral or static key pair for X25519 Diffie-Hellman key agreement.
     struct KeyAgreement {
         private let privateKey: Curve25519.KeyAgreement.PrivateKey
 
         init() { privateKey = Curve25519.KeyAgreement.PrivateKey() }
 
-        /// With a private key that is already known (tests).
+        /// Initializes from an existing 32-byte private key (used by tests).
         init?(privateKey: Bytes) {
             guard let key = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: privateKey) else { return nil }
             self.privateKey = key
@@ -141,7 +138,7 @@ extension Primitives {
 
         var publicKey: Bytes { Bytes(privateKey.publicKey.rawRepresentation) }
 
-        /// The curve's output for the peer's public key, 32 bytes.
+        /// Computes the 32-byte raw X25519 shared secret with `peerPublicKey`.
         func shared(with peerPublicKey: Bytes) -> Bytes? {
             guard let peer = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: peerPublicKey),
                   let shared = try? privateKey.sharedSecretFromKeyAgreement(with: peer)
@@ -158,7 +155,7 @@ import _CryptoExtras
 extension Primitives {
     static func sha256(_ bytes: Bytes) -> Bytes { Bytes(SHA256.hash(data: bytes)) }
 
-    /// AES on one 16-byte block, as it is (ECB). The key is 16 or 32 bytes.
+    /// Single-block 16-byte AES-ECB permutation using a 16- or 32-byte key.
     static func aesBlock(_ block: Bytes, key: Bytes, encrypting: Bool) -> Bytes? {
         guard block.count == Primitives.block, key.count == 16 || key.count == 32 else { return nil }
         var out = block
@@ -171,8 +168,9 @@ extension Primitives {
         return out
     }
 
-    /// AES in CBC mode. `padded` is PKCS#7 padding; without it the length
-    /// must be a multiple of 16. Nil on a bad length, or bad padding when decrypting.
+    /// AES-CBC encryption or decryption. Uses PKCS#7 padding when `padded` is true;
+    /// otherwise `bytes.count` must be a multiple of 16. Returns `nil` on invalid
+    /// input lengths or bad padding.
     static func aesCBC(_ bytes: Bytes, key: Bytes, iv: Bytes, encrypting: Bool, padded: Bool) -> Bytes? {
         guard key.count == 16 || key.count == 32, padded || bytes.count % Primitives.block == 0,
               let cbcIV = try? AES._CBC.IV(ivBytes: iv)
@@ -184,8 +182,8 @@ extension Primitives {
         return out.map { Bytes($0) }
     }
 
-    /// RSA-OAEP with SHA-1, to a public key given as a DER
-    /// SubjectPublicKeyInfo. `bytes` is at most the modulus less 42 bytes.
+    /// Encrypts `bytes` using RSA-OAEP-SHA1 with a DER-encoded `SubjectPublicKeyInfo`
+    /// key (`bytes.count` must be at most `modulusBytes - 42`).
     static func rsaOAEPSHA1(_ bytes: Bytes, publicKey: Bytes) -> Bytes? {
         guard let key = try? _RSA.Encryption.PublicKey(derRepresentation: publicKey),
               let encrypted = try? key.encrypt(bytes, padding: .PKCS1_OAEP)
@@ -193,20 +191,19 @@ extension Primitives {
         return Bytes(encrypted)
     }
 
-    /// PBKDF2 with HMAC-SHA1: `count` bytes from a password and a salt.
+    /// Derives `count` key bytes from `password` and `salt` using PBKDF2-HMAC-SHA1.
     static func pbkdf2SHA1(password: Bytes, salt: Bytes, rounds: Int, count: Int) -> Bytes? {
         let key = try? KDF.Insecure.PBKDF2.deriveKey(from: password, salt: salt, using: .insecureSHA1,
                                                      outputByteCount: count, unsafeUncheckedRounds: rounds)
         return key.map { $0.withUnsafeBytes { Bytes($0) } }
     }
 
-    /// AES in counter mode: a run of bytes that is the same to encrypt and
-    /// to decrypt, and carries on from one call to the next. The counter is
-    /// a whole block of 16 bytes, counted up as one number, most significant byte first.
+    /// Stateful AES-CTR stream cipher (identical for encryption and decryption)
+    /// using a 16-byte big-endian counter incremented across calls.
     final class CounterCipher {
         private let key: Bytes
         private var counter: Bytes
-        /// What is left of the block made from the last counter.
+        /// Unused keystream bytes remaining from the current encrypted counter block.
         private var pad = ByteSlice()
 
         init?(key: Bytes, counter: Bytes) {
@@ -231,13 +228,13 @@ extension Primitives {
         }
     }
 
-    /// One side of an X25519 key agreement.
+    /// Ephemeral or static key pair for X25519 Diffie-Hellman key agreement.
     struct KeyAgreement {
         private let privateKey: Curve25519.KeyAgreement.PrivateKey
 
         init() { privateKey = Curve25519.KeyAgreement.PrivateKey() }
 
-        /// With a private key that is already known (tests).
+        /// Initializes from an existing 32-byte private key (used by tests).
         init?(privateKey: Bytes) {
             guard let key = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: privateKey) else { return nil }
             self.privateKey = key
@@ -245,7 +242,7 @@ extension Primitives {
 
         var publicKey: Bytes { Bytes(privateKey.publicKey.rawRepresentation) }
 
-        /// The curve's output for the peer's public key, 32 bytes.
+        /// Computes the 32-byte raw X25519 shared secret with `peerPublicKey`.
         func shared(with peerPublicKey: Bytes) -> Bytes? {
             guard let peer = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: peerPublicKey),
                   let shared = try? privateKey.sharedSecretFromKeyAgreement(with: peer)

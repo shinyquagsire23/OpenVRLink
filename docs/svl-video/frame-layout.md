@@ -1,15 +1,18 @@
-# Frame layout, foveation and the unwarp pass
+# Frame layout, foveation, and the unwarp pass
 
-The decoded picture is an **atlas** of per-eye tiles: for each eye a wide
-"base" image and a narrow, sharper "foveal" inset. The client does not warp or
-resample by any lens model: it crops each tile out of the atlas into its own
-OpenXR swapchain and submits two projection layers (base, then fovea on top
-with a feathered alpha edge). The compositor does the rest.
+The decoded video picture is an **atlas** of per-eye tiles containing a wide
+"base" view and a narrower, higher-resolution "foveal" inset for each eye.
+Rather than applying lens distortion on the client, `vrlink` crops each tile
+out of the atlas into its own OpenXR swapchain and submits two
+`XrCompositionLayerProjection` layers—the base layer underneath and the foveal
+inset on top with a feathered alpha edge—leaving lens warp and reprojection to
+the OpenXR compositor.
 
 ## Atlas modes
 
-**static** - `QSVLRendererXR::FlipFrame` (+0x10ae78) picks the mode per frame
-from `TransportFrameMetadata_t` ([frame-metadata.md](frame-metadata.md)):
+`QSVLRendererXR::FlipFrame` (+0x10ae78) selects the atlas mode on each frame
+from `TransportFrameMetadata_t` ([frame-metadata.md](frame-metadata.md),
+**static**):
 
 ```python
 if atlas_h / tile_h > 3.0:   mode = 0      # four tiles stacked vertically
@@ -17,14 +20,16 @@ elif atlas_w / tile_w > 1.5: mode = 1      # 2 x 2
 else:                        mode = 2      # two tiles stacked, no foveal layer
 ```
 
-If `(tile_w, tile_h, mode)` differs from the current state the four swapchains
-are recreated (`SetupSwapchains`, +0x10aa64: each `tile_w x tile_h`,
-`GL_SRGB8_ALPHA8` 0x8c43; log `"[XRRenderer] Swapchains were regenerated"`).
+Whenever `(tile_w, tile_h, mode)` changes from the current swapchain state, all
+four swapchains are recreated (`SetupSwapchains`, +0x10aa64: each `tile_w x
+tile_h`, `GL_SRGB8_ALPHA8` `0x8c43`, logging `"[XRRenderer] Swapchains were
+regenerated"`).
 
-Tile placement, from the two vertex shaders (text below) with
-`group = eye*2` for the foveal pass and `group = eye*2 + 1` for the base pass
-(`SRGBCorrectionPass::RenderSpecific`, +0xf19f4). `u`,`v` are texture
-coordinates of the decoded image, v = 0 at the first decoded row:
+The two vertex shaders (shown below) map atlas regions using `group = eye*2`
+for the foveal pass and `group = eye*2 + 1` for the base pass
+(`SRGBCorrectionPass::RenderSpecific`, +0xf19f4). Below, `u` and `v` are
+normalized texture coordinates of the decoded image, with `v = 0` at the first
+decoded row:
 
 | mode | left fovea | left base | right fovea | right base |
 |---|---|---|---|---|
@@ -32,67 +37,73 @@ coordinates of the decoded image, v = 0 at the first decoded row:
 | 1 "2x2" | u 1/2..1, v 0..1/2 | u 0..1/2, v 0..1/2 | u 1/2..1, v 1/2..1 | u 0..1/2, v 1/2..1 |
 | 2 | not drawn | v 0..1/2 | not drawn | v 1/2..1 |
 
-**captured** (`vr3`): metadata reads `atlas 1536 x 6144, tile 1536 x 1536` on
-all 8,631 descriptors (4,260 frames), the SPS says 1536 x 6144, and every
-access unit has four slices. So mode 0 is the one in use, top to bottom:
-**left fovea, left base, right fovea, right base**, each 1536 x 1536. Modes 1
-and 2 did not occur. The client logged `[XRRenderer] Swapchains were
-regenerated` exactly once, at the first frame.
+**captured** (`vr3`): metadata reports `atlas 1536 x 6144, tile 1536 x 1536` on
+all 8,631 descriptors (4,260 frames), the SPS specifies `1536 x 6144`, and
+every access unit contains four slices. Mode 0 is used throughout, ordered from
+top to bottom as **left fovea, left base, right fovea, right base**, each
+`1536 x 1536`. Modes 1 and 2 did not occur. `vrlink` logged `[XRRenderer]
+Swapchains were regenerated` once, on the first frame.
 
-**captured** (`vr3`): the four slices are the four tiles. The CTB is 32 x 32,
-so a tile is 48 x 48 = 2,304 CTBs, and the slice segment addresses are 0,
-2304, 4608, 6912 in every one of the 4,260 access units
-([decode-handoff.md](decode-handoff.md)). Deblocking across slice boundaries
-is off in every slice header, and the decoded picture shows a hard cut at row
-1536 with no guard band or bleed between tiles (zoomed crop of rows
-1488..1584).
+**captured** (`vr3`): the four HEVC slices correspond directly to the four
+tiles. With a `32 x 32` CTB, each tile spans `48 x 48 = 2,304` CTBs, and the
+slice segment addresses are `0`, `2304`, `4608`, and `6912` in all 4,260 access
+units ([decode-handoff.md](decode-handoff.md)). Deblocking across slice
+boundaries is disabled in every slice header, and the decoded image has a clean
+cut at row 1536 with no guard band or cross-tile bleed (verified on a zoomed
+crop of rows `1488..1584`).
 
-What the picture shows (**captured**: frames 300, 2000 and 4000 of `vr3` and
-frames 200 and 1500 of the probe stream, decoded with ffmpeg to raw 10-bit YUV
-and converted with numpy; the scene is the SteamVR dashboard with two
-controllers in view):
+Inspecting decoded frames (**captured**: frames 300, 2000, and 4000 of `vr3`
+plus frames 200 and 1500 of the probe stream, decoded with `ffmpeg` to raw
+10-bit YUV and converted with `numpy`; the scene shows the SteamVR dashboard
+with two controllers in view) confirms the tile assignments:
 
-- Tiles 0 and 2 are magnified central crops of tiles 1 and 3: fovea, base,
-  fovea, base. The measurement is under "Field of view of each layer".
-- **The first pair is the left eye.** Horizontal position in tile 1 minus
-  position in tile 3, by normalized cross-correlation of luma patches (`vr3`
-  frame 2000): far backdrop 0 px, dashboard panel (posters, clock) +47..+50
-  px, both controllers +111 px. Nearer things sit further right in the first
-  pair, growing with nearness, with 0 px vertical shift throughout - that is
-  the left eye. In the fovea tiles the panel shift is +80..+81 px, which is
-  the base shift times the density ratio minus the 21-pixel difference in
-  `inset_x` (47 x 2.1445 - 21 = 80). This agrees with the static reading
-  (`group = eye*2`) and with the first eye-to-head matrix the client
-  published having x = -0.0315 m. **inferred** from the same numbers: with
-  that 63 mm eye separation and 768 px per unit tangent, the panel is about
-  1.0 m away and the controllers about 0.44 m.
-- The fovea tiles are noticeably sharper than the same region of the base
-  tiles, by more than the 2.14x density alone: the encoder gives the base
-  slices a much coarser quantizer (slice QP 27 or 28 above the fovea slice's
-  in 4,188 of 4,259 frames, [decode-handoff.md](decode-handoff.md)).
-- The first frames are not picture: `vr3` frames 0..3 decode to a flat fill
-  (10-bit Y 352..355, Cb 532..536, Cr 486..490 over the whole atlas); the
-  dashboard starts with the second IDR at frame 4.
+- Tiles 0 and 2 are magnified central crops of tiles 1 and 3 (fovea, base,
+  fovea, base); quantitative measurements are under "Field of view of each
+  layer" below.
+- **The first tile pair belongs to the left eye.** Measuring horizontal feature
+  positions in tile 1 minus tile 3 via normalized cross-correlation of luma
+  patches (`vr3` frame 2000) gives `0 px` on the far backdrop, `+47..+50 px` on
+  the dashboard panel (posters and clock), and `+111 px` on both controllers,
+  with `0 px` vertical shift throughout. Closer objects shift further right in
+  the first pair in proportion to proximity, matching left-eye parallax. In the
+  foveal tiles, the panel shift is `+80..+81 px`, matching the base shift
+  multiplied by the pixel-density ratio minus the 21-pixel difference in
+  `inset_x` (`47 * 2.1445 - 21 = 80`). This agrees with both the static shader
+  indexing (`group = eye*2`) and `vrlink`'s first published eye-to-head matrix
+  (`x = -0.0315 m`). **inferred**: given a 63 mm eye separation and 768 px per
+  unit tangent, the dashboard panel sits roughly 1.0 m away and the controllers
+  sit roughly 0.44 m away.
+- Foveal tiles are substantially sharper than the corresponding region of the
+  base tiles, beyond what the `2.14x` pixel-density increase provides on its
+  own: the host encoder assigns a much coarser quantizer to the base slices
+  (slice QP 27 or 28 steps above the foveal slice in 4,188 of 4,259 frames; see
+  [decode-handoff.md](decode-handoff.md)).
+- Frames `0..3` of `vr3` decode to a solid gray fill (`10-bit` Y `352..355`,
+  Cb `532..536`, Cr `486..490` across the whole atlas); the rendered dashboard
+  scene begins on the second IDR at frame 4.
 
-The quad is drawn with `vPos.y *= -1` ("Flip image"), so the first decoded row
-of a tile lands on the bottom row of the GL framebuffer, i.e. the swapchain
-image is stored top-row-first in the usual GL-upside-down sense. **inferred**:
-this just undoes GL's origin; a Metal/Vulkan client copies rows straight.
+The vertex shader flips `vPos.y *= -1` (`"Flip image"`), placing the first
+decoded row of each tile at the bottom row of the OpenGL framebuffer so the
+swapchain image is stored top-row-first in OpenGL's bottom-up convention.
+**inferred**: this compensates for OpenGL's origin, so a Metal or Vulkan client
+copies rows without flipping.
 
-## The pass
+## Render pass and shaders
 
-**static** - per served frame, `FlipFrame` does, with `GL_FRAMEBUFFER_SRGB`
-disabled:
+For each served frame, `FlipFrame` disables `GL_FRAMEBUFFER_SRGB` and performs
+five steps (**static**):
 
-1. bind the decoded image as `GL_TEXTURE_EXTERNAL_OES`;
-2. `RenderSpecific(eye=0, fovea=false)` into the left base swapchain;
-3. `RenderSpecific(0, true)` into the left foveal swapchain;
-4. `RenderSpecific(1, false)`, `RenderSpecific(1, true)` for the right eye;
-5. write the frame's pose into all four `XrCompositionLayerProjectionView`s.
+1. Bind the decoded image as `GL_TEXTURE_EXTERNAL_OES`.
+2. Call `RenderSpecific(eye=0, fovea=false)` into the left base swapchain.
+3. Call `RenderSpecific(0, true)` into the left foveal swapchain.
+4. Call `RenderSpecific(1, false)` and `RenderSpecific(1, true)` for the right
+   eye.
+5. Copy the frame's render pose into all four
+   `XrCompositionLayerProjectionView` structs.
 
-Each `RenderSpecific` clears to (0,0,0,0), sets the viewport to the tile size
-and draws one 4-vertex triangle strip. Layers are returned base first, fovea
-second (`GetProjectionLayers`, +0x10a570).
+Each `RenderSpecific` call clears to `(0, 0, 0, 0)`, sets the viewport to the
+tile dimensions, and draws a 4-vertex triangle strip. `GetProjectionLayers`
+(+0x10a570) returns the base layer first and the foveal layer second.
 
 ### Uniforms
 
@@ -105,8 +116,8 @@ second (`GetProjectionLayers`, +0x10a570).
 | 12 | `group` | `eye*2` (fovea shader) or `eye*2 + 1` (base shader) |
 | 13 | `mode` | atlas mode 0/1/2 |
 
-There are no per-frame foveation uniforms: the per-frame inset position only
-changes the *FOV submitted with the foveal layer* (below), never the crop.
+There are no per-frame foveation uniforms: per-frame inset coordinates adjust
+only the *FOV submitted on the foveal layer* (below), never the shader crop.
 
 ### Vertex shader, base (string at file offset 0x9da82)
 
@@ -147,55 +158,61 @@ vec2 distCenter = abs( placeInSection - 0.5 );
 color.a = pow( 1.05 - (pow( distCenter.y*2.0, 10.0 ) + pow( distCenter.x*2.0, 10.0 )) * 1.06, 1.5 );
 ```
 
-- The foveal alpha is a super-ellipse feather: 1 over most of the tile, falling
-  to 0 at the edges, so the inset blends into the base layer.
-- **captured** (`vr3` frame 2000): the feather exists only in this shader. The
-  encoded fovea tile carries full-strength picture right up to its last row
-  and column: the ratio of fovea luma to the matching base luma is 0.98..1.00
-  in every band from 0..2 px to 256..768 px from the tile edge, for both eyes,
-  with no fall-off, and zoomed corner crops show ordinary scene content at the
-  border. A client has to apply the alpha itself.
-- **inferred**: which tail belongs to which program follows from `uvmask` only
-  existing in the fovea vertex shader; the string concatenation itself was not
-  traced.
-- Color: the decoder is configured BT.2020 / full range / P010 and the
-  sampler delivers RGB; the 3x3 (GLSL column-major, so the first three numbers
-  are the first column) is a small gamut correction; the result is written
-  unconverted into an sRGB swapchain with sRGB encoding disabled. The shader has no YUV->RGB
-  step; the external sampler does that.
-- **captured** (`vr3` and the probe stream, SPS VUI): full range, primaries 9
-  (BT.2020), transfer 4 (gamma 2.2), and **matrix_coefficients 0** (identity /
-  GBR). The first three back the earlier inference that the video is
-  display-referred and gamma-encoded, not linear. The matrix code cannot be
-  taken literally: the stream is 4:2:0 and the planes are ordinary
-  luma/chroma (converting them as Y'CbCr gives the dashboard in its expected
-  colors; a flat frame has Cb and Cr near but not at 512). So the VUI does
-  **not** say which Y'CbCr matrix to use. The client's MediaFormat asks for
-  BT.2020, which on Android selects the BT.2020 matrix; converting with
-  BT.2020 or BT.709 coefficients both give a plausible picture and they
-  cannot be told apart by eye on this scene. Use BT.2020 non-constant
-  luminance, full range, as the client declares, until a test pattern says
-  otherwise.
-- The 3x3 has rows summing to 1.000, 1.000, 1.001, so it leaves white alone;
-  its diagonal is 1.05, 0.96, 0.99, nowhere near a BT.2020-to-BT.709
-  conversion (diagonal 1.66, 1.13, 1.12). It is a small fixed adjustment and not a
-  gamut conversion. **captured** (`vr3` logcat): the client asked the runtime
-  for `XR_FB_color_space` value 3 and logged `Failed to find requested color
-  space 3`, then `VTE_PROP_COLOR_CONTROL updated` / `Updating color props`.
-  **inferred**: the matrix is tied to that color-space choice; what the
-  client does when the request succeeds was not seen.
-- The constants `DIV12`, `DIV1`, `THRESHOLD`, `GAMMA` are declared in the
-  fragment shader and unused: no sRGB<->linear conversion happens here.
+- The foveal alpha mask is a super-ellipse feather that stays near `1` across
+  most of the tile and drops to `0` at the border so the inset blends smoothly
+  over the base layer.
+- **captured** (`vr3` frame 2000): feathering happens entirely in this client
+  shader. The encoded foveal tile carries unattenuated scene content right up
+  to its outer pixel row and column: the ratio of foveal luma to matching base
+  luma stays at `0.98..1.00` across every distance band from `0..2 px` to
+  `256..768 px` from the tile edge in both eyes with no falloff, and zoomed
+  corner crops show normal scene detail at the boundary. Every client must
+  apply its own edge alpha mask.
+- **inferred**: pairing each fragment tail with its vertex shader follows from
+  `uvmask` being written only by the foveal vertex shader; the C++ shader
+  string assembly itself was not traced.
+- `vrlink` configures the decoder for BT.2020, full range, and P010 output, and
+  the `samplerExternalOES` sampler converts Y'CbCr to RGB before the fragment
+  shader runs. The shader multiplies RGB by the column-major 3x3 matrix above
+  (the first three floats are column 0) and writes the result unconverted into
+  an sRGB swapchain with `GL_FRAMEBUFFER_SRGB` disabled.
+- **captured** (`vr3` and the probe stream, SPS VUI): full range, primaries `9`
+  (BT.2020), transfer `4` (gamma 2.2), and **`matrix_coefficients = 0`**
+  (`identity` / GBR). The first three fields match the earlier inference that
+  the video is display-referred and gamma-encoded rather than linear. The
+  `identity` matrix code cannot be used literally: the stream is 4:2:0 and its
+  planes contain standard luma and chroma (converting them as Y'CbCr produces
+  the SteamVR dashboard in its expected colors, and flat frames have Cb and Cr
+  near 512). Because the VUI omits a valid Y'CbCr matrix, `vrlink`'s
+  MediaFormat request for BT.2020 (which selects the BT.2020 Y'CbCr matrix on
+  Android) is the only indication of which matrix to apply; decoding this scene
+  with either BT.2020 or BT.709 coefficients looks visually plausible and
+  indistinguishable by eye. Clients should use BT.2020 non-constant luminance,
+  full range (matching `vrlink`'s MediaFormat) until a color-bar test pattern
+  is measured.
+- The 3x3 shader matrix has row sums `1.000`, `1.000`, and `1.001` (preserving
+  neutral white) and diagonal entries `1.05`, `0.96`, and `0.99`, which is much
+  smaller than a full BT.2020-to-BT.709 gamut conversion (diagonal `1.66`,
+  `1.13`, `1.12`) and acts instead as a minor color trim. **captured** (`vr3`
+  logcat): `vrlink` requested `XR_FB_color_space` value `3` from the runtime
+  and logged `Failed to find requested color space 3`, followed by
+  `VTE_PROP_COLOR_CONTROL updated` and `Updating color props`. **inferred**:
+  this 3x3 matrix corresponds to that target color space; `vrlink`'s behavior
+  when the runtime accepts color space `3` was not observed.
+- Constants `DIV12`, `DIV1`, `THRESHOLD`, and `GAMMA` are declared in the
+  fragment shader source without being referenced, so no sRGB-to-linear
+  conversion occurs in the shader.
 
 ## Field of view of each layer
 
-**static** - `FlipFrame`. Base layer: the per-eye `XrFovf` derived from the
-metadata projection matrix. Foveal layer: computed from the base FOV and the
-per-eye inset record `{inset_x, inset_y, virt_w, virt_h}` (metadata +0xc8,
-i16 each). Read it as: *imagine the base frustum rendered at foveal pixel
-density; that virtual image is `virt_w x virt_h` pixels; the inset tile is the
-`tile_w x tile_h` rectangle whose top-left corner is at `(inset_x, inset_y)`
-in it.* (**inferred** wording; the arithmetic is static.)
+In `FlipFrame` (**static**), the base layer uses the per-eye `XrFovf` derived
+from the metadata projection matrix, while the foveal layer's `XrFovf` is
+computed from that base FOV and the per-eye inset record `{inset_x, inset_y,
+virt_w, virt_h}` (`i16` each at metadata `+0xc8`). Geometrically (**inferred**
+interpretation of the **static** math below), if the full base frustum were
+rendered at foveal pixel density it would span `virt_w x virt_h` pixels, and
+the foveal tile is the `tile_w x tile_h` sub-rectangle whose top-left corner
+sits at `(inset_x, inset_y)` within that virtual image:
 
 ```python
 tl, tr, tu, td = tan(base.left), tan(base.right), tan(base.up), tan(base.down)   # tl, td negative
@@ -211,31 +228,33 @@ fovea.left  = atan(tr * (inset_x - virt_w + S)          / S)
 fovea.right = atan(tr * (inset_x + tile_w - virt_w + S) / S)
 ```
 
-**captured** values (`vr3`: identical on all 4,260 frames; the same numbers as
-in `vr1`): left `(889, 1043, 3294, 3294)`, right `(868, 1043, 3294, 3294)`,
-tiles 1536. With the symmetric +-45 degree frustum that run's matrices carry
-(the client published tangents -1, 1, -1, 1 for both eyes), the left inset
-spans columns 889..2425 of 3294 (center 1657 vs 1647) and rows 1043..2579
-(center 1811 vs 1647) - a 1536-pixel window on a 3294-pixel virtual eye, i.e.
-the fovea has 2.1445x the linear pixel density of the base tile. The formulas
-give the fovea layer left -24.7, right +25.3, up +20.1, down -29.5 degrees
-(right eye: -25.3, +24.7 horizontally). So the inset is not centered: it sits
-about 5.7 degrees below the optical axis, and each eye's is nudged about 0.35
-degrees toward the nose. The values did not move during the run (no eye
-tracking in that setup).
+In `vr3` (**captured**; identical across all 4,260 frames and matching `vr1`),
+the inset records are `(889, 1043, 3294, 3294)` for the left eye and `(868,
+1043, 3294, 3294)` for the right eye, with `1536 x 1536` tiles. With the
+symmetric +/-45 degree frustum in that capture (`vrlink` published tangents
+`-1, 1, -1, 1` for both eyes), the left inset covers columns `889..2425` of
+`3294` (center `1657` vs. `1647`) and rows `1043..2579` (center `1811` vs.
+`1647`)—a 1536-pixel window inside a 3294-pixel virtual eye, giving the foveal
+tile `2.1445x` the linear pixel density of the base tile. Plugging these values
+into the formulas yields a left foveal FOV of left `-24.7`, right `+25.3`, up
+`+20.1`, down `-29.5` degrees (and `-25.3`, `+24.7` horizontally for the right
+eye). Rather than sitting centered on the optical axis, the inset is shifted
+about 5.7 degrees downward and nudged about 0.35 degrees toward the nose in
+each eye. These values remained constant throughout `vr3` (which had no eye
+tracking).
 
-**captured** (`vr3`, Klepton's OpenXR layer log): the client submitted two
-projection layers, `fov 90x90 deg, 1536x1536 px` then `fov 50x50 deg,
-1536x1536 px`, which is what the formulas give (49.99 x 49.65 degrees).
+**captured** (`vr3`, Klepton OpenXR layer log): `vrlink` submitted two
+projection layers—`fov 90x90 deg, 1536x1536 px` followed by `fov 50x50 deg,
+1536x1536 px`—matching the formula output (`49.99 x 49.65` degrees).
 
-**captured**, measured in the picture: the inset record describes exactly
-which part of the base tile the fovea tile shows. In base-tile pixels the
-record predicts that fovea pixel `f` lands at `(inset + f) * 1536 / 3294`:
-scale 0.46630, offset (414.54, 486.35) for the left eye and (404.75, 486.35)
-for the right, i.e. the rectangle x 415..1131, y 486..1203 of the left base
-tile. A least-squares fit of the luma of the fovea tile onto the base tile
-(scale and offset free, bilinear sampling, started 3 px off the prediction)
-gives:
+Measuring the decoded pixels directly (**captured**) confirms that the inset
+record describes the exact region of the base tile shown in the foveal tile. In
+base-tile pixel coordinates, the record predicts that foveal pixel `f` maps to
+`(inset + f) * 1536 / 3294`: a scale of `0.46630` and an offset of `(414.54,
+486.35)` for the left eye and `(404.75, 486.35)` for the right eye, spanning
+`x = 415..1131, y = 486..1203` of the left base tile. Fitting the foveal tile's
+luma onto the base tile via least squares (free scale and offset, bilinear
+sampling, initialized 3 px away from the prediction) yields:
 
 | frame | eye | scale | offset x, y | implied `inset_x, inset_y, virt` |
 |---|---|---|---|---|
@@ -246,86 +265,93 @@ gives:
 | probe 1500 | left | 0.46624 | 414.55, 486.37 | 889.1, 1043.2, 3294.4 |
 | probe 1500 | right | 0.46638 | 404.69, 486.27 | 867.7, 1042.6, 3293.5 |
 
-That is within 0.1 base pixel and 1 part in 5,000 of scale. Letting the
-horizontal and vertical scales differ changes neither by more than 0.0002, so
-the mapping is a plain uniform scale and shift, as two pinhole views from one
-eye point should be. (The probe session's own metadata was not re-read; its
-picture fits the same record.) This confirms the reading of the record given
-above, including that `inset_x, inset_y` are the top-left corner counted from
-the top-left of the virtual image, and fixes the foveal FOV formulas'
-geometry for a symmetric frustum. An asymmetric frustum has not been seen.
+All fits agree within `0.1` base pixel and 1 part in 5,000 of scale. Allowing
+independent horizontal and vertical scales shifts neither by more than
+`0.0002`, confirming a uniform scale and translation as expected for two
+pinhole projections sharing an eye position. (The probe stream's metadata was
+not re-read separately, and its pixels match the same inset geometry.) This
+verifies that `(inset_x, inset_y)` is measured from the top-left corner of the
+virtual image and confirms the foveal FOV formulas for symmetric frusta;
+asymmetric frusta were tested subsequently below.
 
-The pose written to all four views is the frame's render pose
-([frame-metadata.md](frame-metadata.md)); the `subImage` rect is the whole
-swapchain.
+All four projection views receive the frame's render pose
+([frame-metadata.md](frame-metadata.md)), and `subImage` covers the full
+swapchain dimensions.
 
 ## Open questions / to confirm on the wire
 
-Settled by `vr3`: tile order and which eye is first (left; disparity), the
-four slices are the four tiles, the feather is client-side only, and the
-inset record matches the picture.
+`vr3` confirmed the tile order and eye assignment (left eye first, verified by
+stereo parallax), the 1:1 correspondence between the four HEVC slices and four
+atlas tiles, that edge feathering is applied only on the client, and that the
+inset record matches the rendered pixels. Open questions following `vr3`
+(several addressed in the later client results below):
 
-1. Whether mode 1 or mode 2 ever occur (other headsets, foveation disabled).
-   Not in `vr3`.
-2. Whether `inset_x/inset_y` change at run time with eye tracking. Constant
-   over `vr3`, which had no eye tracking.
-3. Which Y'CbCr matrix the host encodes with. The VUI says identity, which
-   cannot be true of a 4:2:0 stream; BT.2020 and BT.709 both look plausible.
-   A known test pattern (pure primaries on the host desktop) would settle it.
-4. What the 3x3 is for, and what changes when the runtime accepts the
-   requested `XR_FB_color_space` (it was refused under Klepton).
-5. The foveal FOV formulas with an asymmetric base frustum (only the symmetric
-   +-45 degree case has been measured).
-6. Both eyes receive the same pose - see the open item in frame-metadata.md.
-   The picture does have stereo disparity, so the host renders the two eyes
-   from separated positions.
-
+1. Whether atlas mode 1 or mode 2 ever occurs (for example, on other headsets
+   or when foveation is disabled); neither appeared in `vr3`.
+2. Whether `inset_x` and `inset_y` update dynamically at runtime when eye
+   tracking is active; they stayed constant across `vr3`, which had no eye
+   tracking.
+3. Which Y'CbCr matrix the host encoder uses: the VUI signals `identity`, which
+   is invalid for 4:2:0, and both BT.2020 and BT.709 look plausible on the
+   dashboard scene. Capturing a pure-primary test pattern on the host desktop
+   would settle this.
+4. What the 3x3 shader color matrix targets, and what changes when the OpenXR
+   runtime accepts the requested `XR_FB_color_space` (which Klepton declined).
+5. Verifying the foveal FOV formulas with an asymmetric base frustum (only the
+   symmetric +/-45 degree case was present in `vr3`).
+6. Why both eyes receive the same pose in metadata (see the open item in
+   [frame-metadata.md](frame-metadata.md)), given that stereo parallax in the
+   decoded image confirms the host renders the two eyes from separated
+   positions.
 
 ## Probe results (2026-11-10)
 
-A frame from the probe's saved stream, decoded with ffmpeg, shows the SteamVR
-dashboard four times down the 1536x6144 atlas: a magnified central crop, the
-full view, then the same pair again. That is fovea then base for one eye, then
-fovea then base for the other - the tile order above is now **captured**.
-Which eye is first is still static only (a motionless head and a dashboard at
-a distance give too little disparity to tell from one frame).
+Decoding a frame from the probe's saved stream with `ffmpeg` shows the SteamVR
+dashboard stacked four times down the `1536x6144` atlas: a magnified central
+crop, the wide view, and then the same pair repeated. That confirms the
+fovea-then-base ordering for each eye (**captured**), though a single frame
+with a stationary head viewing a distant dashboard had too little disparity on
+its own to distinguish which eye came first without the cross-correlation
+check above.
 
-## Client results (2026-11-10): an asymmetric frustum, on a headset
+## Client results (2026-11-10): asymmetric frusta on a headset
 
-The visionOS client published each eye's real frustum from an Apple Vision
-Pro - left eye tangents left -1.73, right 1.00, down -1.19, up 1.00 (the
-right eye mirrored) - and an IPD of about 65 mm, and composed the base and
-foveal tiles with the formulas above. Seen in the headset by the project
-owner: stereo is correct and the picture is sharp in the center with no
-visible seam. So the host renders asymmetric frusta as given, the tile order
-(left fovea, left base, right fovea, right base) holds on a real stereo
-display, and the foveal frustum formulas hold for an asymmetric base
-(open question 5 above), by eye rather than by measurement.
+The visionOS client published each eye's physical frustum from an Apple Vision
+Pro—left eye tangents left `-1.73`, right `1.00`, down `-1.19`, up `1.00` (with
+the right eye mirrored)—along with an IPD of roughly 65 mm, and composited the
+base and foveal tiles using the formulas above. Observed on the headset, stereo
+depth is accurate and the central foveal region is sharp with no visible seam.
+This confirms visually that the host renders asymmetric frusta as requested,
+that the tile order (left fovea, left base, right fovea, right base) holds on a
+stereo headset, and that the foveal FOV formulas hold for an asymmetric base
+frustum (open question 5 above).
 
-## Client results (2026-11-10): a rotated eye
+## Client results (2026-11-10): rotated eye poses
 
-**Captured by client** (`client` on macOS against the real host): the
-host honors the rotation part of `VTE_EYE_TO_HEAD` (0x08). Two sessions,
-the same motionless head, the left eye published once facing straight ahead
-and once turned 15 degrees to the left, with the same frustum both times. The
-client places the base tile from "render pose, then the eye's published pose
-in the head". In the second session the scene stayed exactly where it was in
-the world and the tile's outline turned 15 degrees with the eye: the host had
-rendered through the turned eye. Had the host ignored the rotation, the scene
-would have moved 15 degrees with the tile.
+Testing `client` on macOS against a SteamVR host (**captured**) shows that the
+host honors the rotation component of `VTE_EYE_TO_HEAD` (`0x08`). Across two
+sessions with the same stationary head pose and identical frustum tangents, the
+left eye was published once facing straight ahead and once rotated 15 degrees
+to the left. `client` places each base tile by composing the eye's published
+head-relative pose onto the frame's render pose. In the rotated session, world
+geometry remained stationary while the tile's outline rotated 15 degrees with
+the eye, proving the host rendered through the rotated eye pose; if the host
+had ignored eye rotation, the scene would have shifted by 15 degrees along with
+the tile.
 
-So a headset with canted displays should publish each eye's real orientation
-and the frustum measured about that eye's own axes, and the client must
-place the tiles with the same orientation. The earlier headset run published
-identity rotations with frusta measured about canted axes; that is
-self-consistent (the host rendered a cone aimed straight ahead and the client
-showed it straight ahead) but covers the wrong part of each display.
+In principle, a headset with canted displays can publish each eye's physical
+orientation along with frustum tangents measured around that eye's axes,
+placing the tiles with the matching orientation. (The earlier headset test
+published identity rotations with frusta measured around canted axes, which is
+internally self-consistent—the host rendered a forward-aimed cone and the
+client displayed it straight ahead—but under-samples the outer display margin.)
 
 ## Client results (2026-11-10): asymmetric frusta and eye spacing, measured
 
-**Captured by client** (`client` on macOS; the centroid of a
-controller model drawn by SteamVR Home at a fixed pose about 0.5 m from a
-motionless head, in a 1800-pixel window spanning tangents -1..1):
+To verify frustum and IPD handling quantitatively (**captured** with `client`
+on macOS), we measured the pixel centroid of a controller model rendered by
+SteamVR Home at a fixed pose roughly 0.5 m in front of a stationary head,
+projected into an 1800-pixel window spanning tangents `-1..1`:
 
 | published | centroid, pixels |
 |---|---|
@@ -334,27 +360,30 @@ motionless head, in a 1800-pixel window spanning tangents -1..1):
 | left eye -1.0 / 1.73 / -1.0 / 1.19, right eye mirrored | 1377.1, 1406.8 |
 | symmetric, eyes 126 mm apart | 1433.3, 1404.2 |
 
-The host renders through exactly the frustum it is given, asymmetric or not
-(the model stays within a pixel when the tile is placed by the same
-tangents), and uses the published eye spacing (moving the left eye 31.5 mm
-further left shifts the model 56 pixels, 0.063 in tangent, which is 31.5 mm
-seen from 0.50 m).
+The host renders through the exact published frustum whether symmetric or
+asymmetric (the controller stays within 1 pixel when the tile is placed using
+matching tangents) and honors the published eye spacing (shifting the left eye
+31.5 mm further left moves the controller by 56 pixels, or `0.063` in tangent
+space, matching 31.5 mm at 0.50 m depth).
 
-## Headset result (2026-11-10): do not publish turned eyes
+## Headset result (2026-11-10): canted displays and parallel projection
 
-With the Vision Pro's real eye rotations published (each display about 0.5
-degrees outwards and 1.2 up), the wearer saw host-drawn hands sit further
-away than the real ones, more so with distance, in a game; markers drawn by
-the client at the same tracked points sat exactly on the real hands, so
-tracking and display were right and the picture's stereo was wrong. In
-SteamVR's own empty scene the hands lined up much better.
+When `client` published the Vision Pro's physical eye rotations (each display
+canted roughly 0.5 degrees outward and 1.2 degrees upward), the user saw
+game-rendered hands sit further away than their physical hands, with the depth
+error increasing with distance. Local debug markers drawn by `client` at the
+same tracked coordinates aligned directly with the user's physical hands,
+confirming that tracking and local display composition were accurate while the
+streamed video had wrong stereo convergence. In SteamVR's empty construct
+scene, the hands aligned much more closely.
 
-**inferred** (the known cause of the same symptom on other canted headsets,
-where it is worked around with "parallel projection"): the host and SteamVR
-honor eye rotation, as measured above, but many applications render as if
-the eyes were parallel. A degree of lost convergence moves a hand at half a
-meter about a fifth further away. `client` now publishes eyes facing
-straight ahead, with each frustum widened to enclose the turned display's
-(`Frustum.enclosing`), and draws the picture through the real turned views.
-Reported by the wearer: with parallel eyes the picture renders fine and the
-hands line up in the same game, on a fresh SteamVR start and on a rejoin.
+**inferred**: Although SteamVR and the `vrlink` host driver honor
+`VTE_EYE_TO_HEAD` rotations (as measured above), many VR titles render assuming
+parallel eye views—the same issue seen on other canted headsets, where SteamVR
+works around it via "parallel projection". Losing 1 degree of convergence
+pushes a hand at 0.5 m roughly 20% further away. `client` now publishes
+parallel forward-facing eyes with each frustum widened to enclose the canted
+display's FOV (`Frustum.enclosing`), then renders the received image through
+the physical canted views. With parallel eyes published, the user confirmed
+that stereo depth looks natural and virtual hands align with physical hands in
+the same game, both on a fresh SteamVR launch and on reconnect.

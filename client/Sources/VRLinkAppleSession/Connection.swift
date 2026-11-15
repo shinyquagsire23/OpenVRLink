@@ -12,10 +12,10 @@ import VRLinkVideoToolbox
 import UIKit
 #endif
 
-/// A computer the entry window offers.
+/// A discovered host shown in the connection picker.
 public struct FoundHost: Identifiable {
     public let name: String
-    /// An address in numbers, or a name the system can look up.
+    /// An IP address or a resolvable hostname.
     public let address: String
     public let kind: HostKind
 
@@ -28,26 +28,26 @@ public struct FoundHost: Identifiable {
 /// Sessions can be stopped and started with backgrounding/foregrounding
 /// and when the headset is doffed and re-donned.
 public final class Connection: ObservableObject {
-    /// What the entry window shows (progress, the pairing PIN, errors)
+    /// Human-readable status text shown in the entry window (progress, pairing PIN, or errors).
     @Published public var status = "Not connected"
-    /// Hosts found on the local network, Steam's first
+    /// Discovered hosts on the local network, with Steam hosts listed before WiVRn hosts.
     @Published public var hosts: [FoundHost] = []
     private var steamHosts: [FoundHost] = [], wivrnHosts: [FoundHost] = []
     private let wivrnBrowser = ServiceBrowser(type: WiVRn.serviceType)
     /// Whether the immersive space is open
     @Published public var immersed = false
-    /// Connecting, with the immersive space still to be opened: it is
-    /// opened when there is a picture to show in it.
+    /// True while connecting and waiting for the first decoded video frame
+    /// before opening the immersive space.
     @Published public var waitingForPicture = false
-    /// A WiVRn host that does not know this headset is waiting for the PIN
-    /// it shows: the entry window asks for it and answers with `answerPin`.
+    /// True when an unpaired WiVRn host is waiting for the user to enter its
+    /// pairing PIN via `answerPin(_:)`.
     @Published public var askingForPin = false
     private var pinAnswer: String??
     /// The host the user chose.
     /// When the headset is doffed and re-donned, it will resume from this
     /// host instead of re-asking the user.
     public var hostAddress = ""
-    /// What that host is.
+    /// Protocol used by the selected host (Steam or WiVRn).
     public var hostKind = HostKind.steam
     private var microphone: MicrophoneInput?
     private var searching = false
@@ -73,8 +73,7 @@ public final class Connection: ObservableObject {
         return current
     }
 
-    /// How the display was described to the host when the stream now
-    /// running, or being started, was asked for. Thread-safe.
+    /// The device profile sent to the host for the active or starting stream. Thread-safe.
     public var profile: DeviceProfile? {
         lock.lock()
         defer { lock.unlock() }
@@ -95,11 +94,11 @@ public final class Connection: ObservableObject {
         return pictureArrived
     }
 
-    /// What the host calls this device from pairing on, as in "Max's Apple
-    /// Vision Pro (OpenVRLink)". The system gives an app the name its owner
-    /// chose only with an entitlement Apple grants on request
-    /// (com.apple.developer.device-information.user-assigned-device-name);
-    /// without it the name is the model's, "Apple Vision Pro".
+    /// Device name sent to the host during pairing, e.g. "Max's Apple Vision
+    /// Pro (OpenVRLink)". Querying the user-assigned device name requires the
+    /// `com.apple.developer.device-information.user-assigned-device-name`
+    /// entitlement; without it, UIKit falls back to the generic model name
+    /// ("Apple Vision Pro").
     private let deviceName: String
 
     public init() {
@@ -109,7 +108,7 @@ public final class Connection: ObservableObject {
         deviceName = HostConnector.name(of: Host.current().localizedName ?? "Mac")
         #endif
         #if canImport(UIKit)
-        // The system ends the search for announced hosts while the app is put away.
+        // Restart mDNS discovery when returning to the foreground, since the OS suspends it in the background.
         NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: nil) { [weak self] _ in
             self?.wivrnBrowser.restart()
         }
@@ -130,14 +129,14 @@ public final class Connection: ObservableObject {
         DispatchQueue.main.async { self.status = text }
     }
 
-    /// Keep the list of hosts fresh while the entry window is waiting
+    /// Starts background discovery for WiVRn (mDNS) and Steam (UDP broadcast) hosts.
     public func searchForHosts() {
         lock.lock()
         let already = searching
         searching = true
         lock.unlock()
         if already { return }
-        // WiVRn hosts announce themselves; the system listens for them.
+        // Listen for WiVRn hosts via Bonjour.
         wivrnBrowser.start { [weak self] services in
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -154,8 +153,8 @@ public final class Connection: ObservableObject {
                 lock.lock()
                 let idle = !wanted && current == nil
                 lock.unlock()
-                // A new socket every round, so that one the system refused
-                // before permission was given is not kept.
+                // Create a fresh socket each poll so we don't hold onto a socket
+                // that failed before local network permission was granted.
                 if idle, let socket = UDPSocket() {
                     let found = Broadcast.discover(socket, deviceID: identity.deviceID)
                         .filter(\.offersVRLink).sorted { $0.hostname < $1.hostname }
@@ -169,9 +168,9 @@ public final class Connection: ObservableObject {
         }
     }
 
-    /// Start streaming (or pairing first if the host hasn't paired with this device yet)
-    /// Poses are retrieved from provider args every vsync.
-    /// `microphone`: whether the user wants their voice sent to the host.
+    /// Starts streaming from `hostAddress`, pairing first if needed.
+    /// Tracking providers are polled each vsync; pass `microphone: true` to
+    /// stream microphone audio to the host.
     public func start(profile: DeviceProfile, microphone microphoneWanted: Bool, headProvider: @escaping () -> TrackedPose?,
                handsProvider: @escaping () -> [HandInput?],
                gazeProvider: @escaping () -> Vec3?,
@@ -212,7 +211,7 @@ public final class Connection: ObservableObject {
                 guard let (session, hostName) = try connector.connect(kind, address: address, profile: profile) else { return }
                 if microphoneWanted { sendMicrophone(to: session.microphoneSink) }
                 session.onLog = { Log.note($0) }
-                // The host ended it: drop the stream and say why, where the wearer will look.
+                // Tear down the stream if the host disconnects and display the reason in the UI.
                 session.onEnded = { [weak self, weak session] reason in
                     guard let self, let session, self.session === session else { return }
                     self.stop()
@@ -228,7 +227,7 @@ public final class Connection: ObservableObject {
                 session.onRefreshRateRequested = { hz in DisplayRate.shared.ask(for: hz) }
                 decoder.onFormat = { DisplayRate.shared.videoFormat($0) }
                 #endif
-                // Nothing of an earlier stream's decoding is carried into this one.
+                // Reset decoder state before starting a new stream.
                 decoder.reset()
                 session.onFrame = { [decoder] frame in decoder.decode(frame) }
                 session.start()
@@ -243,7 +242,7 @@ public final class Connection: ObservableObject {
                 DispatchQueue.main.async {
                     if let audio = self.audio { audio.resume() } else { self.audio = AudioOutput(buffer: session.audio) }
                 }
-                // A WiVRn host sends no picture until an application runs there.
+                // WiVRn doesn't send video frames until an OpenXR app starts on the host.
                 show(kind == .steam ? "Streaming from \(hostName)" : "Connected to \(hostName); waiting for an application there")
             } catch {
                 show("Could not connect: \(error)")
@@ -251,8 +250,8 @@ public final class Connection: ObservableObject {
         }
     }
 
-    /// The PIN the wearer types, or nil if they would rather not. Waits for
-    /// as long as they take; the host itself gives up after two minutes.
+    /// Blocks until the user submits a WiVRn pairing PIN or cancels (returning
+    /// nil). The host times out on its own after two minutes.
     private func askForPin(cancelled: () -> Bool) -> String? {
         lock.lock()
         pinAnswer = nil
@@ -269,7 +268,7 @@ public final class Connection: ObservableObject {
         return nil
     }
 
-    /// What was typed when `askingForPin` was set, or nil for "never mind".
+    /// Delivers the user-entered pairing PIN (or nil if canceled) to a waiting `askForPin` call.
     public func answerPin(_ pin: String?) {
         lock.lock()
         pinAnswer = .some(pin)
@@ -293,12 +292,12 @@ public final class Connection: ObservableObject {
         }
     }
 
-    /// Drop everything that belonged to the stream. `leaving` is for the
-    /// wearer saying they are done: the host then quits SteamVR and the
-    /// application in it at once; so it does when nothing
-    /// runs in SteamVR. Otherwise (the headset taken off or the app put
-    /// away in the middle of a game) the host keeps the game for a while,
-    /// and a stream asked for again in that time carries on in it.
+    /// Tears down the active stream. Pass `leaving: true` when the user
+    /// explicitly stops streaming so the host quits SteamVR and any running
+    /// game immediately (the host also quits SteamVR if no game is running).
+    /// When `leaving` is false (for example, when taking off the headset or
+    /// backgrounding the app mid-game), the host keeps the game running briefly
+    /// so reconnecting resumes the session.
     public func stop(leaving: Bool = false) {
         lock.lock()
         let session = current
@@ -310,8 +309,7 @@ public final class Connection: ObservableObject {
         frames.clear()
         guard let session else { return }
         session.stop(leaving: leaving)
-        // The session says goodbye to the host over the next half second.
-        // If the app is being closed, ask the system for that long.
+        // Request brief background execution time so the session can finish sending disconnect packets.
         #if !os(macOS)
         if leaving || !session.sceneApplicationRunning {
             ProcessInfo.processInfo.performExpiringActivity(withReason: "telling the host the session is over") { expired in
@@ -325,7 +323,7 @@ public final class Connection: ObservableObject {
             self.audio = nil
         }
         show("Not connected")
-        // A WiVRn host is not announced while it has a headset: look afresh now that it has none.
+        // WiVRn stops advertising over mDNS while a client is connected, so refresh discovery after disconnecting.
         wivrnBrowser.restart()
     }
 }

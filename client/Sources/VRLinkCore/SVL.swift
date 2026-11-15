@@ -5,26 +5,26 @@
 import Foundation
 
 /// SVL datagram framing (docs/svl-transport/packet-format.md). The session
-/// token's first letters say which of two forms the host wants: `MID`, in
-/// the clear with a checksum seeded by a session id, or `AES`, every
-/// datagram encrypted. Steam's "encrypt streaming" setting on the host
-/// chooses between them.
+/// token prefix selects the wire format requested by the host: `MID` sends
+/// datagrams unencrypted with a checksum seeded by a session ID, while `AES`
+/// encrypts every datagram. Steam's "encrypt streaming" host setting controls
+/// which format is used.
 
-/// The classes of element (docs/svl-transport/packet-types.md). Each class
-/// numbers its own types.
+/// SVL element classes (docs/svl-transport/packet-types.md). Each class
+/// has its own type numbering.
 public enum SVLClass {
     public static let padding: UInt8 = 0            // skipped when reading
-    public static let unreliable: UInt8 = 3         // the typed stream, both ways: poses, values, hands, haptics
+    public static let unreliable: UInt8 = 3         // bidirectional typed stream: poses, values, hands, haptics
     public static let videoReply: UInt8 = 4         // client to host only
     public static let video: UInt8 = 5              // host to client only
-    public static let serverEvent: UInt8 = 8        // a line of text from the host
-    public static let audio: UInt8 = 0x0B           // parity as long as the packets it covers
-    public static let audioVariable: UInt8 = 0x0C   // parity's `index` says how long the shorter packet was
+    public static let serverEvent: UInt8 = 8        // text log line from the host
+    public static let audio: UInt8 = 0x0B           // parity matches the length of the packets it covers
+    public static let audioVariable: UInt8 = 0x0C   // parity `index` records the length of the shorter packet
 }
 
-/// What an element is: its class and its type within that class. The ones
-/// this client sends or reads have names; anything else off the wire is
-/// still a kind, just not one of these.
+/// Identifies an SVL element by its message class and per-class type ID.
+/// Known message types used by this client are defined as static constants;
+/// unrecognized wire elements can still be represented with raw values.
 public struct SVLKind: Equatable {
     public var messageClass: UInt8
     public var type: UInt8
@@ -35,22 +35,22 @@ public struct SVLKind: Equatable {
     }
 
     // Unreliable stream, client to host.
-    public static let pose = SVLKind(SVLClass.unreliable, 0x01)               // poses, input, and value transport after them
+    public static let pose = SVLKind(SVLClass.unreliable, 0x01)               // poses and input, followed by value-transport data
     public static let statistics = SVLKind(SVLClass.unreliable, 0x07)         // string -> double values
     public static let eyesAndFace = SVLKind(SVLClass.unreliable, 0x11)
-    public static let goodbye = SVLKind(SVLClass.unreliable, 0x13)            // empty: the session is over
-    public static let hand = SVLKind(SVLClass.unreliable, 0x17)               // a bare hand's skeleton and gestures
-    public static let addressList = SVLKind(SVLClass.unreliable, 0x18)        // where this side can be reached; both ways
+    public static let goodbye = SVLKind(SVLClass.unreliable, 0x13)            // empty payload ending the session
+    public static let hand = SVLKind(SVLClass.unreliable, 0x17)               // hand-tracking skeleton and gestures
+    public static let addressList = SVLKind(SVLClass.unreliable, 0x18)        // local reachable addresses (sent both ways)
     // Unreliable stream, host to client.
     public static let valueTransport = SVLKind(SVLClass.unreliable, 0x0D)
     public static let haptics = SVLKind(SVLClass.unreliable, 0x16)
     // Video reply, client to host.
-    public static let retransmitRequest = SVLKind(SVLClass.videoReply, 0x05)  // the packet ids wanted again
+    public static let retransmitRequest = SVLKind(SVLClass.videoReply, 0x05)  // packet IDs requested for retransmission
     public static let frameReport = SVLKind(SVLClass.videoReply, 0x0F)
     // Video, host to client.
     public static let frameDescriptor = SVLKind(SVLClass.video, 0x02)         // also carries the host clock and value transport
     public static let videoPacket = SVLKind(SVLClass.video, 0x03)             // data or parity
-    // Audio, either way (the microphone goes up as the variable form).
+    // Bidirectional audio (microphone uplink uses the variable-length form).
     public static let audio = SVLKind(SVLClass.audio, 0x10)
     public static let audioVariable = SVLKind(SVLClass.audioVariable, 0x10)
 }
@@ -60,9 +60,9 @@ public struct SVLElement {
     public var type: UInt8
     public var id: UInt16            // per class: video frame id
     public var index: UInt16         // per class: video packet id, descriptor group
-    /// The payload. For an element off the wire this is a part of the
-    /// datagram it came in, not a copy: a video packet is copied once,
-    /// into its frame.
+    /// Element payload. Parsed wire elements slice directly into the
+    /// underlying datagram buffer so video packets are only copied once,
+    /// into their destination frame buffer.
     public var value: ByteSlice
 
     public var kind: SVLKind { SVLKind(messageClass, type) }
@@ -84,7 +84,7 @@ public enum SVL {
     static let headerLength = 8
     static let maxElementValue = 0x400
 
-    /// The bytes a token carries after its four-character kind.
+    /// Decodes the base64url payload following a token's 4-character prefix.
     static func tokenBytes(_ token: String) -> Bytes? {
         var text = String(token.dropFirst(4)).replacingOccurrences(of: "-", with: "+")
             .replacingOccurrences(of: "_", with: "/")
@@ -100,7 +100,7 @@ public enum SVL {
             for word in 0..<whole {
                 accumulator ^= UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: word * 4, as: UInt32.self))
             }
-            // A last partial word counts as if padded with zeros.
+            // Treat any trailing partial word as zero-padded.
             for index in whole * 4..<raw.count {
                 accumulator ^= UInt32(raw[index]) << UInt32((index - whole * 4) * 8)
             }
@@ -108,7 +108,7 @@ public enum SVL {
         return accumulator
     }
 
-    /// A datagram in the clear: sequence, a zero, a word the caller decides, then the elements.
+    /// Serializes an unencrypted datagram with its sequence number, two zero bytes, a caller-supplied header word, and the encoded elements.
     static func assemble(sequence: UInt16, word: UInt32, elements: [SVLElement]) -> Bytes {
         var datagram = Bytes()
         datagram.append(integer: sequence)
@@ -125,7 +125,7 @@ public enum SVL {
         return datagram
     }
 
-    /// The elements of a datagram in the clear.
+    /// Parses the elements from an unencrypted datagram.
     static func elements(of datagram: Bytes) -> [SVLElement] {
         var elements: [SVLElement] = []
         var offset = headerLength
@@ -146,20 +146,20 @@ public enum SVL {
 }
 
 
-/// The link probe: a datagram outside the SVL framing, three 32-bit
-/// words (a fixed mark, a 2, then 1 for "send this back" or 2 for "here
-/// it is back") and whatever padding the asker added. Each side asks the
-/// other every few seconds; the reference client answers with the same
-/// bytes, the third word changed, and notes the longest answer it has
-/// had (read from Steam Link 2.0.25; seen in capture `vr14`). A host
-/// given version 14 whose probes go unanswered remakes its socket every
-/// two seconds.
+/// Handles link-probe datagrams sent outside normal SVL framing. A probe
+/// consists of three 32-bit words (a magic marker, protocol kind 2, and 1 for
+/// a request or 2 for a reply) followed by arbitrary padding from the sender.
+/// Both peers send probes every few seconds; `vrlink` echoes the packet back
+/// with the third word set to `answer` and tracks the largest probe size
+/// received (observed in Steam Link 2.0.25 and capture `vr14`). Under minor
+/// version 14, a host recreates its UDP socket every two seconds if its probes
+/// go unanswered.
 enum LinkProbe {
     static let mark: UInt32 = 0x459B_4C33
     static let kind: UInt32 = 2
     static let request: UInt32 = 1, answer: UInt32 = 2
 
-    /// The datagram to send back, if `datagram` is a probe asking for one.
+    /// Returns an echo reply if `datagram` is a link-probe request, or nil otherwise.
     static func reply(to datagram: Bytes) -> Bytes? {
         guard datagram.count >= 12, datagram.integer(at: 0) as UInt32 == mark,
               datagram.integer(at: 4) as UInt32 == kind, datagram.integer(at: 8) as UInt32 == request
@@ -169,41 +169,41 @@ enum LinkProbe {
         return out
     }
 
-    /// Whether `datagram` is any link probe, and so not for the SVL reader.
+    /// Returns true if `datagram` is a link probe (request or reply) rather than an SVL datagram.
     static func isProbe(_ datagram: Bytes) -> Bool {
         datagram.count >= 12 && datagram.integer(at: 0) as UInt32 == mark
     }
 }
 
-/// One session's datagram form, read from its token.
+/// Framing and optional encryption state for an SVL session, configured from its session token.
 public struct SVLLink {
     private enum Form {
-        /// In the clear; the header's second word makes the XOR of all the
-        /// datagram's words and this session id come to zero.
+        /// Unencrypted datagrams; the second header word is a checksum chosen
+        /// so that XORing all 32-bit words with `sessionID` yields zero.
         case checked(sessionID: UInt32)
-        /// The whole datagram, padded with zeros to a multiple of 16 bytes,
-        /// is AES-128-CBC encrypted, starting from the same IV every time.
-        /// The header's second word counts sequence wraps, tagged 0x02 on top.
+        /// AES-128-CBC encrypted datagrams zero-padded to a 16-byte boundary,
+        /// reusing the static IV for every packet. The second header word
+        /// tracks 16-bit sequence wraparounds with `0x02` in the high byte.
         case encrypted(key: Bytes, iv: Bytes)
     }
     private let form: Form
     private var wraps: UInt32 = 0
     private var lastSequence: UInt16 = 0
 
-    /// For the log: which form the host chose.
+    /// Human-readable description of the transport mode for logging.
     public let name: String
 
-    /// Nil for a token of a kind this client does not know.
+    /// Returns nil if the token prefix or payload is unrecognized.
     public init?(token: String) {
         guard let bytes = SVL.tokenBytes(token) else { return nil }
         switch token.prefix(3).uppercased() {
         case "MID":
-            // The session id: the token's first three bytes, tagged 0x01.
+            // Session ID formed from the token's first three bytes with 0x01 in the high byte.
             guard bytes.count >= 5 else { return nil }
             form = .checked(sessionID: UInt32(bytes[0]) | UInt32(bytes[1]) << 8 | UInt32(bytes[2]) << 16 | 0x0100_0000)
             name = "unencrypted"
         case "AES":
-            // 16 bytes of IV, then 16 of key (measured; in that order).
+            // 16 bytes of IV followed by 16 bytes of key (measured in that order).
             guard bytes.count >= 32 else { return nil }
             form = .encrypted(key: Bytes(bytes[16..<32]), iv: Bytes(bytes[0..<16]))
             name = "AES-128 encrypted"
@@ -225,13 +225,13 @@ public struct SVLLink {
             // The goodbye datagram (sequence 0xffff) carries a counter of all ones.
             let counter = sequence == 0xFFFF ? 0x00FF_FFFF : wraps & 0x00FF_FFFF
             var datagram = SVL.assemble(sequence: sequence, word: counter | 0x0200_0000, elements: elements)
-            // The reference client's padding: at least four zeros, up to a multiple of 16.
+            // Match vrlink's padding: append at least 4 zero bytes, padded to a 16-byte multiple.
             datagram.append(zeros: ((datagram.count + 0x13) & ~0xF) - datagram.count)
             return Primitives.aesCBC(datagram, key: key, iv: iv, encrypting: true, padded: false) ?? []
         }
     }
 
-    /// Nil when the datagram is not one of this session's.
+    /// Unpacks a datagram, or returns nil if decryption or validation fails.
     public func unpack(_ datagram: Bytes) -> [SVLElement]? {
         switch form {
         case .checked(let sessionID):

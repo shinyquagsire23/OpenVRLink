@@ -7,7 +7,7 @@ import XCTest
 
 final class EyeTests: XCTestCase {
     func testMessageWithoutTrackingMatchesTheReferenceClient() {
-        // The 25 bytes every eye message of capture `vr14` (Steam Link 2.0.25) carries.
+        // Matches the 25-byte payload sent in every eye message of capture `vr14` (Steam Link 2.0.25).
         let message = EyesAndFace.message(gaze: nil, face: nil)
         XCTAssertEqual(message.value, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x3F, 0, 0, 0, 0, 0] + Bytes(repeating: 0, count: 8))
     }

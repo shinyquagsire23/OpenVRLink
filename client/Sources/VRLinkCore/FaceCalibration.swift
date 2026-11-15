@@ -4,31 +4,29 @@
 
 import Foundation
 
-/// Face expressions fitted to one user's face.
+/// Per-user calibration for landmark-based face tracking.
 ///
-/// The rules of thumb in `FaceEstimator` turn measurements of a face into
-/// expression weights with fixed numbers that suit nobody exactly.
-/// The calibration step replaces the numbers with the user's own: they hold a few
-/// expressions in turn while the measurements are recorded, and from then
-/// on each weight is how far the face has gone from its resting measurement
-/// towards the one it showed at that expression's fullest.
+/// `FaceEstimator` converts facial landmark measurements into expression weights using fixed
+/// heuristics that vary in accuracy across different faces. Calibration records a user's actual
+/// measurements across a short sequence of target expressions, then maps live measurements
+/// linearly from the neutral baseline toward each recorded peak pose.
 
-/// What is measured on a face in one picture. Every number is a length in
-/// the picture divided by the face's width or height, so that distance from
-/// the camera does not matter. "L" and "R" are the left and right of the
-/// (mirrored) picture (ie, relative to the user, not a viewer), as in the expression names.
+/// Normalized facial measurements extracted from a single camera frame. Distances are
+/// divided by face width or height for scale invariance. `L` and `R` correspond to the left
+/// and right sides of the mirrored image (matching the user's anatomical left and right, as
+/// in `FaceExpression`).
 public struct FaceMeasures: Codable, Equatable {
-    /// The gap between the lips, over the face's height.
+    /// Vertical inner-lip opening divided by face height.
     public var mouthOpen: Float = 0
-    /// The mouth's width over the face's width, whole and by halves.
+    /// Full, left-half, and right-half outer mouth widths divided by face width.
     public var mouthWidth: Float = 0, mouthWidthL: Float = 0, mouthWidthR: Float = 0
-    /// How far each corner of the mouth is below the mouth's middle.
+    /// Vertical drop of each mouth corner below the mouth center, divided by face height.
     public var cornerDropL: Float = 0, cornerDropR: Float = 0
-    /// How far each brow is above the line through its eye's two corners.
-    /// (Not above the top of the eye: that falls when the eye shuts, and
-    /// shutting the eyes then read as raising the brows.)
+    /// Height of each eyebrow above the line connecting its eye's inner and outer corners,
+    /// divided by face height. Measured relative to the eye corners rather than the upper
+    /// eyelid so closing the eyes does not register as raising the brows.
     public var browLiftL: Float = 0, browLiftR: Float = 0
-    /// How open each eye's lids are (its outline's area over its width squared).
+    /// Eyelid openness ratio (eye contour area divided by eye width squared).
     public var eyeOpenL: Float = 0, eyeOpenR: Float = 0
 
     public init() {}
@@ -46,12 +44,12 @@ public struct FaceMeasures: Codable, Equatable {
     }
 }
 
-/// The expressions the user is asked to hold, in order.
+/// Target expressions requested during face calibration, in presentation order.
 public enum FacePose: String, CaseIterable, Codable {
-    // Shut eyes come last: nothing can be read with them shut.
+    // Keep eyesClosed last because the user cannot read on-screen prompts with closed eyes.
     case neutral, jawOpen, smile, frown, pucker, browsUp, browsDown, eyesWide, eyesClosed
 
-    /// What to ask for.
+    /// User-facing instruction for this calibration step.
     public var prompt: String {
         // TODO: i8n
         switch self {
@@ -69,12 +67,12 @@ public enum FacePose: String, CaseIterable, Codable {
 }
 
 public struct FaceCalibration: Codable, Equatable {
-    /// The measurements recorded at each pose, by the pose's name.
+    /// Recorded facial measurements keyed by `FacePose.rawValue`.
     public var poses: [String: FaceMeasures]
-    /// Which definition of the measurements these were recorded with.
+    /// Schema version of the measurement definitions used when recording.
     public var version: Int
 
-    /// Raised whenever a measurement changes its meaning: recordings made before are then of no use.
+    /// Incremented when `FaceMeasures` definitions change, invalidating older saved calibrations.
     public static let currentVersion = 2
 
     public init(poses: [FacePose: FaceMeasures]) {
@@ -82,36 +80,30 @@ public struct FaceCalibration: Codable, Equatable {
         version = FaceCalibration.currentVersion
     }
 
-    /// Whether every pose this build asks for is there, measured as this build measures.
+    /// Whether this calibration matches `currentVersion` and contains every required `FacePose`.
     public var usable: Bool {
         version == FaceCalibration.currentVersion && FacePose.allCases.allSatisfy { poses[$0.rawValue] != nil }
     }
 
-    /// The picture is of a Persona, which the system drives from its own
-    /// reading of the face, and both it and the landmark detector tend to
-    /// move the two sides of a face together: one eye shut reads as both
-    /// half shut. So the difference between the two sides is exaggerated
-    /// before it is used: each side is moved away from the average of the
-    /// two by `gain` times its distance from it.
+    /// Amplifies left/right asymmetry around the bilateral average by `gain`.
+    /// Both Spatial Persona rendering and Vision's landmark detector couple the two sides
+    /// of the face (for example, winking one eye appears as both eyes half-closed), so
+    /// exaggerating the difference restores single-side expressions.
     static func apart(_ left: Float, _ right: Float, gain: Float) -> (left: Float, right: Float) {
         let middle = (left + right) / 2, half = (left - right) / 2 * gain
         return (max(0, min(1, middle + half)), max(0, min(1, middle - half)))
     }
     static let eyeSideGain: Float = 3, browSideGain: Float = 3, mouthSideGain: Float = 2
-    /// A frown moves the mouth's corners little in the picture; what is seen is multiplied by this.
+    /// Gain applied to frown measurements, which produce only subtle mouth-corner movement in Persona frames.
     static let frownGain: Float = 2.5
-    /// How much of an eye's shutting its brow comes down with. The picture
-    /// shows next to none of it, so it is put in.
+    /// Amount of brow lowering synthesized when an eye closes, compensating for Persona's static brows during blinks.
     static let browFollowsLid: Float = 0.7
-    /// Eyes and brows at rest never measure exactly as they did when
-    /// calibrated: the first tenth or so of each of their weights is taken
-    /// as rest, and the remainder stretched to cover 0 ... 1.
+    /// Deadzone for resting eye and brow weights; values below `restBand` clamp to 0 and the remainder rescales to `0...1`.
     static let restBand: Float = 0.12
     static func pastRest(_ weight: Float) -> Float { max(0, (weight - restBand) / (1 - restBand)) }
 
-    /// The expression weights for a face measured as `now`. `fallback` is
-    /// what the rules of thumb gave; its eye-direction weights are kept,
-    /// since no pose here measures where the eyes look.
+    /// Computes calibrated expression weights from `now`. Copies eye-look weights from
+    /// `fallback` (`FaceEstimator`) because face calibration does not measure gaze direction.
     public func weights(for now: FaceMeasures, fallback: [Float]) -> [Float] {
         guard usable, let rest = poses[FacePose.neutral.rawValue] else { return fallback }
         var weights = [Float](repeating: 0, count: FaceExpressions.weightCount)
@@ -119,8 +111,8 @@ public struct FaceCalibration: Codable, Equatable {
                      .eyesLookRightL, .eyesLookRightR, .eyesLookUpL, .eyesLookUpR] {
             weights[look.rawValue] = fallback[look.rawValue]
         }
-        /// 0 at rest, 1 at the pose's measurement, straight between; 0 if
-        /// the pose did not move this measurement enough to go by.
+        /// Linearly maps `measure` from neutral (`0`) to `pose` (`1`), returning `0` if the
+        /// calibrated range is too small to be reliable.
         func reach(_ measure: KeyPath<FaceMeasures, Float>, _ pose: FacePose) -> Float {
             guard let full = poses[pose.rawValue] else { return 0 }
             let from = rest[keyPath: measure], to = full[keyPath: measure]
@@ -132,9 +124,8 @@ public struct FaceCalibration: Codable, Equatable {
         let jaw = reach(\.mouthOpen, .jawOpen)
         set(.jawDrop, jaw)
 
-        // A frown drops the mouth's corners below its middle (exaggerated,
-        // see `frownGain`). It is worked out first because a frown also
-        // widens the mouth, which is otherwise the sign of a smile.
+        // Compute frown weights first (scaled by `frownGain`) because frowning also widens
+        // the mouth, which would otherwise register as a smile.
         let frownSeenL = reach(\.cornerDropL, .frown), frownSeenR = reach(\.cornerDropR, .frown)
         let (frownL, frownR) = FaceCalibration.apart(frownSeenL * FaceCalibration.frownGain,
                                                      frownSeenR * FaceCalibration.frownGain,
@@ -142,8 +133,8 @@ public struct FaceCalibration: Codable, Equatable {
         set(.lipCornerDepressorL, frownL)
         set(.lipCornerDepressorR, frownR)
 
-        // A smile widens each half of the mouth, with the corners not
-        // dropped: half a frown's drop already rules a smile out.
+        // Smiling widens each half of the mouth without dropping the corners; suppress
+        // smile weights once corner drop reaches half of a calibrated frown.
         let (wideL, wideR) = FaceCalibration.apart(reach(\.mouthWidthL, .smile), reach(\.mouthWidthR, .smile),
                                                    gain: FaceCalibration.mouthSideGain)
         let smileL = wideL * (1 - min(1, frownSeenL * 2)), smileR = wideR * (1 - min(1, frownSeenR * 2))
@@ -152,14 +143,13 @@ public struct FaceCalibration: Codable, Equatable {
         set(.cheekRaiserL, smileL * 0.5)
         set(.cheekRaiserR, smileR * 0.5)
 
-        // A pucker narrows the mouth. So does opening the jaw, so the
-        // mouth is compared with how wide it would be at this much jaw
-        // with the lips relaxed: narrower than that is pucker. With the
-        // jaw open as well the lips are a ring (the funnel), as in a gasp.
+        // Both puckering and opening the jaw narrow the mouth. Compare current width against
+        // the expected relaxed mouth width at the current jaw opening so jaw drop alone does
+        // not trigger pucker. Combining pucker with an open jaw drives the lip funneler weights.
         if let open = poses[FacePose.jawOpen.rawValue], let puckered = poses[FacePose.pucker.rawValue] {
             let relaxedWidth = rest.mouthWidth + (open.mouthWidth - rest.mouthWidth) * jaw
-            // At least this much room, so that a wide-open mouth, already
-            // nearly as narrow as a pucker, does not flicker into one.
+            // Enforce a minimum denominator so a wide-open mouth (already nearly as narrow
+            // as a pucker) does not cause pucker weights to flicker.
             let room = max(relaxedWidth - puckered.mouthWidth, 0.03)
             let pucker = max(0, min(1, (relaxedWidth - now.mouthWidth) / room))
             set(.lipPuckerL, pucker)
@@ -169,7 +159,7 @@ public struct FaceCalibration: Codable, Equatable {
             }
         }
 
-        // Eyes, each on its own.
+        // Eyelid closure and widening per eye.
         let (shutL, shutR) = FaceCalibration.apart(reach(\.eyeOpenL, .eyesClosed), reach(\.eyeOpenR, .eyesClosed),
                                                    gain: FaceCalibration.eyeSideGain)
         let pastRest = FaceCalibration.pastRest
@@ -180,8 +170,8 @@ public struct FaceCalibration: Codable, Equatable {
         set(.upperLidRaiserL, pastRest(eyeWideL) * (1 - shutL))
         set(.upperLidRaiserR, pastRest(eyeWideR) * (1 - shutR))
 
-        // Brows, each on its own. A shutting eye takes its brow down with
-        // it a little, as on a real face, and never up.
+        // Per-side brow raise and lower. Closing an eye pulls the corresponding brow slightly
+        // downward and suppresses brow raise.
         let (browUpL, browUpR) = FaceCalibration.apart(reach(\.browLiftL, .browsUp), reach(\.browLiftR, .browsUp),
                                                        gain: FaceCalibration.browSideGain)
         let (browDownL, browDownR) = FaceCalibration.apart(reach(\.browLiftL, .browsDown), reach(\.browLiftR, .browsDown),
@@ -195,9 +185,8 @@ public struct FaceCalibration: Codable, Equatable {
 }
 
 extension FaceExpressions {
-    /// Set the eight eye-direction weights from where the eyes look, given
-    /// as tangents in the head's frame (see `GazeCalibration`): a weight of
-    /// 1 is the eye turned `fullTurnDegrees` that way.
+    /// Sets the eight eye-look weights from horizontal and vertical gaze tangents in head
+    /// space (see `GazeCalibration`), where `1.0` corresponds to `fullTurnDegrees` of rotation.
     public mutating func setEyeDirection(across: Float, up: Float, fullTurnDegrees: Float = 35) {
         func share(_ tangent: Float) -> Float { Float(atan(Double(tangent))) * 180 / .pi / fullTurnDegrees }
         let right = share(across), upward = share(up)
@@ -211,16 +200,14 @@ extension FaceExpressions {
     }
 }
 
-/// Steadies expression weights from one picture to the next. Each weight
-/// moves towards its new value at a pace set by how far it has to go: a
-/// small difference, which is mostly the detector's shimmer, is followed
-/// slowly (a time constant of `slow` seconds); a large one, which is the
-/// face really moving, a blink or a word, is followed fast (`fast`).
+/// Adaptive exponential smoother for frame-to-frame expression weights. Small changes
+/// (mostly landmark detector jitter) use a `slow` time constant, while large changes
+/// (blinks, speech, or rapid expressions) interpolate using the `fast` time constant.
 public struct FaceSmoother {
     private var last: [Float]?
     private var lastTime: Double?
     static let slow = 0.2, fast = 0.03
-    /// A difference this large or larger is followed at the fast pace.
+    /// Weight delta at which smoothing reaches the `fast` time constant.
     static let largeStep: Float = 0.35
 
     public init() {}

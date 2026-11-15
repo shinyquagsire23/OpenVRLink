@@ -4,14 +4,13 @@
 
 import Foundation
 
-/// Decoded frames waiting for the display.
+/// Small FIFO queue between the video decoder and the display refresh loop.
 ///
-/// The decoder and the display run on different clocks, so frames arrive a
-/// little early or late relative to refreshes. A short queue absorbs that: the
-/// display takes the oldest waiting frame at each refresh, shows the previous
-/// one again when nothing new has arrived.
+/// Because the decoder and display run on independent clocks, decoded frames can arrive
+/// slightly early or late relative to vblank. At each refresh, the display pops the oldest
+/// queued frame, or repeats the last displayed frame if no new frame has arrived.
 public final class DisplayQueue<Frame> {
-    /// More than this many waiting frames means the display is behind.
+    /// Maximum number of queued frames before older frames are dropped.
     public static var depth: Int { 2 }
 
     private let lock = NSLock()
@@ -31,7 +30,7 @@ public final class DisplayQueue<Frame> {
         lock.unlock()
     }
 
-    /// Discard all queued frames
+    /// Discards all queued frames and resets the last displayed frame.
     public func clear() {
         lock.lock()
         waiting = []
@@ -39,7 +38,7 @@ public final class DisplayQueue<Frame> {
         lock.unlock()
     }
 
-    /// The frame to draw at this refresh, and whether it is one not shown before.
+    /// Returns the frame to render for the current refresh, along with whether it is newly dequeued.
     public func next() -> (frame: Frame, isNew: Bool)? {
         lock.lock()
         defer { lock.unlock() }

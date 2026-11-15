@@ -6,10 +6,10 @@ Source: `SVLAudio::SVLAudio(SVLRoot*)` +0x156c88 and its three
 docs/svl-values/. The VTE names for these three ids were not found as strings;
 the names below are descriptive (**inferred**).
 
-`SVLRoot+0x18c` is the "I am the host" flag: when it is zero (the client build
-always takes this branch at runtime — **inferred** from the branch that
-creates a stereo jitter buffer and publishes `cAud*` keys only when it is
-zero) the constructor does the client half.
+`SVLRoot+0x18c` is a host-role flag: when it is zero, the constructor runs
+client initialization (`vrlink` always takes this branch at runtime —
+**inferred** because stereo jitter-buffer creation and `cAud*` publication only
+run when this flag is zero).
 
 | id | direction | size | payload | who writes / reads |
 |---|---|---|---|---|
@@ -17,8 +17,9 @@ zero) the constructor does the client half.
 | 0x19 | host → client | 4 | u32 host audio FEC capabilities | host writes 3 (same code, host branch); client watches it (callback +0x159610) |
 | 0x26 | host → client | 47 | jitter-buffer settings (packed struct below) | host writes; client watches it (callback +0x15971c) |
 
-All **static**. The Klepton capture in `STEAMLINK.md` §3.1 shows ids 0x19
-(len 4) and 0x26 (len 47) in the same host→client message, which matches.
+All table entries above are **static**. The Klepton capture in `STEAMLINK.md`
+§3.1 shows ids 0x19 (len 4) and 0x26 (len 47) in the same host→client message,
+which matches.
 
 ## Capability word (0x18 / 0x19)
 
@@ -27,7 +28,7 @@ All **static**. The Klepton capture in `STEAMLINK.md` §3.1 shows ids 0x19
 | 0 | peer can receive type-0x0b FEC audio |
 | 1 | peer can receive type-0x0c FEC audio (variable length) |
 
-On receipt (**static**, +0x159610):
+When the capability word is received (**static**, +0x159610):
 
 ```python
 use_0c  = (caps >> 1) & 1            # SVLAudio+0x1d61
@@ -80,57 +81,59 @@ different VTE (system volume / mute state, see `AndroidAudioManagerService` and
 `SVLAudio::SyncAudioControls` +0xf4ae8); it is id 0x23, laid out in
 docs/svl-values/vte-id-table.md.
 
-## Confirmed against a wire capture
+## Capture verification (`vr3`)
 
-Capture: `vr3` (real client under Klepton, 40.26 s of streaming, 80,011 SVL
-datagrams, none torn, each with a CLOCK_MONOTONIC receive/send timestamp).
-Times below are seconds from the first SVL datagram of the capture. The earlier
-capture `vr1` had a third of its datagrams torn and no timestamps, so its
-counts were lower bounds; every figure here is a complete count.
+Capture `vr3` records 40.26 s of `vrlink` streaming under Klepton (80,011
+intact SVL datagrams, each with a `CLOCK_MONOTONIC` receive/send timestamp).
+Times below are seconds from the first SVL datagram of the capture. Unlike the
+earlier `vr1` capture, which had a third of its datagrams torn and no
+timestamps (giving only lower-bound counts), every count here is complete.
 The values below were reassembled from the value-transport bytes on the wire
 with `ovrlink.vts` (docs/svl-values/). `vr3`'s `KL_SVL_TRACE` output (238
 `[svl] key = value` lines, logged only when a key changes and at most about
 once a second per key) holds string->double keys such as `cAud*`, not VTE
 values; its `cAudUnd` lines agree with the wire values in
 [jitter-buffer.md](jitter-buffer.md) (95,040 then 95,041 around the audio
-burst, about +48,000 per second afterwards).
+burst, and about +48,000 per second afterward).
 
-- **captured**: host -> client VTE 0x19 = `03 00 00 00` and VTE 0x26 (47
+- **captured**: Host-to-client VTE 0x19 = `03 00 00 00` and VTE 0x26 (47
   bytes) arrive together in a class 3 type 0x0d message at t = 0.004 s (the
-  first host datagram of the capture), as version 1, and again at
+  first host datagram of the capture) as version 1, and again at
   t = 0.023 s as version 2 with identical contents.
 - **captured**: VTE 0x26 is
   `01 01 01 | 32000000 19000000 0f000000 14000000 07000000 f4010000 f4010000
-  02000000 32000000 0a000000 05000000` both times - exactly the compiled-in
+  02000000 32000000 0a000000 05000000` both times — matching the compiled-in
   defaults in the table above (50, 25, 15, 20, 7, 500, 500, 2, 50, 10, 5).
-- **captured**: client -> host VTE 0x18 = `03 00 00 00`, completed at
-  t = 0.030 s (version 1) and t = 0.071 s (version 2), riding in pose packets.
-- **captured**: the client never sent ids 0x19 or 0x26, and the host never
-  sent 0x18. None of the three ids changes again in the remaining 40 s; in
-  particular nothing is republished at the start or end of the audio burst
+- **captured**: Client-to-host VTE 0x18 = `03 00 00 00` completed at
+  t = 0.030 s (version 1) and t = 0.071 s (version 2), carried inside pose
+  packets.
+- **captured**: `vrlink` never sent ids 0x19 or 0x26, and the host never
+  sent 0x18. None of the three ids changed again in the remaining 40 s; in
+  particular, nothing was republished at the start or end of the audio burst
   (t = 1.855 to 11.556 s).
 - **captured** (client log): `CAudioJitterBuffer init:
   48000,1,1,2400,1200,720,960,336,24000,2,2400,480,240` is printed three
-  times: once when the output stream is created, before the first SVL
+  times: once when the output stream is created before the first SVL
   datagram, and once after each of the two 0x26 arrivals (between the
-  datagrams at t = 0.0039 and 0.0044 s, and at 0.0231 and 0.0241 s). That
+  datagrams at t = 0.0039 and 0.0044 s, and at t = 0.0231 and 0.0241 s). That
   confirms both the field mapping (rate, settings byte 0, settings byte 2,
   then start-fill 2400, min-hi 1200, min-lo 720, target 960, low-water 336,
   window 24000, max rewinds 2, fade-in 2400, fwd crossfade 480, rew crossfade
-  240 = `ms x 48000 / 1000`) and the static claim that every arrival of 0x26
-  re-initializes the jitter buffer, even when the bytes are unchanged.
-- **captured**: the first audio message comes 1.85 s after the host has VTE
-  0x18, so `vr3` cannot say whether the host waits for it. The probe can:
-  docs/svl-values/startup-exchange.md ("Audio, settled (probe)") records
-  audio arriving with or without 0x18 published.
+  240 = `ms x 48000 / 1000`) and the static finding that every arrival of 0x26
+  reinitializes the jitter buffer, even when the bytes are unchanged.
+- **captured**: The first audio message arrives 1.85 s after the host receives
+  VTE 0x18, so `vr3` alone does not isolate whether the host waits for 0x18.
+  Separate probe tests in docs/svl-values/startup-exchange.md ("Audio, settled
+  (probe)") confirm that downlink audio arrives with or without 0x18 published.
 
-## Open questions / to confirm on the wire
+## Open questions
 
-- What the host sends when 0x18 is 0 or 1 instead of 3 (type 0x06 / 0x0b are
-  predicted; the probe has only shown that audio still arrives).
-- Whether a host ever sends a 0x26 that differs from the compiled-in
-  defaults (two captures, both defaults).
-- Meaning of the unused i32 at offset 27.
-- `VTE_CLIENT_AUDIO_STATE` is id 0x23 and is documented in
+- Probe what packet type the host sends when VTE 0x18 is 0 or 1 instead of 3
+  (types 0x06 and 0x0b are predicted; probes so far have only verified that
+  audio still arrives).
+- Check whether a host ever sends a VTE 0x26 payload that differs from the
+  compiled-in defaults (both captures used the defaults).
+- Determine the purpose of the unused i32 at offset 27 of VTE 0x26.
+- `VTE_CLIENT_AUDIO_STATE` (id 0x23) is documented in
   docs/svl-values/vte-id-table.md; whether the host ever writes it back to the
-  client is open there.
+  client remains open there.

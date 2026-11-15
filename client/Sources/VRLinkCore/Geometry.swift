@@ -2,11 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-/// World-space geometry, in meters
+/// World-space geometry types in meters.
 ///
-/// Conventions (OpenXR / OpenVR): right-handed; +x is right, +y is up, and a
-/// head looks along its own -z. Every `Pose` carries its three axes explicitly
-/// so that a transform reads as "position plus so many meters along each axis".
+/// Uses right-handed OpenXR/OpenVR coordinates where +x is right, +y is up, and
+/// forward points along -z. `Pose` stores its three basis vectors explicitly so
+/// transforms can be expressed directly in terms of `right`, `up`, and `forward`.
 
 public struct Vec3 {
     public var x, y, z: Float
@@ -19,7 +19,7 @@ public struct Vec3 {
     public func cross(_ b: Vec3) -> Vec3 { Vec3(y * b.z - z * b.y, z * b.x - x * b.z, x * b.y - y * b.x) }
 }
 
-/// Where something is and which way it faces, in world space.
+/// A 3D position and orientation frame.
 public struct Pose {
     public var position: Vec3
     public var right: Vec3      // unit vectors
@@ -33,7 +33,7 @@ public struct Pose {
         self.forward = forward
     }
 
-    /// From a unit quaternion (w, x, y, z); the inverse of `quaternion`.
+    /// Constructs a pose from a position and a `(w, x, y, z)` unit quaternion (the inverse of `quaternion`).
     public init(position: Vec3, quaternion q: [Float]) {
         let (w, x, y, z) = (q[0], q[1], q[2], q[3])
         self.position = position
@@ -42,7 +42,7 @@ public struct Pose {
         forward = Vec3(2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y)) * -1
     }
 
-    /// Turned about the world-space axis `turn` points along, by its length in radians.
+    /// Rotates the pose around the world-space rotation vector `turn` (axis times angle in radians).
     public func turned(by turn: Vec3) -> Pose {
         let angle = turn.dot(turn).squareRoot()
         guard angle > 1e-6 else { return self }
@@ -52,33 +52,32 @@ public struct Pose {
         return Pose(position: position, right: rotate(right), up: rotate(up), forward: rotate(forward))
     }
 
-    /// The same orientation, moved `meters` along its own right axis.
-    /// An eye is the head shifted by half the interpupillary distance.
+    /// Translates the pose by `meters` along its local `right` axis (for example,
+    /// offsetting an eye from the head by half the IPD).
     public func shifted(right meters: Float) -> Pose {
         var pose = self
         pose.position = position + right * meters
         return pose
     }
 
-    /// `child` is given in this pose's own frame (x to its right, y up, z
-    /// behind it); the result is the same thing in the frame this pose is in.
-    /// An eye in world space is `head.placing(eyeInHead)`.
+    /// Transforms `child` from this pose's local frame (+x right, +y up, +z back)
+    /// into this pose's parent frame (for example, `head.placing(eyeInHead)` yields
+    /// the eye pose in world space).
     public func placing(_ child: Pose) -> Pose {
         func direction(_ v: Vec3) -> Vec3 { right * v.x + up * v.y + forward * -v.z }
         return Pose(position: position + direction(child.position), right: direction(child.right),
                     up: direction(child.up), forward: direction(child.forward))
     }
 
-    /// `other`, which is in the frame this pose is in, given in this
-    /// pose's own frame (x to its right, y up, z behind it): what
-    /// `placing` undoes.
+    /// Expresses `other` (given in this pose's parent frame) in this pose's local
+    /// frame (+x right, +y up, +z back); the inverse of `placing(_:)`.
     public func relative(_ other: Pose) -> Pose {
         func own(_ v: Vec3) -> Vec3 { Vec3(v.dot(right), v.dot(up), -v.dot(forward)) }
         return Pose(position: own(other.position - position), right: own(other.right), up: own(other.up), forward: own(other.forward))
     }
 
-    /// Orientation as a unit quaternion (w, x, y, z), from the rotation whose
-    /// columns are this pose's right, up and backward axes.
+    /// Orientation as a unit quaternion `(w, x, y, z)` for the rotation matrix
+    /// with columns `(right, up, -forward)`.
     public var quaternion: [Float] {
         let back = forward * -1
         let (m00, m01, m02) = (right.x, up.x, back.x)
@@ -100,8 +99,7 @@ public struct Pose {
         }
     }
 
-    /// A world-space point expressed in this pose's own frame:
-    /// (meters to the right, meters up, meters in front).
+    /// Projects a world-space point into `(right, up, forward)` distances in meters from `position`.
     public func local(_ point: Vec3) -> Vec3 {
         let offset = point - position
         return Vec3(offset.dot(right), offset.dot(up), offset.dot(forward))
@@ -122,14 +120,14 @@ public struct Frustum {
         return Frustum(left: -t * aspect, right: t * aspect, down: -t, up: t)
     }
 
-    /// The smallest frustum about straight-ahead axes that contains this
-    /// one, when this one belongs to an eye turned as `eye` is. `eye` is
-    /// given in the head's frame (x right, y up, z back), and the result is
-    /// for an eye at the same place facing exactly where the head faces.
+    /// Computes the smallest head-aligned frustum that encloses this frustum
+    /// when viewed from a canted `eye` pose (given in head space: +x right,
+    /// +y up, +z back). The returned frustum shares the eye's origin while
+    /// facing straight ahead along the head's forward axis.
     ///
-    /// For headsets whose displays are turned outwards: the host is told
-    /// parallel eyes with these wider frusta, because much VR software
-    /// renders as if eyes were parallel whatever it is told.
+    /// Used for headsets with canted displays: we report parallel eye orientations
+    /// with these expanded frusta to the host because many VR titles assume
+    /// parallel eyes regardless of reported eye rotation.
     public func enclosing(turnedAs eye: Pose) -> Frustum {
         var out = Frustum(left: .infinity, right: -.infinity, down: .infinity, up: -.infinity)
         for (x, y) in [(left, up), (right, up), (left, down), (right, down)] {
@@ -144,15 +142,13 @@ public struct Frustum {
         return out
     }
 
-    /// This frustum made wider or narrower about straight ahead: every
-    /// tangent multiplied, the sideways ones by `horizontal` and the
-    /// up-down ones by `vertical`.
+    /// Scales the horizontal tangents by `horizontal` and the vertical tangents by `vertical`.
     public func scaled(horizontal: Float, vertical: Float) -> Frustum {
         Frustum(left: left * horizontal, right: right * horizontal, down: down * vertical, up: up * vertical)
     }
 
-    /// The world-space corners of this frustum's cross-section `distance`
-    /// meters in front of `eye`: top-left, top-right, bottom-left, bottom-right.
+    /// Returns the world-space `[topLeft, topRight, bottomLeft, bottomRight]` corners
+    /// of this frustum at `distance` meters in front of `eye`.
     public func corners(from eye: Pose, distance: Float) -> [Vec3] {
         func corner(_ x: Float, _ y: Float) -> Vec3 {
             eye.position + eye.forward * distance + eye.right * (x * distance) + eye.up * (y * distance)
@@ -160,9 +156,9 @@ public struct Frustum {
         return [corner(left, up), corner(right, up), corner(left, down), corner(right, down)]
     }
 
-    /// Clip-space position (x, y, z, w) of a world-space point seen from `eye`
-    /// through this frustum. Depth after the divide runs 0 at `near` to 1 at
-    /// `far`, or the other way round when `reversed` (what visionOS wants).
+    /// Projects a world-space point into clip space `(x, y, z, w)` from `eye` through
+    /// this frustum. Normalized device depth runs from 0 at `near` to 1 at `far`,
+    /// or from 1 at `near` to 0 at `far` when `reversed` is true (as used on visionOS).
     public func project(_ point: Vec3, from eye: Pose, near: Float = 0.05, far: Float = 100,
                         reversed: Bool = false) -> [Float] {
         let p = eye.local(point)                 // p.z is meters in front of the eye
@@ -170,7 +166,7 @@ public struct Frustum {
         let y = (2 * p.y - (up + down) * p.z) / (up - down)
         let z: Float
         if !far.isFinite {
-            // A far plane at infinity (visionOS reports one): the limits of the formulas below.
+            // Handle an infinite far plane (reported by visionOS) using the limit as far -> infinity.
             z = reversed ? near : p.z - near
         } else {
             z = reversed ? near * (far - p.z) / (far - near) : far * (p.z - near) / (far - near)
@@ -179,10 +175,9 @@ public struct Frustum {
     }
 }
 
-/// A tracked thing as the host needs it: where it is, which way it faces, and
-/// how it is moving, so the host can predict where it will be when the frame
-/// is seen. World space, meters and radians per second; the angular velocity
-/// is about the thing's own right, up and backward axes.
+/// A world-space pose paired with linear and angular velocities so the host can
+/// predict pose at display time. Velocities are in meters/second (world space)
+/// and radians/second (around the pose's local right, up, and backward axes).
 public struct TrackedPose {
     public var pose: Pose
     public var linearVelocity = Vec3(0, 0, 0)
@@ -190,12 +185,12 @@ public struct TrackedPose {
 
     public init(pose: Pose) { self.pose = pose }
 
-    /// The turning rate about the world's axes; `angularVelocity` is about the pose's own.
+    /// Angular velocity transformed from the pose's local axes into world space.
     public var worldAngularVelocity: Vec3 {
         pose.right * angularVelocity.x + pose.up * angularVelocity.y + pose.forward * -angularVelocity.z
     }
 
-    /// Where this will be `seconds` from now if it keeps moving and turning as it is.
+    /// Extrapolates the pose `seconds` into the future assuming constant linear and angular velocity.
     public func predicted(seconds: Float) -> TrackedPose {
         var out = self
         out.pose = pose.turned(by: worldAngularVelocity * seconds)
@@ -203,14 +198,14 @@ public struct TrackedPose {
         return out
     }
 
-    /// The same pose with velocities measured from where it was `seconds` ago.
+    /// Returns a copy of this pose with velocities estimated by finite difference from `earlier` over `seconds`.
     public func withVelocities(since earlier: Pose, seconds: Float) -> TrackedPose {
         var out = self
         guard seconds > 0 else { return out }
         out.linearVelocity = (pose.position - earlier.position) * (1 / seconds)
-        // The rotation from the earlier orientation to this one, expressed in
-        // the earlier frame, is conj(q1) * q2; twice its vector part over the
-        // time is the angular velocity for a small step.
+        // The rotation from the earlier orientation to the current orientation,
+        // expressed in the earlier frame, is conj(q1) * q2; twice its vector part
+        // divided by dt approximates angular velocity for small steps.
         let a = earlier.quaternion, b = pose.quaternion
         let scale = 2 / seconds
         out.angularVelocity = Vec3((a[0] * b[1] - a[1] * b[0] - a[2] * b[3] + a[3] * b[2]) * scale,
@@ -220,14 +215,12 @@ public struct TrackedPose {
     }
 }
 
-/// The user's head pose
+/// Head position and yaw/pitch orientation with velocities.
 public struct HeadPose {
     public var position: Vec3
     public var yaw: Float
     public var pitch: Float
-    /// How the head is moving, so the host can predict where it will be when
-    /// the frame is seen: meters per second in world space, and radians per
-    /// second for yaw and pitch.
+    /// World-space linear velocity in meters/second; `yawRate` and `pitchRate` are in radians/second.
     public var velocity = Vec3(0, 0, 0)
     public var yawRate: Float = 0
     public var pitchRate: Float = 0

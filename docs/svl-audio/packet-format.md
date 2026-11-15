@@ -4,11 +4,11 @@ Sources: `SVLAudio::TransmitAudioPacket(dataset*, unsigned short)` +0x1575a8,
 `SVLAudio::TransportRXAudioFrames(dataset*)` +0x1571b8,
 `SVLDataLink::ReceivedData(dataset*)` +0x15a9b8.
 
-## The `dataset` header as audio uses it
+## Audio `dataset` header
 
-Every message handed to/received from the data link is a `dataset`: an 8-byte
-header followed by the payload. Audio fills it like this (**static**, both
-functions above; little-endian):
+Every message handed to or received from the data link is a `dataset`: an 8-byte
+header followed by the payload. Audio populates the header as follows
+(**static**, both functions above; little-endian):
 
 | off | size | field (transport's name) | audio meaning |
 |---|---|---|---|
@@ -49,19 +49,19 @@ channels    = (aux & 3) + 1
 163830 Hz; 48000 Hz stereo is `0x4b01`, 48000 Hz mono is `0x4b00`.
 
 The receiver decodes the format word from every audio packet **except** a
-type-0x0c packet whose `seq % 3 == 2` (that one carries a length instead).
-Note a type-0x0b parity packet still carries a normal format word.
+type-0x0c packet whose `seq % 3 == 2` (which carries a payload length instead).
+Note that a type-0x0b parity packet still carries a normal format word.
 
 When the decoded rate differs from the rate the output stream is running at
 (`SVLAudio+0xc4c`), the client logs
 `[Audio] frame rate change, reinitializing: %d %d to %d %d` (old rate, old
-channels, new rate, new channels) and re-opens its audio streams at the new
+channels, new rate, new channels) and reopens its audio streams at the new
 rate (vtable +0x10 = `QSVLClientAudioNdk::Init(true, rate)` +0xf4184).
 
 ## Payload
 
-Interleaved signed 16-bit PCM, native (little-endian) byte order, no
-compression (**static**: payload pointer `dataset+8` is passed as `short*` to
+Payloads carry uncompressed, interleaved signed 16-bit little-endian PCM
+(**static**: payload pointer `dataset+8` is passed as `short*` to
 `AcceptAudioFramesFromPeer`, which pushes it into
 `CAudioJitterBuffer<short>`).
 
@@ -86,122 +86,118 @@ audio packets (`SVLAudio+0xc44 = 0xfa`, spin-wait via `SVLSpinwait`), then
 calls the data link's send (vtable +0x58 with both bool arguments 0)
 (**static**).
 
-## Confirmed against a wire capture
+## Capture verification (`vr3`)
 
-Capture: `vr3` (real client under Klepton, 40.26 s of streaming, 80,011 SVL
-datagrams, none torn, each with a CLOCK_MONOTONIC receive/send timestamp).
-Times below are seconds from the first SVL datagram of the capture. The earlier
-capture `vr1` had a third of its datagrams torn and no timestamps, so its
-counts were lower bounds; every figure here is a complete count.
+Capture `vr3` records 40.26 s of `vrlink` streaming under Klepton (80,011
+intact SVL datagrams, each with a `CLOCK_MONOTONIC` receive/send timestamp).
+Times below are seconds from the first SVL datagram of the capture. Unlike the
+earlier `vr1` capture, which had a third of its datagrams torn and no
+timestamps (giving only lower-bound counts), every count here is complete.
 
-- **captured**: the 8-byte header in the table above is the transport's
-  element header, byte for byte. All 2,913 audio elements are byte 0 `0x0c`,
-  byte 1 `0x10`, host -> client. In the transport's vocabulary that is
-  "class 0x0c, type 0x10" (which is how `svldump.py` and the capture census
-  print it); in this folder's vocabulary it is "type 0x0c, flags 0x10". Same
-  bytes: the prediction "type 0x0c" was right, and the "type 0x10" in a census
-  line is this page's `flags`. Likewise the transport's `id` is `seq` and its
-  `index` is `aux`.
-- **captured**: no element with byte 0 = 0x06 or 0x0b exists in `vr3`, in
+- **captured**: The 8-byte header in the table above matches the transport's
+  element header byte for byte. All 2,913 audio elements travel host to client
+  with byte 0 `0x0c` and byte 1 `0x10`. Transport tools (`svldump.py` and the
+  capture census) print this as "class 0x0c, type 0x10", corresponding to
+  "type 0x0c, flags 0x10" in the audio code; likewise, the transport's `id` and
+  `index` fields correspond to `seq` and `aux`.
+- **captured**: No element with byte 0 = 0x06 or 0x0b exists in `vr3` in
   either direction.
-- **captured**: `seq` runs 0, 1, 2, ... 2912 with every step +1 (2,912 of
-  2,912): no loss, no duplicate, no reordering.
-- **captured**: on data packets (`seq % 3` = 0 or 1) the format word is
-  `19201 = 0x4b01` in all 1,942 cases -> 48000 Hz, 2 channels. On the 971
-  parity packets it is a length (896 x851, 1024 x60, 768 x60).
-- **captured**: payload lengths: 1024 x2,002, 896 x851, 768 x60 (256 / 224 /
-  192 stereo frames); never above 1024, never anything else. Position 0 (A)
-  is always 1024; position 1 (B) is 896 (851), 1024 (60) or 768 (60);
-  position 2 (parity) is always 1024.
-- **captured**: a group (A + B) carries 480 frames = 10 ms in 851 of 971
+- **captured**: `seq` runs contiguously from 0 to 2912 (+1 on all 2,912 steps),
+  with no loss, duplicates, or reordering.
+- **captured**: On data packets (`seq % 3` = 0 or 1), the format word is
+  `19201 = 0x4b01` in all 1,942 packets (48000 Hz stereo). On the 971 parity
+  packets, `aux` carries a payload length (896 ×851, 1024 ×60, 768 ×60).
+- **captured**: Payload lengths are 1024 bytes (2,002 packets), 896 bytes (851
+  packets), or 768 bytes (60 packets) — 256, 224, or 192 stereo frames — and
+  never exceed 1024 bytes. Position 0 (A) is always 1024 bytes; position 1 (B)
+  is 896 (851 times), 1024 (60 times), or 768 (60 times); position 2 (parity)
+  is always 1024 bytes.
+- **captured**: A group (A + B) carries 480 frames (10 ms) in 851 of 971
   groups. The other 120 groups come as 60 adjacent pairs, always 512 frames
-  (1024 + 1024) followed by 448 (1024 + 768), so every pair is again 960
-  frames. Total 466,080 frames = 971 x 480 = 9.710 s of audio.
-- **captured**: sample rate from timing. A least-squares fit of cumulative
-  frames against the arrival time of each group's A packet gives
-  47,998.4 frames/s over the whole burst (47,997.7 excluding the first 20
-  groups) - 48 kHz to within 35 ppm of the client machine's clock, i.e. the
-  rate the format word announces. 2,913 messages in 9.701 s = 300.3
-  messages/s = 100.1 groups/s.
-- **captured**: datagram packing. 2,909 of the 2,913 audio elements are alone
-  in their datagram. The other 4 share a datagram with the host's class 3
-  type 0x18 message (which comes every 2 s; either order was seen). Audio
-  never shares a datagram with a video packet or frame descriptor.
-- **captured** (client log in the same run):
-  `[aaudio] openStream: 48000 Hz, 2 ch, int16, burst 240 frames`,
+  (1024 + 1024) followed by 448 frames (1024 + 768), so every pair totals 960
+  frames. Across the burst, 466,080 frames arrive (971 × 480 = 9.710 s of
+  audio).
+- **captured**: A least-squares fit of cumulative frames against the arrival
+  time of each group's A packet gives 47,998.4 frames/s over the whole burst
+  (47,997.7 frames/s excluding the first 20 groups) — matching the announced
+  48 kHz rate to within 35 ppm of the capture machine's clock. The 2,913
+  messages arrive over 9.701 s (300.3 messages/s, or 100.1 groups/s).
+- **captured**: Of the 2,913 audio elements, 2,909 occupy a datagram alone. The
+  remaining 4 share a datagram with the host's class 3 type 0x18 message (sent
+  every 2 s, seen in either element order). Audio never shares a datagram with
+  a video packet or frame descriptor.
+- **captured** (client log in the same run): `vrlink` logged
+  `[aaudio] openStream: 48000 Hz, 2 ch, int16, burst 240 frames` and
   `[Audio] AAudioStream_getFramesPerBurst = 240`.
-- **captured, negative**: PCM content is still unconfirmed. All 1,942 data
-  payloads in `vr3` are all-zero bytes (peak 0, RMS 0 in every second of the
-  burst), exactly as in `vr1`. So bit depth, endianness and interleave order
-  remain **static** only; no channel-correlation or spectrum check was
-  possible. (The WAV written from the capture, 9.71 s, is digital silence.)
-  See "Timing" below for what this says about when the host sends.
-- **captured, negative**: no client -> host audio element exists in `vr3`
-  (see [microphone-uplink.md](microphone-uplink.md)), so the uplink header
-  and format word are still unconfirmed.
+- **captured, negative**: PCM sample format was not exercised by `vr3` alone
+  because all 1,942 data payloads are all-zero bytes (peak 0, RMS 0 in every
+  second of the burst, producing 9.71 s of digital silence), just as in `vr1`.
+  See "Client playback test" below for live audio verification.
+- **captured, negative**: No client-to-host audio element exists in `vr3`
+  (see [microphone-uplink.md](microphone-uplink.md)), leaving `vrlink`'s own
+  uplink header and format word unconfirmed on the wire.
 
-### Timing of the downlink (`vr3`)
+### Downlink timing (`vr3`)
 
-- **captured**: audio is a single burst: first message at t = 1.855 s, last
-  at t = 11.556 s (9.701 s), then nothing for the remaining 28.7 s of the
-  session while video continues. For reference, the first video packet is at
-  t = 0.926 s. The burst begins at `seq` 0 on an A packet and ends on a parity
-  packet, i.e. on whole groups. There are no gaps inside it: the longest
-  inter-arrival is 18.1 ms.
-- **captured**: nothing in-band delimits the burst. No other host message
+- **captured**: Audio arrives in a single burst: the first message is at
+  t = 1.855 s and the last is at t = 11.556 s (9.701 s total), followed by no
+  audio packets for the remaining 28.7 s of the session while video continues
+  (the first video packet arrives at t = 0.926 s). The burst begins at `seq` 0
+  on an A packet and ends on a parity packet, aligned to whole groups, with a
+  maximum inter-arrival time of 18.1 ms inside the burst.
+- **captured**: No in-band message delimits the burst: no other host message
   sits within 20 ms of its start or end except video frame descriptors, the
-  payload is zeros from the first message to the last (so there is no ramp
-  to or from silence to see), and no value-transport value completes in
-  either direction after t = 1.05 s.
-- The owner's live probes (docs/svl-values/startup-exchange.md, "Audio,
-  settled (probe)") established that the host sends audio only while
-  something is playing on the host and nothing otherwise, so the absence of
-  audio after t = 11.6 s is expected, not loss. What `vr3` adds: the roughly
-  ten-second burst at session start is 9.71 s of digital silence, not an
-  audible sound. **inferred**: the host's gate is on its capture stream being
-  active rather than on sample values; a capture with known audio playing
-  would show whether zeros are ever sent in the middle of real sound.
-- **captured**: within a group, B follows A after a median 0.20 ms (p95
-  0.27 ms) - consistent with the 250 us minimum gap in "Send pacing" being
-  the host's too (**inferred**: same code). A to next A: median 10.09 ms,
-  mean 9.994 ms. Occasionally two groups arrive back to back (A to A under
-  2.5 ms, 59 times) after a double-length gap (16 to 21 ms, 60 times).
-- **captured**: the parity packet does not follow B immediately. B to parity
-  is spread evenly over 0 to 10 ms (median 4.43 ms). 907 of the 971 parity
-  packets arrive within 0.3 ms of the first frame descriptor (class 5 type 2,
-  index 0) of a video frame, and in 884 cases the parity datagram is the one
+  payload is all zeros from start to finish (with no ramp), and no
+  value-transport update completes in either direction after t = 1.05 s.
+- Live probes (docs/svl-values/startup-exchange.md, "Audio, settled (probe)")
+  established that the host sends audio only while something is playing on the
+  host, so the absence of audio after t = 11.6 s is normal idle behavior rather
+  than packet loss. In `vr3`, the ~10 s burst at session start carries 9.71 s
+  of digital silence. **inferred**: The host gates transmission on its audio
+  capture stream being active rather than on non-zero sample values; a capture
+  with audible playback would show whether zero payloads ever appear mid-stream.
+- **captured**: Within a group, B follows A after a median 0.20 ms (p95
+  0.27 ms), consistent with the host sharing the same 250 µs minimum send gap
+  described in "Send pacing" (**inferred**). From one A packet to the next, the
+  median interval is 10.09 ms and the mean is 9.994 ms. Occasionally two groups
+  arrive back to back (A-to-A under 2.5 ms, 59 times) after a double-length gap
+  (16 to 21 ms, 60 times).
+- **captured**: Parity packets do not follow B immediately: the B-to-parity
+  interval is spread evenly over 0 to 10 ms (median 4.43 ms). Out of 971 parity
+  packets, 907 arrive within 0.3 ms of the first frame descriptor (class 5
+  type 2, index 0) of a video frame, and in 884 cases the parity datagram sits
   immediately before that descriptor's datagram in transport sequence, with B
   immediately before the parity. A and B show no such alignment (41 and 44 of
-  971 within 0.3 ms). **inferred**: the host queues the parity and flushes it
-  on its video frame tick (video frames were 9.10 ms apart during the burst),
-  so a recovery by parity can lag the lost packet by up to one video frame.
-- **captured**: start of the burst. The first groups arrive slightly faster
-  than real time (group starts at 0, 9.3, 18.4, 26.7, 35.9 ms; 3,136 frames
-  = 65 ms of audio in the first 54 ms), then settle to 10 ms. There is no
-  large initial flush.
+  971 within 0.3 ms). **inferred**: The host queues the parity packet and
+  flushes it on its video frame tick (video frames were 9.10 ms apart during
+  the burst), so parity recovery can lag a lost packet by up to one video frame.
+- **captured**: At the start of the burst, the first few groups arrive slightly
+  faster than real time (group starts at 0, 9.3, 18.4, 26.7, and 35.9 ms,
+  delivering 3,136 frames = 65 ms of audio in the first 54 ms) before settling
+  to 10 ms intervals, with no large initial flush.
 
-## Open questions / to confirm on the wire
+## Open questions
 
-- PCM content: two captures in a row are all zeros. A capture with a known
-  signal playing on the host (e.g. a tone in one channel) is needed to confirm
-  s16le and the L/R interleave order.
-- Why the host sends 9.71 s of silence at session start and then stops; and
-  whether it ever sends type 0x06 or 0x0b (only reachable by advertising
-  capabilities 0 or 1 in VTE 0x18 - a probe).
-- Whether the host ever sends `len` > 1024 (never in 2,913 messages).
-- What the host's `flags` byte is on type 6 (predicted `0x00`).
-- Whether the parity packet really waits for the video frame tick, or the
-  alignment is a side effect of something else on the host.
-- The uplink format word: the writer of `SVLAudio+0x0c` was not located (the
-  constructor zeroes it and `QSVLClientAudioNdk::Init` only sets the channel
-  count at +0x08 to 1). If nothing sets it, the client's mic packets carry
-  `aux == 0x0000`; a capture of a client mic packet decides this.
+- Capture a known non-silent test signal on the host (for example, a tone in
+  one channel) to verify s16le encoding and L/R channel interleave directly on
+  the wire.
+- Determine why the host sends 9.71 s of digital silence at session start and
+  then stops, and probe whether advertising capability 0 or 1 in VTE 0x18
+  causes the host to send type 0x06 or 0x0b.
+- Check whether the host ever sends `len` > 1024 (never seen in 2,913 messages).
+- Verify the host's `flags` byte on type 6 packets (predicted `0x00`).
+- Determine whether parity packets explicitly wait for the video frame tick or
+  align with descriptors as a side effect of host scheduling.
+- Check `vrlink`'s uplink format word on the wire: no writer of `SVLAudio+0x0c`
+  was found (the constructor zeroes it and `QSVLClientAudioNdk::Init` only sets
+  the channel count at `+0x08` to 1). If nothing writes `+0x0c`, `vrlink`'s mic
+  packets carry `aux == 0x0000`.
 
-## Client results (2026-11-10): the PCM format, confirmed by ear
+## Client playback test (2026-11-10)
 
-The Swift client (`client`) plays the downlink as interleaved signed
-16-bit little-endian PCM, 48 kHz, two channels, exactly as described above,
-with real audio playing on the host. The project owner listened and reports it
-sounds perfect. So sample format, byte order, channel count and rate are no
-longer static-only. Under 3 % simulated loss, packets rebuilt from the XOR
-parity (55 in 16 s) were not audible as faults.
+The Swift client (`client`) plays downlink audio as interleaved signed 16-bit
+little-endian stereo PCM at 48 kHz with live audio playing on the host.
+Listening tests confirmed clean output, verifying sample format, byte order,
+channel count, and sample rate beyond static analysis. Under 3% simulated
+packet loss, packets reconstructed from XOR parity (55 packets in 16 s)
+produced no audible glitches.

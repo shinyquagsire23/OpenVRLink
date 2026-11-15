@@ -4,17 +4,16 @@
 
 import Foundation
 
-/// Where the client keeps its settings and pairing secrets: one folder named
-/// OpenVRLink in the platform's per-user data location.
+/// Resolves the per-user `OpenVRLink` directory used to store client settings and pairing secrets.
 ///
-/// | platform | folder |
+/// | Platform | Directory |
 /// |---|---|
 /// | Linux, Android | `$XDG_DATA_HOME/OpenVRLink`, or `~/.local/share/OpenVRLink` |
 /// | Windows | `%LOCALAPPDATA%\OpenVRLink` |
 /// | macOS | `~/Library/Application Support/OpenVRLink` |
-/// | iOS, visionOS | the app's Documents folder, `OpenVRLink` inside it |
+/// | iOS, visionOS | `<Documents>/OpenVRLink` |
 ///
-/// Everything goes in the data home; `XDG_CONFIG_HOME` is not used.
+/// All files live in this single directory (`XDG_CONFIG_HOME` is not used).
 public enum DataDirectory {
     public static let name = "OpenVRLink"
 

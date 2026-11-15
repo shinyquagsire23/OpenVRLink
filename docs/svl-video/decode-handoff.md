@@ -1,8 +1,9 @@
-# Decode hand-off - `QSVLCodecNDK` and `QSVLFrameServer`
+# Decode handoff: `QSVLCodecNDK` and `QSVLFrameServer`
 
-How a reassembled frame reaches the decoder and how decoded images reach the
-renderer. `QSVLCodecNDK` is the Android MediaCodec backend of the abstract
-`SVLCodec`; its virtual table is at file offset 0x210bb0 (**static**):
+This page covers how reassembled frames reach the decoder and how decoded
+images pass to the renderer. `QSVLCodecNDK` is the Android MediaCodec backend
+for the abstract `SVLCodec` interface; its vtable is at file offset 0x210bb0
+(**static**):
 
 | Slot | Function | Offset |
 |---|---|---|
@@ -16,7 +17,7 @@ renderer. `QSVLCodecNDK` is the Android MediaCodec backend of the abstract
 
 ## Codec configuration
 
-**static** - `QSVLCodecNDK::Init`:
+`QSVLCodecNDK::Init` configures MediaCodec as follows (**static**):
 
 ```
 AMediaCodec_createDecoderByType("video/hevc")
@@ -39,38 +40,40 @@ output: AImageReader_newWithUsage(1, 1, AIMAGE_FORMAT_PRIVATE,
 AMediaCodec_configure(codec, format, readerWindow, nullptr, 0); AMediaCodec_start
 ```
 
-What follows from it:
+Several constraints follow from this configuration:
 
-- **static**: HEVC is the only codec. There is no codec negotiation and no
-  other mime string in the library.
-- **static**: no `csd-0` is supplied. **captured** (see the end): parameter
-  sets (VPS/SPS/PPS) arrive in-band and the stream is Annex-B framed.
-- **static**: the client asks for P010 output and declares BT.2020 full range
-  with transfer "linear". **captured**: the stream is 10-bit HEVC Main 10 and
-  its VUI says full range and BT.2020 primaries, but transfer gamma 2.2 and
-  matrix "identity" - see "Color description" below. The MediaFormat keys
-  and the VUI agree only on range and primaries.
-- **static**: the picture can be up to 1536 wide and 7680 tall. The size
-  actually in use comes from the SPS; the renderer learns tile sizes from the
-  frame metadata, not from the decoder.
-- **static**: nothing on the client parses the bitstream - no start-code scan,
-  no NAL type check, no keyframe detection.
+- **static**: HEVC is the only supported codec. There is no codec negotiation
+  and no other MIME string in `libvrlink_scene.so`.
+- **static**: no `csd-0` buffer is supplied at configure time. **captured**
+  (see below): parameter sets (VPS/SPS/PPS) arrive in-band and the stream uses
+  Annex-B start codes.
+- **static**: `vrlink` requests P010 output and sets BT.2020 full range with
+  linear transfer (`COLOR_TRANSFER_LINEAR`). **captured**: the stream is 10-bit
+  HEVC Main 10, and its VUI specifies full range and BT.2020 primaries, but
+  gamma 2.2 transfer and an `identity` matrix (see "Color description" below).
+  The MediaFormat keys and the VUI agree only on range and primaries.
+- **static**: the decoded atlas can be up to 1536 wide and 7680 tall. The
+  active picture dimensions come from the SPS, while the renderer reads tile
+  dimensions from the frame metadata rather than the decoder.
+- **static**: `vrlink` does not parse the bitstream on the client—there is no
+  start-code scan, NAL type check, or keyframe detection.
 
-## Input: one frame = one input buffer
+## Decoder input
 
-**static**:
+The input path writes one complete access unit into one MediaCodec buffer per
+frame (**static**):
 
 1. When a receive slot is initialized for a new frame
-   (`SVLFECRXFrame::Initialize` +0x15f6f4) it calls
-   `AcquireEncodedDataBuffer(frame_id, &capacity)`:
-   `AMediaCodec_dequeueInputBuffer(codec, 20000 us)` then
-   `AMediaCodec_getInputBuffer`. The buffer index is remembered per
-   `frame_id & 0xf`. On failure the frame cannot be received at all (`"Could
-   not acquire encoded data buffer from codec for frame: %i"`); error -10000
-   triggers `Stop()` + `Init()`.
+   (`SVLFECRXFrame::Initialize` +0x15f6f4), it calls
+   `AcquireEncodedDataBuffer(frame_id, &capacity)`, which invokes
+   `AMediaCodec_dequeueInputBuffer(codec, 20000 us)` followed by
+   `AMediaCodec_getInputBuffer`. The buffer index is stored per
+   `frame_id & 0xf`. On failure, the frame cannot be received (`"Could
+   not acquire encoded data buffer from codec for frame: %i"`); error `-10000`
+   triggers `Stop()` followed by `Init()`.
 2. Data packets and FEC-recovered blocks are written **directly into that
-   input buffer** at `packet_id * 1024`. There is no intermediate frame buffer.
-3. When the frame is complete and it is its turn
+   input buffer** at `packet_id * 1024`, with no intermediate frame buffer.
+3. Once the frame is complete and next in sequence
    ([retransmit.md](retransmit.md)), `SubmitFrameForDecode(&buf, size,
    frame_id, true)` calls
 
@@ -79,56 +82,59 @@ What follows from it:
                                 presentationTimeUs = frame_id, flags = 0)
    ```
 
-   then pushes `(frame_id, submit_time)` on a marker queue and calls
+   then pushes `(frame_id, submit_time)` onto a marker queue and calls
    `QSVLClient::GotNetworkFrame()`.
 
-So:
+Key properties of the input submission:
 
-- **One access unit per frame id, queued whole.** The bytes are exactly the
-  concatenation of the data-packet payloads, truncated to `frame_size`.
-- **The pts is the 16-bit frame id**, zero-extended, in the microseconds field.
-  It is a frame counter and wraps to 0 after 65535. A decoder backend
-  must carry it through untouched (the client uses it to find the frame's
-  metadata) and must not reorder by it. Klepton observed the same thing from
-  the outside ("the pts the guest hands the decoder is a frame counter").
-- Flags are always 0: no codec-config or key-frame flag is ever set.
+- **One access unit per frame id, queued whole.** The buffer contents are the
+  concatenated data-packet payloads truncated to `frame_size`.
+- **The `pts` is the zero-extended 16-bit `frame_id`** passed in the
+  microseconds field. It is a frame counter that wraps to 0 after 65535. A
+  decoder backend must pass it through unmodified (`vrlink` uses it to look up
+  the frame's metadata) and must not reorder output by `pts`. Klepton observed
+  the same behavior externally ("the pts the guest hands the decoder is a frame
+  counter").
+- `flags` is always 0: neither codec-config nor keyframe flags are ever set.
 
-## Output
+## Decoder output
 
-**static**:
+On the output side (**static**):
 
 - `QSVLCodecNDK::MediaThread` (+0xfd5b4, thread name `SVLMediaThread`) loops on
-  `AMediaCodec_dequeueOutputBuffer(1000 us)` and immediately
-  `AMediaCodec_releaseOutputBuffer(index, render = true)`, which pushes the
-  picture to the `AImageReader` surface. On a dequeue failure it checks
-  `BIsStuck()`.
-- `BIsStuck()`: true when the oldest entry of the marker queue was submitted
-  more than 300 000 us ago. Then the marker queue is cleared and
-  `SVLFEC::ExperiencedAnUnrecoverableError()` is raised (reset path in
-  [retransmit.md](retransmit.md)).
-- `QSVLCodecNDK::HandleOnImageAvailable` (+0xfde30), on the reader's listener
-  thread:
-  1. `QSVLClient::GotDecodedFrame()` and `PhaseEventDecodeComplete()`.
-  2. `AImageReader_acquireLatestImage` (older undelivered images are discarded
-     by the reader). Failure logs `"[SVLDecoder] Failed to acquire latest
+  `AMediaCodec_dequeueOutputBuffer(1000 us)` and immediately calls
+  `AMediaCodec_releaseOutputBuffer(index, render = true)`, pushing the decoded
+  picture to the `AImageReader` surface. On a dequeue timeout or failure, it
+  checks `BIsStuck()`.
+- `BIsStuck()` returns true when the oldest entry in the marker queue was
+  submitted more than 300,000 us ago. When triggered, it clears the marker
+  queue and calls `SVLFEC::ExperiencedAnUnrecoverableError()` (see the reset
+  path in [retransmit.md](retransmit.md)).
+- `QSVLCodecNDK::HandleOnImageAvailable` (+0xfde30) runs on the reader's
+  listener thread:
+  1. Calls `QSVLClient::GotDecodedFrame()` and `PhaseEventDecodeComplete()`.
+  2. Calls `AImageReader_acquireLatestImage` (the reader discards older
+     undelivered images). Failure logs `"[SVLDecoder] Failed to acquire latest
      image!"`.
-  3. `frame_id = AImage_getTimestamp() / 1000` (the reader reports ns; this
-     undoes the us -> ns scaling of the pts).
-  4. Markers with id <= `frame_id` are popped.
-  5. `SVLFEC::GetMetadataForFrameId(frame_id)`; if absent,
-     `"[SVLDecoder] Invalid frame metadata for frame [ %d ], dropping."` and the
-     image is deleted.
-  6. `SVLDataLink::FrameHasBeenDecoded(metadata.present_number, now)`.
-  7. `QSVLFrameServer::EnqueueHardwareBuffer({AImage*, frame_id, width, height,
-     decode_time})`.
+  3. Computes `frame_id = AImage_getTimestamp() / 1000` (the reader reports
+     nanoseconds, so dividing by 1000 undoes the microsecond-to-nanosecond
+     scaling of `pts`).
+  4. Pops markers with id <= `frame_id`.
+  5. Calls `SVLFEC::GetMetadataForFrameId(frame_id)`; if absent, logs
+     `"[SVLDecoder] Invalid frame metadata for frame [ %d ], dropping."` and
+     deletes the image.
+  6. Calls `SVLDataLink::FrameHasBeenDecoded(metadata.present_number, now)`.
+  7. Calls `QSVLFrameServer::EnqueueHardwareBuffer({AImage*, frame_id, width,
+     height, decode_time})`.
 
-## `QSVLFrameServer` - choosing the frame to show
+## Frame selection in `QSVLFrameServer`
 
-**static**:
+`QSVLFrameServer` buffers decoded images and selects which one to display
+(**static**):
 
-- A deque of decoded images, capped at 5: when a sixth is enqueued the oldest
-  are deleted (`EnqueueHardwareBuffer` +0x102274). An awaiting renderer is woken
-  through a `std::promise<bool>`.
+- Decoded images sit in a deque capped at 5 entries; enqueueing a sixth deletes
+  the oldest entries (`EnqueueHardwareBuffer` +0x102274) and wakes a waiting
+  renderer via `std::promise<bool>`.
 - `ServeBestHardwareBuffer(out, root, target_local_us, period_us)` (+0x102830),
   used when descriptor `version >= 9`:
 
@@ -149,124 +155,131 @@ So:
   `target_local_us` is `now + (predictedDisplayTime - xr_now)`; `period_us` is
   the third argument of `FlipFrame` in microseconds (**inferred**: the display
   period).
-- `ServeNextHardwareBuffer(out, age)` (+0x10270c), used for `version < 9`: pops
+- `ServeNextHardwareBuffer(out, age)` (+0x10270c), used for `version < 9`, pops
   from the front, deleting images until one is newer than the given age or the
-  queue is empty; optionally waits up to 5 ms for a new frame.
+  queue is empty, and optionally waits up to 5 ms for a new frame.
 
 The served `AImage`'s `AHardwareBuffer` is wrapped as an `EGLImage` and bound
-to a `GL_TEXTURE_EXTERNAL_OES` texture for the pass described in
+to a `GL_TEXTURE_EXTERNAL_OES` texture for the render pass described in
 [frame-layout.md](frame-layout.md).
 
 ## Notes for a non-Android client
 
-- Feed each completed frame to the decoder as one Annex-B access unit; absorb
-  parameter sets from the stream; they can be re-sent with different bytes
-  (**captured** in `vr3`: the SPS of the second IDR differs from the first in
-  `vui_time_scale` only), so do **not** rebuild the decoder session each time
-  unless the picture size changes.
-- Keep `frame_id -> metadata` for at least the 16 most recent frames; the
-  decoder output must be joined back to its metadata by frame id.
-- Decode order is display order (no reordering is tolerated by this design:
-  `low-latency`, `picture-order.enable`, and frames are matched by id).
-  **captured** (`vr3`): the stream has no B-frames and
+- Feed each completed frame to the decoder as one Annex-B access unit and parse
+  parameter sets in-band. Parameter sets can be resent with modified non-layout
+  fields (**captured** in `vr3`: the SPS of the second IDR differs from the
+  first only in `vui_time_scale`), so avoid tearing down and recreating the
+  decoder session unless the picture dimensions change.
+- Retain `frame_id -> metadata` mappings for at least the 16 most recent
+  frames so decoded images can be matched back to their metadata by `frame_id`.
+- Decode order equals display order (`low-latency` and `picture-order.enable`
+  are set, and frames are matched by `frame_id` without reordering).
+  **captured** (`vr3`): the stream contains no B-frames and
   `sps_max_num_reorder_pics` is 0.
-- The SPS color description cannot be handed to a decoder framework as it
-  stands (matrix "identity" on a 4:2:0 stream); override the Y'CbCr matrix
-  ([frame-layout.md](frame-layout.md)).
+- Do not pass the SPS color description straight through to a platform decoder
+  framework as-is (`matrix_coefficients` is `identity` on a 4:2:0 stream);
+  override the Y'CbCr matrix explicitly ([frame-layout.md](frame-layout.md)).
 
 ## Captured
 
-Capture `vr3`: the wire capture and the elementary stream the same client fed
-its decoder (`vr3.h265`, with an index of `access_unit, pts, bytes` per queued
-buffer; neither is in the repo). Everything in this section is **captured**.
-Header fields were read with ffmpeg's `trace_headers` bitstream filter.
+The observations below come from `vr3`, comparing the wire capture against the
+elementary stream `vrlink` fed to its decoder (`vr3.h265`, accompanied by a
+per-buffer `access_unit, pts, bytes` index; neither file is in the repo).
+Everything in this section is **captured**. Bitstream headers were inspected
+with ffmpeg's `trace_headers` bitstream filter.
 
-### Wire against decoder input
+### Wire vs. decoder input
 
-- 4,260 frames (ids 0..4259) rebuild from the wire, none incomplete. Frames
-  0..4258 appear in the decoder stream byte for byte, in id order, back to
-  back with nothing between them. So the client queued every frame exactly
-  once and in order, and each input buffer is exactly the data-packet
+- All 4,260 frames (ids `0..4259`) reassemble cleanly from the wire. Frames
+  `0..4258` appear in the decoder dump byte for byte, in `frame_id` order,
+  back to back with no extra bytes between them. `vrlink` queued every frame
+  once in order, and each input buffer equals the concatenated data-packet
   payloads truncated to the descriptor's `frame_size`.
-- The one frame "missing" from the dump is the last, 4259: the dump ends with
-  its first 6,155 of 7,724 bytes because the file was cut at a 4,096-byte
-  boundary when the run was stopped (the frame completed on the wire 1.3 ms
-  before the capture's last element). The two agree.
-- **pts = frame id**: the index covers buffers 0..4219 (it too stops short of
-  the file's end) and every row reads `pts == access unit number == frame
-  id`, size equal to the rebuilt frame, with no gap or repeat in the pts
-  sequence. Klepton's media layer logged the first buffer as `2512 bytes,
-  pts 0 us, flags 0x0`.
-- The stream is **Annex-B with 4-byte start codes** throughout (17,046 NAL
-  units, no 3-byte start codes).
+- Frame 4259 (the final frame) is truncated in the dump file, which ends after
+  the first 6,155 of its 7,724 bytes at a 4,096-byte block boundary when the
+  run stopped (the full frame finished arriving on the wire 1.3 ms before the
+  last captured element). Up to that cutoff, the wire capture and decoder dump
+  match byte for byte.
+- Across the buffer index (which covers buffers `0..4219` before its own
+  buffered cutoff), every row satisfies **`pts == access unit number == frame
+  id`** with a byte length matching the reassembled wire frame and no gaps or
+  repeats in the `pts` sequence. Klepton's media layer logged the first buffer
+  as `2512 bytes, pts 0 us, flags 0x0`.
+- The bitstream uses **Annex-B framing with 4-byte start codes** throughout
+  (17,046 NAL units, zero 3-byte start codes).
 
 ### Access-unit structure
 
-- NAL types present are only 1 (`TRAIL_R`, 17,032), 19 (`IDR_W_RADL`, 8), 32,
-  33, 34 (VPS, SPS, PPS, 2 each) - no SEI, no AUD, no B or leading pictures.
-  All NALs are layer 0, temporal id 0.
-- **Every one of the 4,260 access units has exactly four slices.** (`vr1`
-  reported one with three; with a third of that capture torn it was probably
-  damage, and nothing like it occurs here.) An IDR access unit is `VPS, SPS, PPS`
-  then four IDR slices (I slices); every other is four `TRAIL_R` P slices
-  and begins `00 00 00 01 02 01`.
-- **The four slices are the four atlas tiles.** The coding tree block is
-  32 x 32 (min coding block 16, one level up), so the picture is 48 x 192
-  CTBs and a 1536 x 1536 tile is 2,304 CTBs. The slices have
-  `first_slice_segment_in_pic_flag` 1 and then `slice_segment_address` 2304,
-  4608, 6912, in all 4,260 access units. Tiles (the HEVC tool) and wavefront
-  are off, there are no dependent slice segments, and
-  `slice_loop_filter_across_slices_enabled_flag` is 0 in all 17,040 slice
-  headers, so the four slices are filtered independently. Motion vectors may
-  still cross slice boundaries, so the slices are not independently decodable
-  across frames.
-- Slice QP alternates with the tile kind: in 4,188 of 4,259 complete frames
-  the left base slice starts 27 or 28 QP steps above the left fovea slice,
-  and the right eye's two slices start within 1 step of the left eye's.
-  Slice QP ranged 5..30 for fovea slices (median 5 to 6) and 33..51 for base
-  slices (median 33); CU-level QP deltas are enabled, so these are starting
-  points. Mean slice sizes in tile order: 2,927, 2,105, 2,988, 2,024 bytes.
-  Access units: 302 bytes minimum, 7,735 median, 10,061 mean, 283,768
-  maximum (over the indexed 4,220).
-- Reference structure: `sps_max_dec_pic_buffering` 5, no long-term
-  references, no temporal MVP. Every P slice codes its own short-term
-  reference set of up to four previous pictures and marks **only the
-  immediately preceding picture as used**. So each frame depends on exactly
-  the one before it; a lost frame breaks everything until the next IDR.
-  Picture order count is an 8-bit counter that restarts at each IDR.
+- Only five NAL types appear in the capture: `1` (`TRAIL_R`, 17,032), `19`
+  (`IDR_W_RADL`, 8), and `32`, `33`, `34` (VPS, SPS, PPS, 2 each)—with no SEI,
+  no AUD, and no B-frames or leading pictures. Every NAL has layer 0 and
+  temporal id 0.
+- **Every one of the 4,260 access units has four slices.** (`vr1` had one
+  three-slice access unit, likely caused by datagram truncation across a third
+  of that capture; none occur in `vr3`.) An IDR access unit consists of `VPS,
+  SPS, PPS` followed by four IDR slices (I slices); every other access unit
+  consists of four `TRAIL_R` P slices and begins with `00 00 00 01 02 01`.
+- **The four slices correspond to the four atlas tiles.** With a 32 x 32 coding
+  tree block (minimum coding block 16, one level up), the full picture is
+  48 x 192 CTBs and each 1536 x 1536 tile spans 2,304 CTBs. Across all 4,260
+  access units, the four slices have `first_slice_segment_in_pic_flag = 1`
+  followed by `slice_segment_address` values `2304`, `4608`, and `6912`. HEVC
+  tiles and wavefront parallel processing are disabled, there are no dependent
+  slice segments, and `slice_loop_filter_across_slices_enabled_flag` is 0 in
+  all 17,040 slice headers, so loop filtering does not cross slice boundaries.
+  Motion vectors may still cross slice boundaries, so slices are not
+  independently decodable across frames.
+- Slice QP alternates by tile type: in 4,188 of 4,259 complete frames, the left
+  base slice starts 27 or 28 QP steps above the left foveal slice, and the
+  right eye's two slices start within 1 QP step of the corresponding left-eye
+  slices. Initial slice QP ranged from `5..30` for foveal slices (median 5 to
+  6) and `33..51` for base slices (median 33), with CU-level QP deltas enabled
+  within each slice. Mean slice sizes in tile order are 2,927, 2,105, 2,988,
+  and 2,024 bytes. Across the 4,220 indexed access units, frame size spans 302
+  bytes minimum, 7,735 median, 10,061 mean, and 283,768 maximum.
+- In the reference structure, `sps_max_dec_pic_buffering` is 5, with no
+  long-term references and no temporal MVP. Every P slice signals its own
+  short-term reference picture set of up to four previous pictures and marks
+  **only the immediately preceding picture as used for reference**. Each frame
+  therefore depends on the frame immediately before it, so any lost frame
+  breaks decoding until the next IDR. Picture order count is an 8-bit counter
+  that resets on each IDR.
 
 ### IDR frames and parameter sets
 
-- **Two IDRs in the run, at frames 0 and 4**, and none in the remaining 4,255
-  frames (39.3 s). Parameter sets appear only with those two. `vr1` had five
-  (frames 0, 5, 39, 74, 82 of 113) and Klepton once reported parameter sets
-  "roughly every fifth frame" in another session, so the count is not a
-  property of the stream format. In `vr3` the client never asked for a
-  reset: the `rst` field was 0 in all 17,423 pose packets
-  (docs/svl-tracking-input/poses.md). So the IDR at frame 4 was not asked
-  for through `rst`, and a session without resets has no periodic IDR at
-  all. What precedes each IDR on the wire belongs to
+- **Only two IDRs occur in the run, at frames 0 and 4**, with none across the
+  remaining 4,255 frames (39.3 s). Parameter sets are sent only with those two
+  IDRs. `vr1` had five IDRs (frames 0, 5, 39, 74, and 82 out of 113) and
+  Klepton once logged parameter sets "roughly every fifth frame" in another
+  session, so IDR frequency depends on session conditions rather than a fixed
+  interval. In `vr3`, `vrlink` never requested a reset: the `rst` field was 0
+  in all 17,423 pose packets (`docs/svl-tracking-input/poses.md`). Frame 4's
+  IDR was therefore sent without an `rst` bump, and a clean session has no
+  periodic keyframes. Wire events preceding each IDR are covered in
   [retransmit.md](retransmit.md).
-- Frames 0..3 (the first IDR and three P frames, 2,512, 566, 536 and 620
-  bytes) decode to a flat fill; real picture starts with the second IDR
-  (2,378 bytes, then 13,043). **inferred**: the encoder was restarted once
-  the host had the client's configuration.
-- VPS and PPS are identical in both IDRs. The two SPS differ only in
-  `vui_time_scale`: 40 at frame 0, **114** at frame 4 (with
-  `vui_num_units_in_tick` 1, i.e. a nominal 40 then 114 frames per second;
-  the measured rate was 108.2). The probe stream has one IDR, the same VPS
-  and PPS, and time scale 117. **inferred**: the host writes its current
-  frame-rate target there; a decoder should ignore it.
+- Frames 0..3 (the first IDR plus three P frames of 2,512, 566, 536, and 620
+  bytes) decode to a solid gray fill; rendered scene content begins with the
+  second IDR at frame 4 (2,378 bytes, followed by 13,043 bytes on frame 5).
+  **inferred**: the host restarted its encoder once client configuration
+  finished arriving.
+- VPS and PPS are byte-identical in both IDRs. The two SPS NALs differ only in
+  `vui_time_scale`: `40` at frame 0 and **`114`** at frame 4 (with
+  `vui_num_units_in_tick = 1`, signaling nominal rates of 40 and 114 fps
+  compared to the measured 108.2 fps). The probe stream contains a single IDR
+  with the same VPS and PPS and `vui_time_scale = 117`. **inferred**: the host
+  writes its current frame-rate target into `vui_time_scale`, and decoders
+  should ignore it.
 
 ### SPS and PPS
 
-- SPS: HEVC **Main 10** (profile 2), high tier, level 6.1 (`level_idc` 183),
-  4:2:0, **1536 x 6144**, no conformance window, 10-bit luma and chroma. AMP
-  and SAO on (`slice_sao_luma_flag` 1 on every slice); scaling lists, PCM and
-  strong intra smoothing off.
-- PPS: one reference by default, `init_qp` 26, CU QP delta on, constrained
-  intra prediction on, sign data hiding on, no weighted prediction, no tiles,
-  no wavefront, deblocking on with zero offsets.
+- The SPS specifies HEVC **Main 10** (profile 2), high tier, level 6.1
+  (`level_idc` 183), 4:2:0 chroma, **1536 x 6144** resolution with no
+  conformance window, and 10-bit luma and chroma. AMP and SAO are enabled
+  (`slice_sao_luma_flag = 1` on every slice); scaling lists, PCM, and strong
+  intra smoothing are disabled.
+- The PPS specifies one default reference, `init_qp` 26, CU QP delta enabled,
+  constrained intra prediction enabled, sign data hiding enabled, no weighted
+  prediction, no tiles, no wavefront, and deblocking enabled with zero offsets.
 
 ### Color description (SPS VUI)
 
@@ -279,105 +292,112 @@ Header fields were read with ffmpeg's `trace_headers` bitstream filter.
 | `aspect_ratio_idc` | 1 | square pixels |
 | `chroma_loc_info_present_flag` | 0 | chroma siting not signaled |
 
-Identical in both SPS of `vr3` and in the probe stream. Against the client's
-MediaFormat (BT.2020, full range, "linear") and the shader:
+These VUI fields are identical in both SPS NALs of `vr3` and in the probe
+stream. Comparing them with `vrlink`'s MediaFormat (BT.2020, full range,
+linear) and fragment shader:
 
-- Range and primaries agree with the keys.
-- Transfer: the stream says gamma 2.2, the key says linear (1). The shader
-  does no transfer conversion and writes into an sRGB swapchain with sRGB
-  encoding off, which treats the samples as display-referred, i.e. agrees
-  with the VUI, not with the key. **inferred**: the key is ignored or
-  harmless on the reference devices.
-- Matrix: "identity" is not usable as written - it is only defined for 4:4:4,
-  and the decoded planes are plainly luma and subsampled chroma. The VUI
-  therefore gives no Y'CbCr matrix; the client's BT.2020 key is the only
-  statement of one. ffprobe reports the stream as `gbr/bt2020/bt470m`, and a
-  decoder that trusts the VUI may mis-convert or refuse. See
-  [frame-layout.md](frame-layout.md) for what the picture shows.
+- Range and primaries match the MediaFormat keys.
+- For transfer characteristics, the VUI signals gamma 2.2 while the MediaFormat
+  key specifies linear (`1`). Because the shader applies no transfer curve and
+  writes directly to an sRGB swapchain with sRGB encoding disabled, it treats
+  decoded values as display-referred—matching the VUI rather than the
+  MediaFormat key. **inferred**: `COLOR_TRANSFER_LINEAR` is ignored or harmless
+  on the Android devices `vrlink` targets.
+- For matrix coefficients, `identity` (`0`) is defined only for 4:4:4 GBR
+  streams, whereas the decoded planes are 4:2:0 luma and subsampled chroma.
+  Because the VUI does not specify a valid Y'CbCr matrix, `vrlink`'s
+  `COLOR_STANDARD_BT2020` MediaFormat key is the only declaration of one.
+  `ffprobe` reports the stream as `gbr/bt2020/bt470m`, and a decoder that
+  trusts the VUI literally may apply the wrong matrix or reject the stream. See
+  [frame-layout.md](frame-layout.md) for measurements of the decoded image.
 
 ### Client log (`vr3`)
 
-- Klepton's media layer: `AMediaCodec_createDecoderByType("video/hevc")`,
-  `AImageReader 1x1 format 0x22 usage 0x100, 20 images` (format PRIVATE,
-  usage GPU_SAMPLED_IMAGE), `AMediaCodec_configure ... flags=0x0`, first
-  access unit `2512 bytes, pts 0 us, flags 0x0`, first decoded frame `pts 0`,
-  published to the reader as `1536x6144`. All as the static reading says.
-- The client's own lines: `[SVLDecoder] Began decoder init` / `Finished
-  decoder init` once each; `[SVLDecoder] Failed to acquire latest image!`
-  **once**, right after the first image became available (Klepton logged
-  its first `acquireLatestImage` with pts 1 at that point); then
-  `[XRRenderer] Initializing swapchains...`, `Swapchains were regenerated`.
-  No "Invalid frame metadata", "late metadata", "Could not acquire encoded
-  data buffer" or unrecoverable-error line in the whole run: one decoder
-  instance, no reset, for 4,260 frames.
+- Klepton's media layer logged `AMediaCodec_createDecoderByType("video/hevc")`,
+  `AImageReader 1x1 format 0x22 usage 0x100, 20 images` (format `PRIVATE`,
+  usage `GPU_SAMPLED_IMAGE`), `AMediaCodec_configure ... flags=0x0`, the first
+  access unit as `2512 bytes, pts 0 us, flags 0x0`, and the first decoded frame
+  (`pts 0`) published to the reader as `1536x6144`, matching the static
+  analysis above.
+- `vrlink` logged `[SVLDecoder] Began decoder init` and `Finished decoder init`
+  once each, followed by `[SVLDecoder] Failed to acquire latest image!`
+  **once** right after the first image became available (when Klepton logged
+  its first `acquireLatestImage` at `pts 1`), and then `[XRRenderer]
+  Initializing swapchains...` and `Swapchains were regenerated`. None of the
+  error logs (`Invalid frame metadata`, `late metadata`, `Could not acquire
+  encoded data buffer`, or unrecoverable error) appeared during the run; a
+  single decoder instance decoded all 4,260 frames without resetting.
 
 ## Open questions / to confirm on the wire
 
-Settled by `vr3`: the SPS VUI is decoded (above); the four slices are the
-four atlas tiles; pts is the frame id on every buffer; there is no periodic
-IDR.
+`vr3` resolved the SPS VUI fields (above), confirmed that the four slices map
+to the four atlas tiles, verified `pts == frame_id` on every buffer, and showed
+that clean sessions have no periodic IDRs. Remaining open questions:
 
-1. Which Y'CbCr matrix the host really encodes with (the VUI's "identity"
-   cannot be it). Owned by [frame-layout.md](frame-layout.md).
-2. Whether every client reset is answered by exactly one IDR: `vr3` had no
-   reset. Its second IDR (frame 4) came without one, so the host does send
-   IDRs for its own reasons at start-up; whether it ever does later in a
-   session is unknown.
-3. The pts wrap at frame 65536 on a long session.
-4. Why the single `Failed to acquire latest image!` at the first frame
-   (**inferred**: the reader's callback raced the first image under Klepton;
-   it may not happen on a headset).
-5. Whether a lost frame is always repaired by retransmission before the
-   decoder sees its successor, given that each frame references only the
-   previous one ([retransmit.md](retransmit.md)).
+1. Which Y'CbCr matrix the host encoder uses (since the VUI's `identity` value
+   is invalid for 4:2:0); see [frame-layout.md](frame-layout.md).
+2. Whether every client reset triggers a single IDR from the host: `vr3` had no
+   resets, and its second IDR (frame 4) arrived without an `rst` bump during
+   startup; whether the host ever sends unprompted IDRs later in a session is
+   unknown.
+3. How the decoder handles the `pts` wrap to 0 at frame 65536 on a long
+   session.
+4. What causes the single `Failed to acquire latest image!` message on the
+   first frame (**inferred**: the reader callback raced the first frame under
+   Klepton and may not occur on a physical headset).
+5. Whether lost frames are always repaired by retransmission before the decoder
+   sees the next frame, given that each P frame references the immediately
+   preceding frame ([retransmit.md](retransmit.md)).
 
-## Which codec (checked 2026-11-10)
+## Codec support (checked 2026-11-10)
 
-- **static**, two client builds: 2.0.20.1812 (the one studied here) and
-  2.0.25.2532 (shipped inside the SteamVR beta on the host). In both,
-  `libvrlink_scene.so` contains exactly one MIME string, `video/hevc`, and one
-  decoder class. Nothing in the session request, the values or the frame
-  descriptor names a codec, so a stock host talking to a stock client must
-  send HEVC.
-- The newer APK does carry `libpyrowave-shared.so` and an AV1 parser
-  (`libobuparse.so`), but only the flat Remote Play client `libmain.so` links
-  them.
-- A third-party tool (github.com/elliotttate/SteamFrame-Advanced-Options)
-  streams AV1 and H.264 over this transport to a Steam Frame by replacing the
-  host's encoder and the headset's decoder together; its documentation says
-  it adds no codec negotiation. That shows the packet layer does not care
-  what the elementary stream is. Not verified here.
-- So the client does not assume: `client` reads the codec off each
-  keyframe (`VRLinkCore/Bitstream.swift`). HEVC and H.264 are decoded (H.264
-  only against an ffmpeg-made stream, never from a host). AV1 is handed to
-  VideoToolbox too, with its sequence header turned into a format
-  description by the parser from the ALVR visionOS client; that parser is
-  tested against an ffmpeg-made keyframe, but AV1 decoding itself has not
-  run anywhere yet (it needs AV1 hardware, which the development Mac lacks). Keyframe detection, which loss recovery
-  depends on, uses the same test instead of looking for an HEVC parameter
-  set.
-- The descriptor's `fec_mode` (0x20 in every capture) is checked, and a
-  different value is reported once.
+- Across two `vrlink` builds (**static**)—2.0.20.1812 (analyzed throughout
+  these docs) and 2.0.25.2532 (bundled inside the host SteamVR beta)—
+  `libvrlink_scene.so` contains a single MIME string (`video/hevc`) and one
+  decoder class. Nothing in the session request, values, or frame descriptor
+  names a codec, so an unmodified host streaming to an unmodified `vrlink`
+  client always sends HEVC.
+- The newer APK includes `libpyrowave-shared.so` and an AV1 parser
+  (`libobuparse.so`), but only the 2D Remote Play library (`libmain.so`) links
+  against them.
+- A third-party mod (`github.com/elliotttate/SteamFrame-Advanced-Options`)
+  streams AV1 and H.264 over this transport to a Steam Frame by patching both
+  the host encoder and headset decoder; its documentation states that it adds
+  no codec negotiation. This indicates that the SVL packet framing is
+  codec-agnostic, though we have not verified the mod directly.
+- Rather than assuming HEVC, this repo's `client` inspects each keyframe to
+  detect the codec (`VRLinkCore/Bitstream.swift`). HEVC and H.264 are supported
+  (H.264 has been tested only against a synthetic `ffmpeg` stream, never a live
+  host). AV1 is also wired to VideoToolbox using the sequence-header parser
+  from the ALVR visionOS client to construct the format description; that
+  parser is tested against an `ffmpeg`-generated keyframe, though end-to-end
+  AV1 hardware decoding has not run yet because the development Mac lacks AV1
+  decode hardware. Loss recovery uses the same multi-codec keyframe check
+  instead of scanning specifically for HEVC parameter sets.
+- `client` checks the descriptor's `fec_mode` (`0x20` in every capture) and
+  logs once if a different value appears.
 
-## A second host with a broken picture (2026-11-10)
+## Broken chroma from a Linux Vulkan Video host (2026-11-10)
 
-**Captured by probe** from a Linux host (SteamVR beta on an ARM machine with
-an NVIDIA GB10, Steam running through an x86 layer; its log shows the vrlink
-driver encoding with Vulkan Video, 10-bit, four slices, a 1024x4096 atlas):
+A stream **captured** by the probe from a Linux host (SteamVR beta on an ARM
+machine with an NVIDIA GB10, running Steam under an x86 translation layer; host
+logs show the `vrlink` driver encoding 10-bit, four-slice, `1024x4096` atlases
+via Vulkan Video) exhibited broken chroma:
 
-- The stream is HEVC with the same declared format as the Windows host's
-  (Main 10, 4:2:0, 10-bit, full range, BT.2020 primaries, gamma 2.2, identity
-  matrix). It differs in three ordinary encoder choices: no loop filter
-  across slices, strong intra smoothing on, and reference picture sets
-  carried in the slices instead of the SPS. Keyframes are VPS, SPS, PPS, IDR
-  slices; other frames are plain trailing slices.
-- The picture decodes green on the headset, and equally in software: one
-  frame decoded by ffmpeg has its V plane at exactly 512 everywhere (standard
-  deviation 0.2) and its U plane at 124 almost everywhere, where neutral is
-  512. The Windows host's planes in the same test are
-  ordinary (U 561, V 488, both varying; luma mean 138).
+- The bitstream is HEVC with the same VUI parameters as the Windows host
+  (Main 10, 4:2:0, 10-bit, full range, BT.2020 primaries, gamma 2.2, `identity`
+  matrix), differing only in standard encoder settings: loop filtering across
+  slices is off, strong intra smoothing is on, and reference picture sets are
+  signaled in slice headers rather than the SPS. Keyframes consist of VPS, SPS,
+  PPS, and IDR slices; non-keyframes are trailing P slices.
+- The picture decodes bright green both on the headset and in software: in a
+  frame decoded with `ffmpeg`, the V plane sits at `512` everywhere (standard
+  deviation `0.2`) and the U plane sits near `124` almost everywhere (neutral
+  10-bit chroma is `512`). On the Windows host in the same test, both chroma
+  planes carry normal scene variation (mean U `561`, mean V `488`, mean luma
+  `138`).
 
-So that host's encoder is being fed bad chroma, and no client can show its
-stream correctly. Both chroma planes are flat (99 % of U lies within 123 to
-125), so the stream carries no color information, only luma. **inferred**: a fault in the host's color-conversion
-step on that GPU or driver. Not pursued.
+Because both chroma planes are flat in the encoded bitstream (99% of U samples
+fall within `123..125`), the stream contains luma only and no client can
+recover color from it. **inferred**: the host's pre-encode color conversion has
+a bug on that GPU or driver stack; we did not investigate further.

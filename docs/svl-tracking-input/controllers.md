@@ -1,39 +1,40 @@
 # Controller input encoding
 
-Client → host, carried inside the pose packet ([poses.md](poses.md)) as two
-28-byte blocks (left at 0x30, right at 0x4c). There is no separate button
-message.
+Controller input flows from client to host inside the pose packet
+([poses.md](poses.md)) as two 28-byte blocks (left at 0x30, right at 0x4c).
+There is no separate button message.
 
 ## Wire block (28 bytes per hand)
 
-**static**: `QSVLClient::SendPoses` (0xf4d34), the two loops over the
-`QSVLControllerInputState` vectors.
+In `QSVLClient::SendPoses` (0xf4d34, **static**), two loops over the
+`QSVLControllerInputState` vectors pack one 28-byte block per hand:
 
 | off | type | field |
 |---|---|---|
 | 0x00 | u64 | `inputType 0` bits ("click"): bit *i* = value of the action with `inputTypeIndex` *i* |
 | 0x08 | u64 | `inputType 1` bits ("touch"): bit *i* likewise |
-| 0x10 | u8 | 1 if `QSVLControllerState+0x78 == 1`, else 0. The source is `QSVLXRInput+0x188` (left) / `+0x18c` (right), written only by `SetActiveInteractionProfiles` (0x107010): 1 when the hand has no interaction profile and hand tracking is set up (`XRQContext+0x118d` bit 0; log `No interaction profile for %s hand specified, but hand tracking is setup so using that.`), else 0. So: "this hand is a tracked hand, not a controller" (**static**) |
+| 0x10 | u8 | 1 if `QSVLControllerState+0x78 == 1`, else 0. The source is `QSVLXRInput+0x188` (left) / `+0x18c` (right), written only by `SetActiveInteractionProfiles` (0x107010): 1 when the hand has no interaction profile and hand tracking is set up (`XRQContext+0x118d` bit 0; log `No interaction profile for %s hand specified, but hand tracking is setup so using that.`), else 0. Indicates that the hand is using hand tracking rather than a controller (**static**) |
 | 0x11 | i8×11 | `inputType 2` analog values: byte *i* = `(int8)(value * 127.0)` for the action with `inputTypeIndex` *i* |
 
-Packing detail (**static**): bits are OR-ed as
-`(int64)(int32)(value_byte << (index & 0x1f))`, so only indices 0..31 are
-usable and index 31 would sign-extend into the top half. Unused bits/bytes are
-zero. A float axis is truncated toward zero, range −127..127; −1.0 → 0x81.
+Bits are OR-ed as `(int64)(int32)(value_byte << (index & 0x1f))` (**static**),
+so only indices 0..31 are usable and index 31 sign-extends into the upper 32
+bits. Unused bits and bytes are zero. Float axes are truncated toward zero into
+the range −127..127 (−1.0 encodes as 0x81).
 
-## Where the bit numbers come from
+## Action-to-bit mapping
 
-**static**: `QSVLXRInput::GetControllerState_Controller` (0x10722c) walks the
-action list (0x68-byte entries at `QSVLXRInput+0x40`). Each entry has an OpenXR
-action, an `actionType` (1 = boolean via `xrGetActionStateBoolean`, 2 = float
-via `xrGetActionStateFloat`; anything else logs
+`QSVLXRInput::GetControllerState_Controller` (0x10722c, **static**) walks the
+action list (0x68-byte entries at `QSVLXRInput+0x40`). Each entry holds an
+OpenXR action, an `actionType` (1 = boolean via `xrGetActionStateBoolean`,
+2 = float via `xrGetActionStateFloat`; anything else logs
 `[XRInput] Unknown input type! %i`), and an 8-byte `{inputType, inputTypeIndex}`
 pair copied verbatim into the 12-byte `QSVLControllerInputState`
-`{u32 type; u8 index; pad; u8 value}`. A state is only written when the action
+`{u32 type; u8 index; pad; u8 value}`. An entry is written only when the action
 is bound for that hand's subaction path and `isActive` is true.
 
-The table is not in the binary; it is `inputActions[]` in
-`assets/config/controller_config.json`. For this APK:
+The action mapping comes from `inputActions[]` in
+`assets/config/controller_config.json` rather than being compiled into the
+binary. In this APK, the bindings are:
 
 | inputType | index | wire location | binding (oculus/touch_controller; L / R) |
 |---|---|---|---|
@@ -53,51 +54,54 @@ The table is not in the binary; it is `inputActions[]` in
 | 2 | 2 | axis byte 2 | `thumbstick/y` |
 | 2 | 3 | axis byte 3 | `squeeze/value` |
 
-Axis bytes 4..10 are unused by this config. **inferred**: the host maps these
-indices onto the SteamVR input profile named by the controller's static props
-(`sInputProfilePath`, e.g. `{oculus}/input/touch_profile.json`); the mapping
-table itself is host-side and not visible here.
+Axis bytes 4..10 are unused by this config. On the host (**inferred**), these
+indices map onto the SteamVR input profile named by the controller's static
+props (`sInputProfilePath`, e.g. `{oculus}/input/touch_profile.json`); the
+host-side mapping table is not in this binary.
 
 ## Interaction profile
 
-- **static**: the active profile per hand is an `XrPath` at
+- The active profile per hand (**static**) is an `XrPath` at
   `QSVLXRInput+0x150` (left) / `+0x158` (right), set by
   `SetActiveInteractionProfiles` (0x107010) under the mutex at `+0x160`.
-  A zero path means "no controller in this hand".
-- **static**: `GetControllerStates` (0x107104): with a non-zero profile the
-  hand is read through OpenXR actions; with a zero profile and host version
-  ≥ 7 the hand falls back to hand tracking (below); with version < 7 a zero
-  profile gives tracking result 1 / state 0.
+  A zero path means no controller is active in that hand.
+- In `GetControllerStates` (0x107104, **static**), a hand with a non-zero
+  profile is read through OpenXR actions. With a zero profile and host version
+  ≥ 7, the hand falls back to hand tracking (below); with version < 7, a zero
+  profile produces tracking result 1 and state 0.
 - The profile also selects the pose offset ([poses.md](poses.md)) and the
   controller's static props (docs/svl-values/). Klepton's finding that an
-  `XR_NULL_PATH` answer suppresses `VTE_PROPS_STATIC_L/R` is consistent with
-  this code: nothing is published for a hand without a profile.
+  `XR_NULL_PATH` result suppresses `VTE_PROPS_STATIC_L/R` matches this code,
+  which publishes nothing for a hand without a profile.
 
 ## Hand tracking presented as a controller (host version ≥ 7)
 
-**static**: `QSVLXRInput::GetControllerState_HandTracking` (0x107ca4),
-`QSVLXRInput::QSVLXRInput` (0x1037e0) for the constants.
+This fallback is implemented in `QSVLXRInput::GetControllerState_HandTracking`
+(0x107ca4, **static**), with constants initialized in
+`QSVLXRInput::QSVLXRInput` (0x1037e0, **static**).
 
-- Pose: the raw OpenXR **wrist joint** (joint 1) pose from
-  `xrLocateHandJoints` at now + 30 ms, in the hand tracker's base space:
-  position, orientation (w first on the wire), no conversion. Linear and
-  angular velocity are the wrist's `XrHandJointVelocityEXT`, low-pass
-  filtered `v = 0.8·v_prev + 0.2·v_new` per hand (each only updated when its
-  velocity-valid flag is set), and **not** rotated into the body frame the
-  way controller angular velocity is. Tracking result 200 when the wrist's
-  two valid bits are set, else 1; state is always 2; trailing u32 0.
-- Offset pose (the 7 floats at 0x38 of `PackedPose_t`; hard-coded in the
-  constructor, `QSVLXRInput+0x288 + hand*0x1c`), orientation = Rz(∓90°)·Rx(45°):
+- **Pose**: Uses the raw OpenXR **wrist joint** (joint 1) pose from
+  `xrLocateHandJoints` at `now + 30 ms` in the hand tracker's base space,
+  sending position and orientation (`w` first on the wire) with no coordinate
+  conversion. Linear and angular velocity come from the wrist's
+  `XrHandJointVelocityEXT`, low-pass filtered as `v = 0.8·v_prev + 0.2·v_new`
+  per hand (each updated only when its velocity-valid flag is set), and are
+  **not** rotated into the body frame like controller angular velocity.
+  Tracking result is 200 when both of the wrist's valid bits are set, or 1
+  otherwise; state is always 2, and the trailing `u32` is 0.
+- **Offset pose**: The 7 floats at 0x38 of `PackedPose_t` are hard-coded in the
+  constructor (`QSVLXRInput+0x288 + hand*0x1c`) with orientation
+  `Rz(∓90°)·Rx(45°)`:
 
 | hand | offset position | offset orientation (w, x, y, z) |
 |---|---|---|
 | left | (0.09, −0.02, −0.15) | (0.65328, 0.27060, −0.27060, −0.65328) |
 | right | (−0.09, −0.02, −0.15) | (0.65328, 0.27060, 0.27060, 0.65328) |
 
-- Buttons from `SkeletalGestureInfo` (0x18 bytes per hand at
-  `QSVLXRInput+0x380`). Note it is zeroed and recomputed by
-  `GetHandTracking` ([skeleton.md](skeleton.md)), which runs *after* the pose
-  packet is built, so the pose packet carries the previous tick's gestures:
+- **Buttons**: Read from `SkeletalGestureInfo` (0x18 bytes per hand at
+  `QSVLXRInput+0x380`). Because `GetHandTracking` ([skeleton.md](skeleton.md))
+  zeroes and recomputes this struct *after* the pose packet is built, the pose
+  packet carries the previous tick's gestures:
 
 | wire location | source | meaning |
 |---|---|---|
@@ -108,21 +112,22 @@ table itself is host-side and not visible here.
 
   Touch bits and the other axis bytes stay 0; input-block byte 0x10 is 1.
 - If hand joints report inactive for more than 2 s (steady clock, deadline at
-  `+0x2c8`) the hand is reported absent (tracking result 1, state 0).
-- Static props for a tracked hand are hard-coded, and power props are a
-  constant: docs/svl-values/static-and-power-props.md.
+  `+0x2c8`), the hand is reported absent (tracking result 1, state 0).
+- Static props for a tracked hand are hard-coded and power props are constant
+  (see docs/svl-values/static-and-power-props.md).
 
 ### Hand gestures (`SkeletalGestures::Compute`, 0x130be0)
 
-**static**. Inputs: the 26 joints, the Meta aim state's `status` flags
-(`XrHandTrackingAimStateFB+0x10`), the previous result for the hand (kept for
-hysteresis). The info struct is all zero before each call.
+`SkeletalGestures::Compute` (**static**) takes the 26 hand joints, the Meta aim
+state's `status` flags (`XrHandTrackingAimStateFB+0x10`), and the previous
+tick's result for hysteresis. The output struct is zeroed before each call.
 
-Finger curl (`GetFingerCurlDegrees` 0x130914), for finger f = 0..3 = index,
-middle, ring, little: the angle in degrees (0..180) between the −Z (forward)
-axis of the finger's **proximal** joint (J[7+5f]) and that of its **tip**
-joint (J[10+5f]). "Curled" below means curl > 120° (> 80° if the gesture was
-already on last time); the code also tests < 300°, always true.
+`GetFingerCurlDegrees` (0x130914, **static**) computes finger curl for finger
+`f = 0..3` (index, middle, ring, little) as the angle in degrees (0..180)
+between the −Z (forward) axis of the finger's **proximal** joint (`J[7+5f]`)
+and that of its **tip** joint (`J[10+5f]`). In the table below, "curled" means
+curl > 120° (> 80° if the gesture was already active on the previous tick); the
+code also checks < 300°, which is always true.
 
 | field | meaning | computed as |
 |---|---|---|
@@ -132,74 +137,80 @@ already on last time); the code also tests < 300°, always true.
 | `+0x0c` float, `+0x10` bool | grip | all four fingers curled; strength 1.0 |
 | `+0x14` bool | point | index curl < 18° (< 40° if already on) and middle, ring, little curled |
 
-The pinches come from the runtime (`XR_FB_hand_tracking_aim`), not from
-joint distances; a client without that extension has to detect pinches
-itself. The exact thresholds the Meta runtime uses are not in this binary.
+Pinch detection relies on the OpenXR runtime (`XR_FB_hand_tracking_aim`) rather
+than computing joint distances directly, so a client without that extension must
+detect pinches itself. The Meta runtime's exact thresholds are external to this
+binary.
 
 ## Capture check (`vr3`)
 
-**captured**, all 17,423 pose packets of `vr3` (a desktop-view session under
-Klepton, whose OpenXR runtime presents two synthetic Touch controllers; the
-client log shows `Setting active interaction profile for left hand to:
-/interaction_profiles/oculus/touch_controller`, and the same for the right):
+Across all 17,423 pose packets of `vr3` (**captured**, a desktop-view session
+under Klepton whose OpenXR runtime presents two synthetic Touch controllers;
+`vrlink` logs `Setting active interaction profile for left hand to:
+/interaction_profiles/oculus/touch_controller` and the same for the right):
 
-- Both 28-byte input blocks are all zero in every packet: no click bit, no
-  touch bit, byte 0x10 = 0, all eleven axis bytes 0.
-- Both controller poses are present and valid from the very first packet and
-  are byte-identical for the whole 40 s. Left: position (−0.22, 1.35, −0.40),
-  orientation (w,x,y,z) = (0.9483, 0.3173, 0, 0), i.e. pitched 37° about +x;
-  right: the same with x = +0.22. Linear and angular velocity zero, tracking
-  result 200, state 2, trailing u32 0.
-- Offset pose per hand: position (∓0.007, −0.0342, −0.0961), orientation
-  (0.9839, −0.1788, 0, 0) for both. That matches the Touch entry of
-  `controller_config.json` with x mirrored for the right hand
+- Both 28-byte input blocks are all zero in every packet (no click bits, no
+  touch bits, byte 0x10 = 0, and all eleven axis bytes = 0).
+- Both controller poses are present and valid from the first packet and remain
+  byte-identical across the entire 40 s capture. Left is at position
+  (−0.22, 1.35, −0.40) with orientation (w, x, y, z) = (0.9483, 0.3173, 0, 0),
+  pitched 37° about +x; right is identical with x = +0.22. Linear and angular
+  velocity are zero, tracking result is 200, state is 2, and the trailing `u32`
+  is 0.
+- The offset pose per hand has position (∓0.007, −0.0342, −0.0961) and
+  orientation (0.9839, −0.1788, 0, 0) for both hands, matching the Touch entry
+  in `controller_config.json` with x mirrored for the right hand
   ([poses.md](poses.md)).
-- The HMD-input "no controller" bit (flags bit3) is set in packet 0 only,
-  although packet 0 already carries both poses; see poses.md for why it lags.
+- The HMD-input "no controller" bit (flags bit3) is set in packet 0 only, even
+  though packet 0 already carries both poses; see [poses.md](poses.md) for why
+  it lags by one packet.
 
-Captured negatives in `vr3`: no packet with an absent controller (tracking
-result 1 / state 0), none in "no input" form (all-zero pose blocks, which
-`vr1` had in 1020 of 1637 packets), no hand-tracked hand, and no button,
-touch or axis bit ever set. The index table above is therefore still
-**static** only.
+`vr3` contains no packets with an absent controller (tracking result 1 /
+state 0), no packets in "no input" mode (all-zero pose blocks, which `vr1` had
+in 1,020 of 1,637 packets), no hand-tracked hands, and no set button, touch, or
+axis bits (**captured** negatives). The index table above therefore remains
+**static** only in `vr3`.
 
 ## Client results (2026-11-10)
 
-**Captured by client** (`client`, the macOS viewer with made-up
-hands, against the real host, protocol version 14):
+Tested with `client` (the macOS viewer sending synthetic hands against a
+SteamVR host speaking protocol version 14, **captured**):
 
-- A client that publishes no controller values at start and then, on the
-  first pose packet, publishes 0x0e/0x0f (the Touch strings) and 0x11/0x12,
-  while sending valid grip poses with the Touch offset pose, gets two Quest 2
-  controllers drawn in SteamVR Home at the poses sent, with a pointer ray.
-  So controller identity can be published after the session has begun.
-- A hand sent as a tracked hand - the hand static props with driver type 1
-  published once the host version is known (after the first bookend, so
-  mid-stream), the wrist pose with the hand offset pose, input-block byte
-  0x10 = 1, and one `0x17` message per pose packet in a datagram of its
-  own - is accepted: the host keeps streaming at the full rate and draws a
-  small pointer marker where the hand is. The other hand was a Touch
-  controller in the same session, so the two kinds mix.
-- A hand left absent is sent as tracking result 1 / state 0 with the rest of
-  the pose zero; the host draws nothing for it.
+- Publishing no controller values at startup and then, on the first pose
+  packet, publishing 0x0e/0x0f (the Touch strings) and 0x11/0x12 while sending
+  valid grip poses with the Touch offset pose causes SteamVR Home to render two
+  Quest 2 controllers at those poses with pointer rays. Controller identity can
+  therefore be published after the session has started.
+- Sending a hand as a tracked hand — publishing the hand static props (driver
+  type 1) once the host version is known after the first bookend (mid-stream),
+  sending the wrist pose with the hand offset pose, setting input-block byte
+  0x10 = 1, and sending one `0x17` message per pose packet in its own
+  datagram — is accepted by the host. The host keeps streaming at full frame
+  rate and draws a small pointer marker at the hand's position. Sending a Touch
+  controller on the other hand in the same session also works, confirming that
+  controller and tracked-hand inputs can be mixed.
+- Leaving a hand absent (tracking result 1 / state 0 with the rest of the pose
+  zeroed) causes the host to draw nothing for that hand.
 
-First headset run (Vision Pro, PS VR2 Sense controllers and bare hands, as
-reported by the wearer): controllers appear and follow the real ones but
-swim, having been sent unpredicted; hands appear and mostly line up with
-the real hands; pinching had no effect in SteamVR; a hand vanished when
-partly closed (a client fault: it dropped the hand whenever one joint was
-hidden). Whether the pinch reaches the host as a button is still open.
+In the first headset test on Vision Pro with PS VR2 Sense controllers and bare
+hands (reported by the user), controllers appeared and tracked physical
+movement but swam because poses were sent unpredicted. Tracked hands appeared
+and mostly lined up with the user's hands, though pinching had no effect in
+SteamVR and a hand vanished when partly closed (a `client` bug that dropped the
+hand whenever any single joint was occluded). Whether the pinch gesture reaches
+the host as a button press remains open.
 
-Not yet seen: any button, axis or gesture having an effect (nothing was
-pressed), haptics, and a real hand skeleton (the made-up hand is flat).
+This initial test did not exercise button presses, analog axes, active
+gestures, haptics, or articulated hand skeletons (the synthetic macOS hand is
+flat).
 
-## Client results (2026-11-10): the button bits, seen working
+## Client results (2026-11-10): button bit verification
 
-**Captured by client** (`client` on macOS holding one control at a
-time on two pretend controllers of the Touch type; SteamVR's controller model
-watched for the matching part moving, by differencing captures of the
-button area against an idle capture; areas of the controller body away from
-the buttons changed by 0 pixels in every case):
+Tested with `client` on macOS (**captured**) by holding one control at a time
+on two synthetic Touch controllers and checking whether the corresponding part
+of SteamVR's rendered controller model moved (measured by differencing
+screenshots of the button region against an idle baseline; regions of the
+controller body away from the buttons changed by 0 pixels in every case):
 
 | held | bit sent | left model | right model |
 |---|---|---|---|
@@ -208,18 +219,18 @@ the buttons changed by 0 pixels in every case):
 | menu | click bit 2 | moves | does not |
 | stick click | click bit 3 | moves | moves |
 
-So click bits 0, 1 and 3 are what the table above says for both hands, and
-bit 2 acts on the left hand only, as vrlink's configuration
-has it. (Trigger and grip, axis bytes 0 and 3, move the model's parts on a
-headset, reported by the wearer.)
+Click bits 0, 1, and 3 match the action table above for both hands, and bit 2
+applies to the left hand only, matching `vrlink`'s configuration. On a headset,
+trigger and grip (axis bytes 0 and 3) also animate the corresponding parts on
+the controller model (reported by the user).
 
 ## Open questions / to confirm on the wire
 
 - Press each button on a Touch controller and watch the bit named above flip
   in the 0x30 / 0x4c blocks; push the stick and confirm axis bytes 1/2 as
   signed ±127.
-- Byte 0x10 of each block is the tracked-hand flag by static reading; a
-  capture with bare hands would confirm the host sees it.
+- Byte 0x10 of each block is the tracked-hand flag (**static**); a wire capture
+  with bare hands would confirm how `vrlink` sends it.
 - Whether the host needs the thumbstick deadzoned or raw.
 - Whether the host accepts axis indices above 3 or click bits above 5 for
   other controller types.
