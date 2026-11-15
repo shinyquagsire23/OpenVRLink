@@ -12,11 +12,6 @@ import VRLinkVideoToolbox
 import UIKit
 #endif
 
-/// What kind of host a computer is: which protocol it is spoken to in.
-public enum HostKind: String {
-    case steam, wivrn
-}
-
 /// A computer the entry window offers.
 public struct FoundHost: Identifiable {
     public let name: String
@@ -38,7 +33,7 @@ public final class Connection: ObservableObject {
     /// Hosts found on the local network, Steam's first
     @Published public var hosts: [FoundHost] = []
     private var steamHosts: [FoundHost] = [], wivrnHosts: [FoundHost] = []
-    private let wivrnBrowser = ServiceBrowser(type: "_wivrn._tcp")
+    private let wivrnBrowser = ServiceBrowser(type: WiVRn.serviceType)
     /// Whether the immersive space is open
     @Published public var immersed = false
     /// Connecting, with the immersive space still to be opened: it is
@@ -109,9 +104,9 @@ public final class Connection: ObservableObject {
 
     public init() {
         #if canImport(UIKit)
-        deviceName = UIDevice.current.name + " (" + DataDirectory.name + ")"
+        deviceName = HostConnector.name(of: UIDevice.current.name)
         #else
-        deviceName = (Host.current().localizedName ?? "Mac") + " (" + DataDirectory.name + ")"
+        deviceName = HostConnector.name(of: Host.current().localizedName ?? "Mac")
         #endif
         #if canImport(UIKit)
         // The system ends the search for announced hosts while the app is put away.
@@ -205,17 +200,16 @@ public final class Connection: ObservableObject {
                 defer { lock.unlock() }
                 return !wanted
             }
+            var connector = HostConnector(deviceName: deviceName, deviceModel: SystemVersion.model, systemVersion: SystemVersion.named)
+            connector.microphone = microphoneWanted
+            // Prefer wired network interfaces (such as the developer strap Ethernet) when available.
+            connector.preferredInterfaces = { WiredInterfaces.names() }
+            connector.show = { [self] in show($0) }
+            connector.log = { Log.note($0) }
+            connector.askPin = { [self] in askForPin(cancelled: cancelled) }
+            connector.cancelled = cancelled
             do {
-                let session: any StreamingSession, hostName: String
-                switch kind {
-                case .steam:
-                    guard let (steam, name) = try steamSession(address, profile: profile, cancelled: cancelled) else { return }
-                    (session, hostName) = (steam, name)
-                case .wivrn:
-                    guard let wivrn = try wivrnSession(address, profile: profile, microphone: microphoneWanted, cancelled: cancelled)
-                    else { return }
-                    (session, hostName) = (wivrn, address)
-                }
+                guard let (session, hostName) = try connector.connect(kind, address: address, profile: profile) else { return }
                 if microphoneWanted { sendMicrophone(to: session.microphoneSink) }
                 session.onLog = { Log.note($0) }
                 // The host ended it: drop the stream and say why, where the wearer will look.
@@ -257,50 +251,12 @@ public final class Connection: ObservableObject {
         }
     }
 
-    /// Find a Steam host, pair with it if it does not know this device, and
-    /// have it start a session. Nil when the wearer gave up meanwhile.
-    private func steamSession(_ address: String, profile: DeviceProfile, cancelled: () -> Bool) throws -> (StreamSession, String)? {
-        let identity = Identity()
-        // Keep looking until a host answers. The very first packet pops
-        // the local-network permission prompt, and until it's accepted everything is dropped.
-        var reached: (socket: UDPSocket, host: SteamHost, interface: String?)?
-        show("Looking for \(address)")
-        while reached == nil {
-            if cancelled() { return nil }
-            // Prefer a connected ethernet endpoint (via dev strap) if one exists
-            reached = try? Broadcast.reach(address: address, deviceID: identity.deviceID,
-                                           preferring: WiredInterfaces.names())
-        }
-        guard let (socket, host, interface) = reached else { return nil }
-        print(interface.map { "using wired interface \($0)" } ?? "using the default network interface")
-        let args: SessionArgs
-        do {
-            show("Asking \(host.hostname) for a session")
-            args = try Broadcast.requestSession(socket, host: host, identity: identity,
-                                                deviceVersion: DataDirectory.name + " " + SystemVersion.named)
-        } catch BroadcastError.notPaired {
-            try Broadcast.pair(socket, host: host, identity: identity, deviceName: deviceName,
-                               deviceModel: SystemVersion.model) { pin in
-                show("Enter PIN \(pin) in Steam on \(host.hostname)")
-            }
-            show("Paired; asking \(host.hostname) for a session")
-            args = try Broadcast.requestSession(socket, host: host, identity: identity,
-                                                deviceVersion: DataDirectory.name + " " + SystemVersion.named)
-        }
-        guard let session = StreamSession(args, profile: profile, interface: interface) else {
-            throw BroadcastError.badResponse("the host offered a transport this client does not have implemented yet (token kind \(args.token.prefix(4)))")
-        }
-        print("transport: \(session.transportName)")
-        return (session, host.hostname)
-    }
-
     /// The PIN the wearer types, or nil if they would rather not. Waits for
     /// as long as they take; the host itself gives up after two minutes.
     private func askForPin(cancelled: () -> Bool) -> String? {
         lock.lock()
         pinAnswer = nil
         lock.unlock()
-        show("The host wants its PIN")
         DispatchQueue.main.async { self.askingForPin = true }
         while !cancelled() {
             lock.lock()
@@ -319,24 +275,6 @@ public final class Connection: ObservableObject {
         pinAnswer = .some(pin)
         lock.unlock()
         askingForPin = false
-    }
-
-    /// Connect to a WiVRn host, trying again for as long as nothing
-    /// answers there. Nil when the wearer gave up meanwhile.
-    private func wivrnSession(_ address: String, profile: DeviceProfile, microphone: Bool, cancelled: @escaping () -> Bool) throws -> WiVRnSession? {
-        show("Looking for WiVRn on \(address)")
-        while true {
-            if cancelled() { return nil }
-            do {
-                // Over a cable if there is one that reaches it (the developer strap's Ethernet).
-                return try WiVRnSession.connect(host: address, profile: profile, name: deviceName,
-                                                pin: { [self] in askForPin(cancelled: cancelled) }, microphone: microphone,
-                                                preferring: WiredInterfaces.names()) { Log.note($0) }
-            } catch WiVRnError.unreachable {
-                // Not there yet, or the local-network permission is still being asked for.
-                Thread.sleep(forTimeInterval: 1)
-            }
-        }
     }
 
     private func sendMicrophone(to sink: any MicrophoneSink) {

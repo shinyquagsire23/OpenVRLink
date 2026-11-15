@@ -176,7 +176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         movementTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 120, repeats: true) { [weak self] _ in
             self?.view.stepMovement()
         }
-        Thread.detachNewThread { [self] in wivrn ? connectWiVRn(profile: profile) : connect(profile: profile) }
+        Thread.detachNewThread { [self] in connect(profile: profile) }
     }
 
     private var hostName = ""
@@ -190,118 +190,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async { self.window.title = "OpenVRLink — " + text }
     }
 
-    /// Connect to a WiVRn host and start streaming: video and the head, so far.
-    private func connectWiVRn(profile: DeviceProfile) {
-        do {
-            var address = hostAddress ?? ""
-            if hostAddress == nil {
-                setTitle("looking for WiVRn hosts")
-                let browser = ServiceBrowser(type: "_wivrn._tcp")
-                let found = DispatchSemaphore(value: 0)
-                browser.start { services in
-                    guard let first = services.first, address.isEmpty else { return }
-                    print("  \(first.name) at \(first.host)")
-                    address = first.host
-                    found.signal()
-                }
-                // The browser has to outlive the wait: it stops listening when it goes.
-                let heard = withExtendedLifetime(browser) { found.wait(timeout: .now() + 5) }
-                guard heard == .success else { throw WiVRnError.unreachable("any address; none announced itself") }
+    /// Discovers a WiVRn or Steam host on the local network and returns its address.
+    private func findHost() throws -> String {
+        if wivrn {
+            setTitle("looking for WiVRn hosts")
+            var address = ""
+            let browser = ServiceBrowser(type: WiVRn.serviceType)
+            let found = DispatchSemaphore(value: 0)
+            browser.start { services in
+                guard let first = services.first, address.isEmpty else { return }
+                print("  \(first.name) at \(first.host)")
+                address = first.host
+                found.signal()
             }
-            setTitle("connecting to WiVRn on \(address)")
-            // A testing aid: "address:port" for a host on another port than WiVRn's own.
-            var port = WiVRn.defaultPort
-            if let colon = address.lastIndex(of: ":"), let given = UInt16(address[address.index(after: colon)...]) {
+            // Keep the browser alive until the semaphore finishes waiting, otherwise it stops listening on deinit.
+            let heard = withExtendedLifetime(browser) { found.wait(timeout: .now() + 5) }
+            guard heard == .success else { throw WiVRnError.unreachable("any address; none announced itself") }
+            return address
+        }
+        setTitle("looking for Steam hosts")
+        let identity = Identity()
+        guard let searcher = UDPSocket() else { throw BroadcastError.noReply }
+        let hosts = Broadcast.discover(searcher, deviceID: identity.deviceID)
+        for found in hosts {
+            print("  \(found.hostname) at \(found.address)\(found.offersVRLink ? "" : " (no VR Link)")")
+        }
+        // Prefer a host this device is already paired with.
+        let usable = hosts.filter(\.offersVRLink)
+        guard let chosen = usable.first(where: { identity.isPaired(withHost: $0.clientID) }) ?? usable.first
+        else { throw BroadcastError.noReply }
+        return chosen.address
+    }
+
+    /// Finds a host, pairs with it if needed, and starts streaming. Runs on a
+    /// background thread because host startup blocks for a few seconds.
+    private func connect(profile: DeviceProfile) {
+        do {
+            var address = try hostAddress ?? findHost()
+            // Allow "address:port" when testing against a WiVRn host on a non-default port.
+            var port: UInt16?
+            if wivrn, let colon = address.lastIndex(of: ":"), let given = UInt16(address[address.index(after: colon)...]) {
                 port = given
                 address = String(address[..<colon])
             }
-            let session = try WiVRnSession.connect(host: address, port: port, profile: profile,
-                                                   name: (Host.current().localizedName ?? "Mac") + " (OpenVRLink)",
-                                                   pin: {
-                                                       if let wivrnPin { return wivrnPin }
-                                                       print("The host wants its PIN. Type it here: ", terminator: "")
-                                                       return readLine()?.trimmingCharacters(in: .whitespaces)
-                                                   },
-                                                   microphone: useMicrophone, preferring: WiredInterfaces.names()) { Log.note($0) }
+            var connector = HostConnector(deviceName: HostConnector.name(of: Host.current().localizedName ?? "Mac"),
+                                          deviceModel: SystemVersion.model, systemVersion: SystemVersion.named)
+            connector.microphone = useMicrophone
+            // Talk to the host over a cable if there is one that reaches it.
+            connector.preferredInterfaces = { WiredInterfaces.names() }
+            // Fail immediately if the host is unreachable instead of retrying like the headset app does.
+            connector.keepLooking = false
+            connector.show = { [self] in setTitle($0) }
+            connector.log = { Log.note($0) }
+            connector.askPin = {
+                if let wivrnPin { return wivrnPin }
+                print("Type it here: ", terminator: "")
+                return readLine()?.trimmingCharacters(in: .whitespaces)
+            }
+            guard let (session, name) = try connector.connect(wivrn ? .wivrn : .steam, address: address, port: port, profile: profile)
+            else { return }
             session.onLog = { Log.note($0) }
+            (session as? StreamSession)?.simulatedLoss = simulatedLoss
             if useMicrophone {
                 MicrophoneInput.requestPermission { [microphone] allowed in
                     let started = allowed && microphone.start(into: session.microphoneSink)
-                    print(started ? "microphone: ready for the host" : "microphone: not available or not permitted")
-                }
-            }
-            // The face experiment, with this Mac's camera standing in for a Persona.
-            if Settings.load().faceFromCamera {
-                faceCamera.faceCalibration = Settings.load().faceCalibration
-                faceCamera.start()
-                session.faceProvider = { [faceCamera] in faceCamera.estimate()?.face }
-            }
-            session.handsProvider = { [controllers = view.controllers] in controllers.get() }
-            session.onFrame = { [decoder] frame in decoder.decode(frame) }
-            session.start()
-            DispatchQueue.main.async {
-                self.session = session
-                self.renderer.session = session
-                self.audioOutput = AudioOutput(buffer: session.audio)
-                session.setHead(self.view.head.tracked)
-            }
-            hostName = address
-            showEyeInTitle()
-        } catch {
-            print("could not start: \(error)")
-            DispatchQueue.main.async { NSApp.terminate(nil) }
-        }
-    }
-
-    /// Find the host, pair with it if needed, and start streaming. Blocks for
-    /// a few seconds while SteamVR starts, so it runs off the main thread.
-    private func connect(profile: DeviceProfile) {
-        do {
-            let identity = Identity()
-            var address = hostAddress
-            if address == nil {
-                setTitle("looking for Steam hosts")
-                guard let searcher = UDPSocket() else { throw BroadcastError.noReply }
-                let hosts = Broadcast.discover(searcher, deviceID: identity.deviceID)
-                for found in hosts {
-                    print("  \(found.hostname) at \(found.address)\(found.offersVRLink ? "" : " (no VR Link)")")
-                }
-                // Prefer a host this device is already paired with.
-                let usable = hosts.filter(\.offersVRLink)
-                guard let chosen = usable.first(where: { identity.isPaired(withHost: $0.clientID) }) ?? usable.first
-                else { throw BroadcastError.noReply }
-                address = chosen.address
-            }
-            // Talk to the host over a cable if there is one that reaches it.
-            let (socket, host, interface) = try Broadcast.reach(address: address ?? "", deviceID: identity.deviceID,
-                                                                preferring: WiredInterfaces.names())
-            print(interface.map { "using wired interface \($0)" } ?? "using the system's choice of network interface")
-
-            let args: SessionArgs
-            do {
-                setTitle("asking \(host.hostname) for a session")
-                args = try Broadcast.requestSession(socket, host: host, identity: identity,
-                                                        deviceVersion: "OpenVRLink " + SystemVersion.named)
-            } catch BroadcastError.notPaired {
-                try Broadcast.pair(socket, host: host, identity: identity,
-                                   deviceName: (Host.current().localizedName ?? "Mac") + " (OpenVRLink)",
-                                   deviceModel: SystemVersion.model) { pin in
-                    setTitle("enter PIN \(pin) in Steam on \(host.hostname)")
-                }
-                setTitle("paired; asking \(host.hostname) for a session")
-                args = try Broadcast.requestSession(socket, host: host, identity: identity,
-                                                        deviceVersion: "OpenVRLink " + SystemVersion.named)
-            }
-
-            guard let session = StreamSession(args, profile: profile, interface: interface) else {
-                throw BroadcastError.badResponse("the host offered a transport this client does not know (token kind \(args.token.prefix(4)))")
-            }
-            session.onLog = { Log.note($0) }
-            print("transport: \(session.transportName)")
-            session.simulatedLoss = simulatedLoss
-            if useMicrophone {
-                MicrophoneInput.requestPermission { [microphone] allowed in
-                    let started = allowed && microphone.start(into: session.microphone)
                     print(started ? "microphone: sending to the host" : "microphone: not available or not permitted")
                 }
             }
@@ -320,7 +272,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.audioOutput = AudioOutput(buffer: session.audio)
                 session.setHead(self.view.head.tracked)
             }
-            hostName = host.hostname
+            hostName = name
             showEyeInTitle()
         } catch {
             print("could not start: \(error)")

@@ -25,6 +25,8 @@ public enum WiVRn {
     public static let protocolVersion: UInt64 = 0xfc26_e619_b7ab_80f8
     public static let release = "26.9"
     public static let defaultPort: UInt16 = 9757
+    /// Bonjour/mDNS service type advertised by WiVRn hosts on the local network.
+    public static let serviceType = "_wivrn._tcp"
 
     /// The host's answer to the first packet.
     enum CryptoState: UInt8 {

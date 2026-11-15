@@ -18,7 +18,11 @@ import Foundation
 public enum DataDirectory {
     public static let name = "OpenVRLink"
 
+    /// Overrides the data directory path during tests so user files are not modified.
+    static var elsewhere: URL?
+
     public static var url: URL {
+        if let elsewhere { return elsewhere }
         let files = FileManager.default
         #if os(macOS)
         let base = files.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
