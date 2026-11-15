@@ -120,4 +120,97 @@ final class HandTests: XCTestCase {
         }
         XCTAssertEqual(out.x, x, accuracy: 0.01)
     }
+
+    // MARK: HandResolver
+
+    private let head = Pose(position: Vec3(0, 1.6, 0), right: Vec3(1, 0, 0), up: Vec3(0, 1, 0), forward: Vec3(0, 0, -1))
+
+    func testResolvingAlwaysGivesBothHandsAndSaysWhatChanged() {
+        var resolver = HandResolver()
+        // Starts with no input in either hand and no log messages.
+        var resolved = resolver.resolve([], head: head, seconds: 0)
+        XCTAssertEqual(resolved.hands.count, 2)
+        XCTAssertTrue(resolved.hands.allSatisfy { $0 == nil })
+        XCTAssertEqual(resolved.notes, [])
+
+        // Passing only the left hand still returns two entries, with nil for the right hand.
+        resolved = resolver.resolve([.controller(ControllerState(grip: TrackedPose(pose: wrist)))], head: head, seconds: 0.01)
+        XCTAssertEqual(resolved.hands.count, 2)
+        guard case .controller = resolved.hands[0] else { return XCTFail("the left hand holds a controller") }
+        XCTAssertNil(resolved.hands[1])
+        XCTAssertEqual(resolved.notes, ["left hand is now a controller"])
+
+        // Unchanged hands do not log again; only hands whose input type changed are logged.
+        let both: [HandInput?] = [.controller(ControllerState(grip: TrackedPose(pose: wrist))),
+                                  .hand(TrackedHand.flat(wrist: wrist, side: .right))]
+        XCTAssertEqual(resolver.resolve(both, head: head, seconds: 0.02).notes, ["right hand is now a tracked hand"])
+        XCTAssertEqual(resolver.resolve(both, head: head, seconds: 0.03).notes, [])
+        XCTAssertEqual(resolver.resolve([nil, nil], head: head, seconds: 0.04).notes,
+                       ["left hand is now nothing", "right hand is now nothing"])
+    }
+
+    func testAHostWithNoUseForBareHandsGetsNone() {
+        var resolver = HandResolver()
+        let hands: [HandInput?] = [.hand(TrackedHand.flat(wrist: wrist, side: .left)),
+                                   .controller(ControllerState(grip: TrackedPose(pose: wrist)))]
+        let resolved = resolver.resolve(hands, head: head, seconds: 0, bareHands: false)
+        XCTAssertNil(resolved.hands[0])
+        guard case .controller = resolved.hands[1] else { return XCTFail("the controller stays") }
+        XCTAssertEqual(resolved.notes, ["right hand is now a controller"])
+        // Once bare hand tracking is enabled, the tracked hand is included.
+        XCTAssertEqual(resolver.resolve(hands, head: head, seconds: 0.01).notes, ["left hand is now a tracked hand"])
+    }
+
+    func testGesturesCarryOverFromOneResolvingToTheNext() {
+        var resolver = HandResolver()
+        var hand = TrackedHand.flat(wrist: wrist, side: .right)
+        var resolved = resolver.resolve([nil, .hand(hand)], head: head, seconds: 0)
+        XCTAssertEqual(resolved.gestureNotes, [])
+
+        // Bringing the thumb and index finger together triggers a pinch and logs it once.
+        let indexTip = hand.joints[TrackedHand.tip(0)].position
+        hand.joints[TrackedHand.thumbTip].position = indexTip + Vec3(0, 0.01, 0)
+        resolved = resolver.resolve([nil, .hand(hand)], head: head, seconds: 0.01)
+        guard case .hand(_, let pinching, _) = resolved.hands[1] else { return XCTFail("a hand") }
+        XCTAssertTrue(pinching.pinch[0])
+        XCTAssertEqual(resolved.gestureNotes, ["right hand: index pinch"])
+        XCTAssertEqual(resolver.resolve([nil, .hand(hand)], head: head, seconds: 0.02).gestureNotes, [])
+
+        // Between the press and release thresholds, hysteresis keeps the pinch active.
+        hand.joints[TrackedHand.thumbTip].position = indexTip + Vec3(0, 0.03, 0)
+        resolved = resolver.resolve([nil, .hand(hand)], head: head, seconds: 0.03)
+        guard case .hand(_, let held, _) = resolved.hands[1] else { return XCTFail("a hand") }
+        XCTAssertTrue(held.pinch[0])
+        // If tracking is lost and resumes at that same distance, it does not start as a pinch.
+        _ = resolver.resolve([nil, nil], head: head, seconds: 0.04)
+        resolved = resolver.resolve([nil, .hand(hand)], head: head, seconds: 0.05)
+        guard case .hand(_, let fresh, _) = resolved.hands[1] else { return XCTFail("a hand") }
+        XCTAssertFalse(fresh.pinch[0])
+    }
+
+    func testThePointingRayIsSmoothedUnlessThePlatformGivesOne() {
+        var resolver = HandResolver()
+        var hand = TrackedHand.flat(wrist: wrist, side: .left)
+        func aim(_ seconds: Double) -> Pose? {
+            guard case .hand(_, _, let aim) = resolver.resolve([.hand(hand)], head: head, seconds: seconds).hands[0] else { return nil }
+            return aim
+        }
+        // The first sample returns the raw hand aim ray since the filter has no prior state.
+        let own = hand.aim(.left, head: head)
+        XCTAssertEqual(length(aim(0)!.position - own.position), 0, accuracy: 1e-6)
+
+        // When the hand jumps, the smoothed ray moves part of the way toward the new pose.
+        for joint in hand.joints.indices { hand.joints[joint].position = hand.joints[joint].position + Vec3(0.02, 0, 0) }
+        let followed = aim(0.005)!.position.x - own.position.x
+        XCTAssertGreaterThan(followed, 0)
+        XCTAssertLessThan(followed, 0.02)
+
+        // A system-provided pinch ray bypasses smoothing and is used directly.
+        let ray = Pose(position: Vec3(1, 2, 3), right: Vec3(1, 0, 0), up: Vec3(0, 1, 0), forward: Vec3(0, 0, -1))
+        hand.systemPinch = .pinching(ray: ray, pressed: true)
+        XCTAssertEqual(length(aim(0.01)!.position - ray.position), 0)
+        // Ending the system pinch resets the filter so smoothing restarts from the current hand ray.
+        hand.systemPinch = nil
+        XCTAssertEqual(length(aim(0.015)!.position - hand.aim(.left, head: head).position), 0, accuracy: 1e-6)
+    }
 }

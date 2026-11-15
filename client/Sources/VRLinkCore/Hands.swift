@@ -346,3 +346,69 @@ struct AimFilter {
         return Pose(position: position, right: right, up: right.cross(forward), forward: forward)
     }
 }
+
+/// Processed input for a single hand, ready to send over either protocol.
+/// For tracked hands, this includes recognized gestures and the smoothed aim ray.
+enum ResolvedHand {
+    case controller(ControllerState)
+    case hand(TrackedHand, gestures: HandGestures, aim: Pose)
+}
+
+/// Tracks per-hand state across pose updates, including gesture hysteresis,
+/// aim ray smoothing, and logging when input switches between controllers and hand tracking.
+struct HandResolver {
+    private var gestures: [HandGestures?] = [nil, nil]
+    private var aimFilters = [AimFilter(), AimFilter()]
+    private var holding = ["nothing", "nothing"]
+
+    struct Resolved {
+        /// Resolved left and right hand states (always two elements).
+        var hands: [ResolvedHand?]
+        /// Log messages when a hand switches between nothing, a controller, or hand tracking.
+        var notes: [String] = []
+        /// Log messages when a tracked hand's active gestures change.
+        var gestureNotes: [String] = []
+    }
+
+    /// Resolves raw hand inputs (`hands`, ordered left then right; missing entries are treated as nil).
+    /// `head` provides the reference pose for aim rays, and `seconds` is a monotonic timestamp
+    /// used by the smoothing filter. If `bareHands` is false, tracked hands without a controller
+    /// are ignored and treated as nil.
+    mutating func resolve(_ hands: [HandInput?], head: Pose, seconds: Double, bareHands: Bool = true) -> Resolved {
+        var out = Resolved(hands: [nil, nil])
+        for side in Side.allCases {
+            let index = side.rawValue
+            var now = "nothing"
+            switch index < hands.count ? hands[index] : nil {
+            case .controller(let controller):
+                now = "a controller"
+                gestures[index] = nil
+                out.hands[index] = .controller(controller)
+            case .hand(let hand) where bareHands:
+                now = "a tracked hand"
+                let read = HandGestures(hand, previous: gestures[index])
+                if read.description != (gestures[index]?.description ?? "nothing") {
+                    out.gestureNotes.append("\(side) hand: \(read.description)")
+                }
+                gestures[index] = read
+                let aim: Pose
+                if case .pinching(let ray, _) = hand.systemPinch {
+                    // System pinch uses the eye-tracked ray directly. Reset the filter so
+                    // hand-ray smoothing starts fresh when the pinch ends.
+                    aim = ray
+                    aimFilters[index] = AimFilter()
+                } else {
+                    aim = aimFilters[index].smooth(hand.aim(side, head: head), seconds: seconds)
+                }
+                out.hands[index] = .hand(hand, gestures: read, aim: aim)
+            case .hand, nil:
+                gestures[index] = nil
+            }
+            if now != holding[index] {
+                holding[index] = now
+                out.notes.append("\(side) hand is now \(now)")
+            }
+        }
+        return out
+    }
+}

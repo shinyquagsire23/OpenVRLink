@@ -110,8 +110,8 @@ public final class WiVRnSession: StreamingSession {
     private var targetHz: Float { ([profile.refreshHz] + profile.otherRefreshRates).min() ?? profile.refreshHz }
     /// Each input as last sent, and when it last changed.
     private var inputsSent: [UInt8: (value: Float, changed: Int64)] = [:]
-    private var gestures: [HandGestures?] = [nil, nil]
-    private var aimFilters = [AimFilter(), AimFilter()]
+    /// Resolves hand gestures and smooths aim rays across pose updates.
+    private var handResolver = HandResolver()
     private var holding: [UInt8] = [WiVRn.InteractionProfile.none, WiVRn.InteractionProfile.none]
     /// Set as each frame begins: the hands' joints go once a frame.
     private var jointsDue = true
@@ -435,8 +435,9 @@ public final class WiVRnSession: StreamingSession {
         // just as much.)
         let ahead = Float(prediction) / 1e9
         let head = (headProvider?() ?? last).predicted(seconds: ahead)
-        var hands = handsProvider?() ?? []
-        hands += [HandInput?](repeating: nil, count: max(0, 2 - hands.count))
+        let resolved = handResolver.resolve(handsProvider?() ?? [], head: head.pose, seconds: Double(time) / 1e9)
+        for note in resolved.notes { onLog?(note) }
+        let hands = resolved.hands
 
         var poses = [WiVRnDevicePose(WiVRn.Device.head, head)]
         var inputs: [(id: UInt8, value: Float)] = []
@@ -458,19 +459,8 @@ public final class WiVRnSession: StreamingSession {
                 grip.pose = aiming.aimPose(side)
                 poses.append(WiVRnDevicePose(WiVRn.Device.aim(side), grip))
                 inputs += controller.wivrnInputs(side)
-            case .hand(let hand):
+            case .hand(let hand, let gestures, let aim):
                 nowHolding[side.rawValue] = WiVRn.InteractionProfile.hand
-                let now = HandGestures(hand, previous: gestures[side.rawValue])
-                gestures[side.rawValue] = now
-                let aim: Pose
-                if case .pinching(let ray, _) = hand.systemPinch {
-                    // Where the eyes looked: used as it is, and the smoothed
-                    // hand ray starts afresh when the pinch ends.
-                    aim = ray
-                    aimFilters[side.rawValue] = AimFilter()
-                } else {
-                    aim = aimFilters[side.rawValue].smooth(hand.aim(side, head: head.pose), seconds: Double(time) / 1e9)
-                }
                 // The grip is the palm; the pinch is between the tips of
                 // thumb and index, facing as the aim does; the poke is the index tip.
                 let indexTip = hand.joints[TrackedHand.tip(0)]
@@ -478,17 +468,12 @@ public final class WiVRnSession: StreamingSession {
                 pinch.position = (hand.joints[TrackedHand.thumbTip].position + indexTip.position) * 0.5
                 poses += [WiVRnDevicePose(WiVRn.Device.grip(side), hand.joints[0]), WiVRnDevicePose(WiVRn.Device.aim(side), aim),
                           WiVRnDevicePose(WiVRn.Device.pinchPose(side), pinch), WiVRnDevicePose(WiVRn.Device.poke(side), indexTip)]
-                inputs += now.wivrnInputs(side)
+                inputs += gestures.wivrnInputs(side)
             case nil:
-                gestures[side.rawValue] = nil
+                break
             }
         }
-        if nowHolding != holding {
-            holding = nowHolding
-            let names = [WiVRn.InteractionProfile.none: "nothing", WiVRn.InteractionProfile.hand: "a tracked hand",
-                         WiVRn.InteractionProfile.touch: "a controller"]
-            onLog?("left hand is now \(names[nowHolding[0]] ?? "?"), right \(names[nowHolding[1]] ?? "?")")
-        }
+        holding = nowHolding
         // Where the eyes look, as a pose on the head: at the head's own
         // origin, facing the point looked at.
         if profile.tracksGaze, let point = gazeProvider?(), length(point) > 0.001 {
@@ -517,7 +502,7 @@ public final class WiVRnSession: StreamingSession {
             jointsDue = false
             for side in Side.allCases where pattern.contains(where: { $0.device == WiVRn.Device.hand(side) }) {
                 var joints: [Pose]?
-                if case .hand(let hand) = hands[side.rawValue] { joints = hand.joints }
+                if case .hand(let hand, _, _) = hands[side.rawValue] { joints = hand.joints }
                 sendStream(WiVRnPacket.handTracking(produced: time, time: time, side: side, joints: joints))
             }
         }

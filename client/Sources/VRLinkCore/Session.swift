@@ -175,14 +175,13 @@ public final class StreamSession: StreamingSession {
         powerPublished[id] = power
         values.publish(id, DeviceProfile.powerProps(power, reportsBattery: true), force: true)
     }
-    private var gestures: [HandGestures?] = [nil, nil]
+    /// Resolves hand gestures and smooths aim rays across pose updates.
+    private var handResolver = HandResolver()
     /// Each wrist as it was last sent, for measuring how it moves.
     private var wrists: [(pose: TrackedPose, time: Int32)?] = [nil, nil]
     private var hostVersion: UInt32 = 0
     static let knownFECMode: UInt8 = 0x20
     private var warnedAboutFEC = false
-    /// Smoothing for each hand's pointing ray.
-    private var aimFilters = [AimFilter(), AimFilter()]
     private var hapticPulses = 0
     /// The longest wait between two pose datagrams since the last report, and when the last one went.
     private var longestPoseGap: Double = 0
@@ -340,7 +339,7 @@ public final class StreamSession: StreamingSession {
     }
 
     /// The pose message, and behind it one hand message per tracked bare hand.
-    private func poseMessages(subIndex: Int, head: TrackedPose, hands: [HandInput?]) -> (pose: SVLElement, hands: [SVLElement]) {
+    private func poseMessages(subIndex: Int, head: TrackedPose, hands: [ResolvedHand?]) -> (pose: SVLElement, hands: [SVLElement]) {
         let time = now()
         var inputBlocks = Bytes(), poses = Bytes(), handMessages: [SVLElement] = []
         for side in Side.allCases {
@@ -348,26 +347,12 @@ public final class StreamSession: StreamingSession {
             case .controller(let controller):
                 inputBlocks.append(contentsOf: controller.inputBlock())
                 poses.append(contentsOf: packedPose(controller.gripForHost, offset: ControllerState.gripOffset(side, senseModel: profile.senseControllerModels)))
-            case .hand(let hand):
-                let now = HandGestures(hand, previous: gestures[side.rawValue])
-                if now.description != (gestures[side.rawValue]?.description ?? "nothing") {
-                    onLog?("\(side) hand: \(now.description)")
-                }
-                gestures[side.rawValue] = now
+            case .hand(let hand, let gestures, let aim):
                 let offset = TrackedHand.wristOffset(side)
-                inputBlocks.append(contentsOf: now.inputBlock())
+                inputBlocks.append(contentsOf: gestures.inputBlock())
                 poses.append(contentsOf: packedPose(trackedWrist(hand, side),
                                                     offset: [offset.position.x, offset.position.y, offset.position.z] + offset.orientation))
-                let aim: Pose
-                if case .pinching(let ray, _) = hand.systemPinch {
-                    // Where the eyes looked: used as it is, and the smoothed
-                    // hand ray starts afresh when the pinch ends.
-                    aim = ray
-                    aimFilters[side.rawValue] = AimFilter()
-                } else {
-                    aim = aimFilters[side.rawValue].smooth(hand.aim(side, head: head.pose), seconds: Double(time) / 1_000_000)
-                }
-                handMessages.append(hand.message(side, gestures: now, aim: aim))
+                handMessages.append(hand.message(side, gestures: gestures, aim: aim))
             case nil:
                 inputBlocks.append(zeros: InputBlock.size)
                 poses.append(contentsOf: packedPose(nil))
@@ -642,22 +627,22 @@ public final class StreamSession: StreamingSession {
                     frameDisplayTime = target
                 }
                 let head = headProvider?() ?? lastHead
-                var hands = handsProvider?() ?? []
-                hands += [HandInput?](repeating: nil, count: max(0, 2 - hands.count))
+                // Only send tracked hands once the host reports a protocol version that supports them.
+                let resolved = handResolver.resolve(handsProvider?() ?? [], head: head.pose, seconds: Double(now()) / 1_000_000,
+                                                    bareHands: hostVersion >= StreamSession.firstVersionWithHands)
+                for note in resolved.notes + resolved.gestureNotes { onLog?(note) }
+                let hands = resolved.hands
                 for side in Side.allCases {
                     var isController: Bool?
                     switch hands[side.rawValue] {
                     case .controller: isController = true
-                    case .hand:
-                        // An older host, or one whose version is not known yet, gets no hand.
-                        if hostVersion >= StreamSession.firstVersionWithHands { isController = false } else { hands[side.rawValue] = nil }
+                    case .hand: isController = false
                     case nil: break
                     }
                     if let isController, handIsController[side] != isController {
                         // This hand is something new: tell the host what.
                         handIsController[side] = isController
                         powerPublished[DeviceProfile.ValueID.powerController(side)] = nil
-                        onLog?("\(side) hand is now a \(isController ? "controller" : "tracked hand")")
                         for (id, value) in profile.handValues(side, isController: isController) {
                             values.publish(id, value, force: true)
                         }
