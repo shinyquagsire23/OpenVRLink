@@ -102,7 +102,7 @@ public final class RealityKitDisplay {
         // so downsampling and stereo matching run on Metal.
         let shrink = StereoShrink(device: device)
         self.shrink = shrink
-        depth = DepthEstimator(measure: shrink.map { shrink in { shrink.measure($0, done: $1) } } ?? { $1(nil) })
+        depth = DepthEstimator(measure: shrink.map { shrink in { shrink.measure($0, interests: $1, done: $2) } } ?? { $2(nil) })
     }
 
     /// Populates the RealityKit scene and attaches the Persona camera anchor entity.
@@ -414,7 +414,8 @@ public final class RealityKitDisplay {
             return nil
         }
         shrink?.savesPictures = settings.current.showDepth
-        depth.offer(frame)
+        // Sample depth densely around the hands or controllers and the host's foveal inset.
+        depth.offer(frame, interests: DepthSampling.interests(layout: frame.layout, hands: inputs.handPositions()))
         if depthNoted == 0 { depthNoted = seconds }
         if seconds - depthNoted > 5 {
             depthNoted = seconds
@@ -427,7 +428,8 @@ public final class RealityKitDisplay {
                 Log.note("depth: no depth estimate available yet")
             }
         }
-        return depth.field
+        // Reproject once to this frame's rendering pose for both eyes and the debug overlay.
+        return depth.field?.fitted(to: frame.layout)
     }
 
     /// Updates the Persona camera anchor to stay one meter in front of the user's head.

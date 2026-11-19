@@ -30,7 +30,7 @@ public final class StereoShrink {
     private let width: Int
     /// Left and right downsampled luma textures, reallocated when frame height changes.
     private var targets: [MTLTexture] = []
-    /// Output texture storing `(nearness, trust, 0, 0)` per cell, stacked vertically across pyramid levels.
+    /// Stores `(nearness, trust, 0, 0)` for each matched cell, with one row per pyramid level.
     private var answers: MTLTexture?
     private var reportedFailure = false
 
@@ -39,8 +39,14 @@ public final class StereoShrink {
     private var lastSaved: UInt64 = 0, savedCount = 0
     private static let secondsBetweenSaves = 4.0
 
-    /// Multi-scale matching configuration (`StereoMatcher.levels`) shared with the GPU kernel.
+    /// Multi-scale matching configuration shared with `matchCells`. When no custom
+    /// matcher is passed to `init`, this doubles the grid resolution per axis of
+    /// `StereoMatcher.fitted(toWidth:)` and enables `StereoMatcher.sampled` so only
+    /// a subset of cells is matched each frame.
     public let matcher: StereoMatcher
+
+    /// Caps how many cells are matched per frame and sets the texture width of `answers`.
+    private static let mostCells = 2048
 
     /// Maximum pixel disparity supported by `matchCells` (`MOST_SHIFTS` in `Shrink.metal`).
     private static let mostShifts = 160
@@ -49,7 +55,15 @@ public final class StereoShrink {
     public init?(device: MTLDevice, width: Int = 768, matcher: StereoMatcher? = nil) {
         self.device = device
         self.width = width
-        self.matcher = matcher ?? StereoMatcher.fitted(toWidth: width)
+        if let matcher {
+            self.matcher = matcher
+        } else {
+            var fine = StereoMatcher.fitted(toWidth: width)
+            fine.columns *= 2
+            fine.rows *= 2
+            fine.sampled = true
+            self.matcher = fine
+        }
         guard let queue = device.makeCommandQueue() else { return nil }
         self.queue = queue
         do {
@@ -97,10 +111,10 @@ public final class StereoShrink {
             descriptor.storageMode = .shared
             targets = (0..<2).compactMap { _ in device.makeTexture(descriptor: descriptor) }
         }
-        // Stack each pyramid level's `columns x rows` output grid vertically in one texture.
-        if answers?.width != matcher.columns || answers?.height != matcher.rows * matcher.levels.count {
-            let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: matcher.columns,
-                                                                      height: matcher.rows * matcher.levels.count, mipmapped: false)
+        // Allocate `answers` with one column per matched cell and one row per pyramid level.
+        if answers == nil {
+            let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: StereoShrink.mostCells,
+                                                                      height: matcher.levels.count, mipmapped: false)
             descriptor.usage = [.shaderWrite, .shaderRead]
             descriptor.storageMode = .shared
             answers = device.makeTexture(descriptor: descriptor)
@@ -174,8 +188,13 @@ public final class StereoShrink {
     }
 
     /// Generates mipmaps for `targets` and dispatches `matchCells` for each pyramid level in `matcher.levels`.
-    private func compare(covered: [(x: Range<Int>, y: Range<Int>)], pixelsPerNearness: Float, into commands: MTLCommandBuffer) -> Bool {
-        guard let answers else { return false }
+    /// Only the row-major cell indices in `cells` are matched.
+    private func compare(cells: [Int], covered: [(x: Range<Int>, y: Range<Int>)], pixelsPerNearness: Float,
+                         into commands: MTLCommandBuffer) -> Bool {
+        let listed = cells.prefix(StereoShrink.mostCells).map { UInt32($0 % matcher.columns) | UInt32($0 / matcher.columns) << 16 }
+        guard let answers, !listed.isEmpty,
+              let list = device.makeBuffer(bytes: listed, length: listed.count * MemoryLayout<UInt32>.size, options: .storageModeShared)
+        else { return false }
         if targets[0].mipmapLevelCount > 1 {
             guard let blit = commands.makeBlitCommandEncoder() else { return false }
             targets.forEach { blit.generateMipmaps(for: $0) }
@@ -186,6 +205,7 @@ public final class StereoShrink {
         encoder.setTexture(targets[0], index: 0)
         encoder.setTexture(targets[1], index: 1)
         encoder.setTexture(answers, index: 2)
+        encoder.setBuffer(list, offset: 0, index: 1)
         for (index, level) in matcher.levels.enumerated() {
             // Shrink valid pixel bounds for each 2x mipmap step, matching `StereoPair.halved()`.
             var parts = covered
@@ -203,37 +223,49 @@ public final class StereoShrink {
                                   Int((matcher.nearest * perNearness).rounded(.up))))
             // Pack `MatchSettings` (`Shrink.metal`) as floats.
             let settings: [Float] = [
-                Float(level.halvings), Float(index * matcher.rows),
+                Float(level.halvings), Float(index), Float(listed.count),
                 Float(matcher.columns), Float(matcher.rows), Float(level.reach), Float(matcher.stride), Float(most),
                 Float(parts[0].x.lowerBound), Float(parts[0].x.upperBound), Float(parts[0].y.lowerBound), Float(parts[0].y.upperBound),
                 Float(parts[1].x.lowerBound), Float(parts[1].x.upperBound), Float(parts[1].y.lowerBound), Float(parts[1].y.upperBound),
                 perNearness, level.grain, matcher.distinct.least, matcher.distinct.full,
             ]
             encoder.setBytes(settings, length: settings.count * MemoryLayout<Float>.size, index: 0)
-            encoder.dispatchThreadgroups(MTLSize(width: (matcher.columns + 3) / 4, height: (matcher.rows + 3) / 4, depth: 1),
-                                         threadsPerThreadgroup: MTLSize(width: 4, height: 4, depth: 1))
+            encoder.dispatchThreadgroups(MTLSize(width: (listed.count + 15) / 16, height: 1, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: 16, height: 1, depth: 1))
         }
         encoder.endEncoding()
         return true
     }
 
-    /// Reads back the multi-scale output texture after GPU completion and selects the finest confident reading per cell.
-    private func readings() -> [StereoMatcher.Reading] {
+    /// Reads back the multi-scale output texture after GPU completion and selects the finest
+    /// confident reading for each index in `cells`, leaving unmatched cells at zero confidence.
+    private func readings(for cells: [Int]) -> [StereoMatcher.Reading] {
         guard let answers else { return [] }
-        let cells = matcher.columns * matcher.rows, levels = matcher.levels.count
-        var values = [Float](repeating: 0, count: cells * levels * 4)
-        answers.getBytes(&values, bytesPerRow: matcher.columns * 4 * MemoryLayout<Float>.size,
-                         from: MTLRegionMake2D(0, 0, matcher.columns, matcher.rows * levels), mipmapLevel: 0)
-        let byLevel = (0..<levels).map { level in
-            (0..<cells).map { StereoMatcher.Reading(nearness: values[(level * cells + $0) * 4], trust: values[(level * cells + $0) * 4 + 1]) }
+        let count = min(cells.count, StereoShrink.mostCells), levels = matcher.levels.count
+        var values = [Float](repeating: 0, count: StereoShrink.mostCells * levels * 4)
+        answers.getBytes(&values, bytesPerRow: StereoShrink.mostCells * 4 * MemoryLayout<Float>.size,
+                         from: MTLRegionMake2D(0, 0, StereoShrink.mostCells, levels), mipmapLevel: 0)
+        let none = StereoMatcher.Reading(nearness: 0, trust: 0)
+        let byLevel = (0..<levels).map { level -> [StereoMatcher.Reading] in
+            var all = [StereoMatcher.Reading](repeating: none, count: matcher.columns * matcher.rows)
+            for item in 0..<count where all.indices.contains(cells[item]) {
+                let at = (level * StereoShrink.mostCells + item) * 4
+                all[cells[item]] = StereoMatcher.Reading(nearness: values[at], trust: values[at + 1])
+            }
+            return all
         }
         return StereoMatcher.finest(byLevel, worth: matcher.levels.map(\.worth))
     }
 
+    /// Returns all grid cell indices in row-major order when `matcher.sampled` is `false`.
+    private var everyCell: [Int] { Array(0..<matcher.columns * matcher.rows) }
+
     /// Downsamples and matches `frame` on the GPU, invoking `done` from Metal's
     /// command-buffer completion handler with the resulting `StereoMeasure`, or
     /// calling `done(nil)` immediately if the frame layout cannot be stereo-matched.
-    public func measure(_ frame: DecodedFrame, done: @escaping (StereoMeasure?) -> Void) {
+    /// When `matcher.sampled` is enabled, `interests` specifies the regions to match at full grid density.
+    public func measure(_ frame: DecodedFrame, interests: [DepthSampling.Interest] = [],
+                        done: @escaping (StereoMeasure?) -> Void) {
         guard let plan = StereoPlan(layout: frame.layout, width: width) else {
             fail("eye views are not parallel and horizontally separated; skipping stereo depth")
             return done(nil)
@@ -242,8 +274,9 @@ public final class StereoShrink {
             fail("failed to allocate downsampled textures or command buffer")
             return done(nil)
         }
+        let cells = matcher.cells(window: plan.window, interests: interests) ?? everyCell
         guard let kept = drawEyes(of: frame, plan: plan, into: commands),
-              compare(covered: plan.covered, pixelsPerNearness: plan.apart * plan.perTangent, into: commands)
+              compare(cells: cells, covered: plan.covered, pixelsPerNearness: plan.apart * plan.perTangent, into: commands)
         else { return done(nil) }
         let now = DispatchTime.now().uptimeNanoseconds
         let saving = savesPictures && Double(now &- lastSaved) / 1e9 >= StereoShrink.secondsBetweenSaves
@@ -264,7 +297,7 @@ public final class StereoShrink {
                 }
                 DispatchQueue.global(qos: .utility).async { plan.pair(left: read[0], right: read[1]).save(number: number) }
             }
-            done(StereoMeasure(readings: readings(), columns: matcher.columns, rows: matcher.rows, window: plan.window,
+            done(StereoMeasure(readings: readings(for: cells), columns: matcher.columns, rows: matcher.rows, window: plan.window,
                                apart: plan.apart, pose: plan.pose))
         }
         commands.commit()
@@ -293,7 +326,8 @@ public final class StereoShrink {
     /// Uploads an existing `StereoPair` and runs `matchCells` on the GPU to verify
     /// parity with `StereoMatcher.measureLevels`. Requires `width`-wide images
     /// whose height is a multiple of 4.
-    public func match(_ pair: StereoPair, done: @escaping ([StereoMatcher.Reading]?) -> Void) {
+    public func match(_ pair: StereoPair, interests: [DepthSampling.Interest] = [],
+                      done: @escaping ([StereoMatcher.Reading]?) -> Void) {
         guard pair.left.width == width, pair.right.width == width, pair.left.height == pair.right.height,
               ready(height: pair.left.height), let commands = queue.makeCommandBuffer()
         else { return done(nil) }
@@ -301,10 +335,12 @@ public final class StereoShrink {
             target.replace(region: MTLRegionMake2D(0, 0, width, picture.height), mipmapLevel: 0, withBytes: picture.pixels,
                            bytesPerRow: width)
         }
-        guard compare(covered: [pair.leftCovered, pair.rightCovered], pixelsPerNearness: pair.pixelsPerNearness, into: commands)
+        let cells = matcher.cells(window: pair.window, interests: interests) ?? everyCell
+        guard compare(cells: cells, covered: [pair.leftCovered, pair.rightCovered], pixelsPerNearness: pair.pixelsPerNearness,
+                      into: commands)
         else { return done(nil) }
         commands.addCompletedHandler { [self] finished in
-            done(finished.status == .completed ? readings() : nil)
+            done(finished.status == .completed ? readings(for: cells) : nil)
         }
         commands.commit()
     }

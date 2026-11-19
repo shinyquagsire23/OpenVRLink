@@ -92,7 +92,7 @@ public final class CompositorDisplay {
         // so downsampling and stereo matching run on Metal.
         let shrink = StereoShrink(device: layerRenderer.device)
         self.shrink = shrink
-        depth = DepthEstimator(measure: shrink.map { shrink in { shrink.measure($0, done: $1) } } ?? { $1(nil) })
+        depth = DepthEstimator(measure: shrink.map { shrink in { shrink.measure($0, interests: $1, done: $2) } } ?? { $2(nil) })
         renderer.chromaKey = settings.current.chromaKeying(inGame: false)
         // Forward system spatial pinch events (including their gaze-targeted rays) to PinchRays.
         layerRenderer.onSpatialEvent = { [pinches = inputs.pinches] in pinches.handle($0) }
@@ -343,7 +343,10 @@ public final class CompositorDisplay {
             return
         }
         shrink?.savesPictures = settings.current.showDepth
-        if let picked, picked.isNew { depth.offer(picked.frame) }
+        if let picked, picked.isNew {
+            // Sample depth densely around the hands or controllers and the host's foveal inset.
+            depth.offer(picked.frame, interests: DepthSampling.interests(layout: picked.frame.layout, hands: inputs.handPositions()))
+        }
         if depthNoted == 0 { depthNoted = seconds }
         guard seconds - depthNoted > 5 else { return }
         depthNoted = seconds
@@ -384,7 +387,8 @@ public final class CompositorDisplay {
         // passthrough regardless of color, so we draw an explicit black backdrop
         // quad that writes depth behind the video quads.
         let roomBehind = frame == nil || profile == nil || renderer.chromaKey != nil || frame?.layout.transparent == true
-        let field = settings.current.depthFromPicture ? depth.field : nil
+        // Reproject once to this frame's rendering pose for both eyes and the debug overlay.
+        let field = settings.current.depthFromPicture ? frame.flatMap { shown in depth.field?.fitted(to: shown.layout) } : nil
         let shownDepth = settings.current.showDepth ? field : nil
         let eyes = drawQuads(into: drawable, commands: commands, renderer: renderer, frame: frame,
                              originFromDevice: lastOriginFromDevice,

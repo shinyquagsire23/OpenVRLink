@@ -39,11 +39,12 @@ fragment float4 shrinkFragment(Piece in [[stage_in]], texture2d<float> picture [
 }
 
 // GPU implementation of `StereoMatcher.measure` (`VRLinkCore/StereoDepth.swift`),
-// dispatching one thread per `(column, row)` grid cell. Keep matching math in sync
+// dispatching one thread per listed grid cell. Keep matching math in sync
 // with `StereoMatcher`. All fields are passed as `float` from `StereoShrink.swift`.
 struct MatchSettings {
-    // Mipmap `level` to sample (`halvings`) and vertical row offset (`firstRow`) in `found`.
-    float level, firstRow;
+    // `level` is the mipmap level to sample (`halvings`), `answerRow` is the output row in
+    // `found` for this level, and `count` is the number of packed cell indices in `cells`.
+    float level, answerRow, count;
     float columns, rows, reach, stride, most;
     float leftFirstX, leftEndX, leftFirstY, leftEndY;
     float rightFirstX, rightEndX, rightFirstY, rightEndY;
@@ -57,11 +58,15 @@ kernel void matchCells(texture2d<float, access::read> left [[texture(0)]],
                        texture2d<float, access::read> right [[texture(1)]],
                        texture2d<float, access::write> found [[texture(2)]],
                        constant MatchSettings &s [[buffer(0)]],
-                       uint2 cell [[thread_position_in_grid]]) {
+                       const device uint *cells [[buffer(1)]],
+                       uint2 item [[thread_position_in_grid]]) {
+    // Each thread unpacks one `(column, row)` pair (`column | row << 16`) from `cells` and writes its reading to `found` at `item.x`.
+    if (item.x >= uint(s.count)) { return; }
     int columns = int(s.columns), rows = int(s.rows);
+    uint2 cell = uint2(cells[item.x] & 0xFFFF, cells[item.x] >> 16);
     if (int(cell.x) >= columns || int(cell.y) >= rows) { return; }
     uint level = uint(s.level);
-    uint2 answer = uint2(cell.x, cell.y + uint(s.firstRow));
+    uint2 answer = uint2(item.x, uint(s.answerRow));
     // Initialize output `(nearness, trust)` to zero before testing disparities.
     found.write(float4(0.0), answer);
     int width = int(left.get_width(level)), height = int(left.get_height(level));

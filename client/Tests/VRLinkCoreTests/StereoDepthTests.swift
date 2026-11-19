@@ -265,6 +265,94 @@ final class StereoDepthTests: XCTestCase {
         XCTAssertEqual(about?["number"] as? Int, 11)
     }
 
+    func testOnlyALatticeAndThePlacesOfInterestAreSampled() {
+        let window = Frustum(left: -1.2, right: 1.2, down: -1, up: 1), columns = 56, rows = 48
+        let lattice = DepthSampling.cells(columns: columns, rows: rows, window: window, interests: [])
+        // Every other cell per axis is a quarter of the grid; thinning the ceiling and far periphery removes more.
+        XCTAssertLessThan(lattice.count, columns * rows / 4)
+        XCTAssertGreaterThan(lattice.count, columns * rows / 8)
+        XCTAssertTrue(lattice.allSatisfy { ($0 / columns) % 2 == 0 && ($0 % columns) % 2 == 0 })
+        XCTAssertEqual(Set(lattice).count, lattice.count)
+        func kept(_ across: Float, _ up: Float) -> Int {
+            lattice.filter { index in
+                let x = window.left + (Float(index % columns) + 0.5) / Float(columns) * 2.4
+                let y = window.up - (Float(index / columns) + 0.5) / Float(rows) * 2
+                return abs(x - across) < 0.15 && abs(y - up) < 0.15
+            }.count
+        }
+        XCTAssertGreaterThan(kept(0, -0.3), kept(0, 0.8), "ceiling should be sampled more sparsely than the center")
+        XCTAssertGreaterThan(kept(0, -0.3), kept(1.0, -0.3), "far periphery should be sampled more sparsely than the center")
+
+        // Add a hand region in the lower right and check that every cell inside its radius is sampled.
+        let hand = DepthSampling.Interest(across: 0.4, up: -0.5, radius: 0.2)
+        let withHand = DepthSampling.cells(columns: columns, rows: rows, window: window, interests: [hand])
+        XCTAssertEqual(Array(withHand.prefix(lattice.count)), lattice, "base lattice cells should come first")
+        XCTAssertEqual(Set(withHand).count, withHand.count)
+        for index in 0..<columns * rows {
+            let x = window.left + (Float(index % columns) + 0.5) / Float(columns) * 2.4
+            let y = window.up - (Float(index / columns) + 0.5) / Float(rows) * 2
+            if hypot(x - 0.4, y + 0.5) <= 0.2 { XCTAssertTrue(withHand.contains(index), "cell \(index)") }
+            if hypot(x - 0.4, y + 0.5) > 0.3 { XCTAssertEqual(withHand.contains(index), lattice.contains(index)) }
+        }
+        // Cap the output at `most` cells, and ignore regions outside the view frustum.
+        XCTAssertEqual(DepthSampling.cells(columns: columns, rows: rows, window: window, interests: [hand], most: lattice.count + 5).count,
+                       lattice.count + 5)
+        let outside = DepthSampling.Interest(across: 5, up: 5, radius: 0.2)
+        XCTAssertEqual(DepthSampling.cells(columns: columns, rows: rows, window: window, interests: [outside]), lattice)
+    }
+
+    func testPlacesOfInterestComeFromTheHandsAndTheSharpInset() {
+        func eye(_ aside: Float) -> Pose {
+            Pose(position: Vec3(aside, 1.6, 0), right: Vec3(1, 0, 0), up: Vec3(0, 1, 0), forward: Vec3(0, 0, -1))
+        }
+        let whole = Frustum(left: -1, right: 1, down: -1, up: 1)
+        func layout(inset: Frustum?) -> FrameLayout {
+            let tiles = [FrameLayout.Tile(frustum: whole)] + (inset.map { [FrameLayout.Tile(frustum: $0, feather: 0.06)] } ?? [])
+            return FrameLayout(views: [FrameLayout.View(eye: eye(-0.032), tiles: tiles), FrameLayout.View(eye: eye(0.032), tiles: tiles)],
+                               eyePixels: (10, 10))
+        }
+        // Place one hand 0.5 m ahead (20 cm right, 30 cm down) and a second hand behind the head, which should be ignored.
+        let hands = [Vec3(0.2, 1.3, -0.5), Vec3(0, 1.6, 0.4)]
+        let found = DepthSampling.interests(layout: layout(inset: Frustum(left: 0.1, right: 0.5, down: -0.4, up: 0)), hands: hands)
+        XCTAssertEqual(found.count, 2)
+        XCTAssertEqual(found[0].across, 0.4, accuracy: 1e-4)
+        XCTAssertEqual(found[0].up, -0.6, accuracy: 1e-4)
+        XCTAssertEqual(found[0].radius, DepthSampling.handReach / 0.5, accuracy: 1e-4)
+        // The second interest region should sit at the center of the foveal inset.
+        XCTAssertEqual(found[1], DepthSampling.Interest(across: 0.3, up: -0.2, radius: DepthSampling.sharpRadius))
+        // Fall back to straight ahead when the layout has no foveal inset.
+        XCTAssertEqual(DepthSampling.interests(layout: layout(inset: nil), hands: []),
+                       [DepthSampling.Interest(across: 0, up: 0, radius: DepthSampling.sharpRadius)])
+        // Clamp the tangent radius for distant and very close hands.
+        XCTAssertEqual(DepthSampling.Interest(around: Vec3(0, 1.6, -5), reach: 0.17, seenFrom: eye(0))?.radius, 0.1)
+        XCTAssertEqual(DepthSampling.Interest(around: Vec3(0, 1.6, -0.2), reach: 0.17, seenFrom: eye(0))?.radius, 0.45)
+    }
+
+    func testAHandInFrontOfTheFloorKeepsItsOwnDepthAndASharpEdge() {
+        // Simulate a 56x48 grid with a floor at 0.6 /m on the base lattice and a dense block of
+        // hand readings at 2 /m in the lower right.
+        var smoother = DepthSmoother()
+        let window = Frustum(left: -1, right: 1, down: -1, up: 1), columns = 56, rows = 48
+        let hand = (columns: 30..<38, rows: 30..<38)
+        let readings = (0..<columns * rows).map { index -> StereoMatcher.Reading in
+            let row = index / columns, column = index % columns
+            if hand.columns.contains(column), hand.rows.contains(row) { return .init(nearness: 2, trust: 1) }
+            // Include dense floor readings immediately around the hand to match a circular region of interest.
+            let nearHand = (26..<42).contains(column) && (26..<42).contains(row)
+            return nearHand || (row % 2 == 0 && column % 2 == 0) ? .init(nearness: 0.6, trust: 1) : .init(nearness: 0, trust: 0)
+        }
+        var field = smoother.update(readings, columns: columns, rows: rows, window: window, apart: 0.064)
+        for _ in 0..<8 { field = smoother.update(readings, columns: columns, rows: rows, window: window, apart: 0.064) }
+        // Both the hand and the adjacent floor should keep their own depth with a single-cell transition at the boundary.
+        XCTAssertEqual(field.nearness[33 * columns + 33], 2, accuracy: 0.05)
+        XCTAssertEqual(field.nearness[33 * columns + 37], 2, accuracy: 0.05, "last column of the hand")
+        XCTAssertEqual(field.nearness[33 * columns + 38], 0.6, accuracy: 0.05, "first floor column beside the hand")
+        XCTAssertEqual(field.nearness[29 * columns + 33], 0.6, accuracy: 0.05, "first floor row above the hand")
+        // Away from the hand, the floor is filled between lattice points without being pulled toward the hand.
+        XCTAssertEqual(field.nearness[33 * columns + 45], 0.6, accuracy: 0.05)
+        XCTAssertEqual(field.nearness[11 * columns + 11], 0.6, accuracy: 0.05)
+    }
+
     func testEachCellTakesTheFinestSizeThatIsBelieved() {
         let fine: [StereoMatcher.Reading] = [.init(nearness: 1, trust: 0.9), .init(nearness: 0, trust: 0), .init(nearness: 0, trust: 0)]
         let half: [StereoMatcher.Reading] = [.init(nearness: 1.1, trust: 1), .init(nearness: 2, trust: 1), .init(nearness: 0, trust: 0)]

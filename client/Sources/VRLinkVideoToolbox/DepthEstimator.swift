@@ -31,7 +31,7 @@ public final class DepthEstimator {
     }
 
     /// Asynchronous frame-measurement hook (such as `StereoShrink.measure`); may complete on any queue.
-    public typealias Measure = (DecodedFrame, @escaping (StereoMeasure?) -> Void) -> Void
+    public typealias Measure = (DecodedFrame, [DepthSampling.Interest], @escaping (StereoMeasure?) -> Void) -> Void
 
     private let width: Int
     private let measure: Measure?
@@ -87,8 +87,10 @@ public final class DepthEstimator {
         work.async { [self] in smoother = DepthSmoother() }
     }
 
-    /// Submits `frame` for background depth estimation if idle and past the rate-limit interval; returns immediately.
-    public func offer(_ frame: DecodedFrame) {
+    /// Submits `frame` for background depth estimation when the estimator is idle and past the
+    /// rate-limit interval, then returns immediately. When sparse sampling is enabled, `interests`
+    /// specifies the regions to match at full grid density.
+    public func offer(_ frame: DecodedFrame, interests: [DepthSampling.Interest] = []) {
         let now = DispatchTime.now().uptimeNanoseconds
         lock.lock()
         // Allow a 10% timing slack so a steady 90 Hz stream consistently accepts every third frame rather than slipping to every fourth.
@@ -103,10 +105,11 @@ public final class DepthEstimator {
         lock.unlock()
         let offered = DispatchTime.now().uptimeNanoseconds
         if let measure {
-            measure(frame) { [self] measured in work.async { [self] in finish({ measured }, asked: asked, offered: offered) } }
+            measure(frame, interests) { [self] measured in work.async { [self] in finish({ measured }, asked: asked, offered: offered) } }
         } else {
             work.async { [self] in
-                finish({ DepthEstimator.pair(from: frame, width: width).map(matcher.measured) }, asked: asked, offered: offered)
+                finish({ DepthEstimator.pair(from: frame, width: width).map { matcher.measured($0, interests: interests) } },
+                       asked: asked, offered: offered)
             }
         }
     }

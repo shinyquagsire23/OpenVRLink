@@ -211,8 +211,9 @@ public enum Composition {
         return quads
     }
 
-    /// Target maximum tangent span per grid cell (~3 degrees) and upper bound on subdivisions per axis.
-    static let cell: Float = 0.055, mostCells = 48
+    /// `cell` sets the maximum tangent span per warped mesh cell (~2.3 degrees, roughly
+    /// matching the finest depth grid), and `mostCells` caps subdivisions per axis.
+    static let cell: Float = 0.04, mostCells = 64
 
     /// Builds world-space quads for `eye` ordered back-to-front. When `depth` is
     /// `nil`, quads are flat planes `distance` meters in front of the rendering

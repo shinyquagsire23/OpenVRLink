@@ -58,19 +58,41 @@ public final class StreamInputs {
         return profile
     }
 
-    /// Returns the current input state for each hand: a tracked controller when
-    /// one is held on that side, or optical hand tracking otherwise.
+    private let handsLock = NSLock()
+    private var lastHandPositions: [Vec3] = []
+
+    /// Returns the world-space hand or controller positions recorded by the most recent
+    /// `handsNow()` call so other callers can read them without polling the trackers again.
+    public func handPositions() -> [Vec3] {
+        handsLock.lock()
+        defer { handsLock.unlock() }
+        return lastHandPositions
+    }
+
+    /// Returns the current input state for each side, using a tracked controller when
+    /// one is held and falling back to optical hand tracking otherwise.
     public func handsNow() -> [HandInput?] {
         let chosen = settings.current
         let held = controllers.states(clackSwitching: chosen.clackSwitchesToHands, head: head.latestHead())
         let bare = hands.hands()
-        return Side.allCases.map { side in
+        let hands = Side.allCases.map { side -> HandInput? in
             if let controller = held[side.rawValue] { return .controller(controller) }
             guard var hand = bare[side.rawValue] else { return nil }
             // Override wrist/arm aim rays with visionOS's gaze-targeted spatial pinch rays when enabled.
             if chosen.gazePinchRays { hand.systemPinch = pinches.pinch(side) }
             return .hand(hand)
         }
+        let positions = hands.compactMap { hand -> Vec3? in
+            switch hand {
+            case .controller(let controller): return controller.grip.pose.position
+            case .hand(let tracked): return tracked.joints.first?.position
+            case nil: return nil
+            }
+        }
+        handsLock.lock()
+        lastHandPositions = positions
+        handsLock.unlock()
+        return hands
     }
 }
 #endif

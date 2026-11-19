@@ -217,14 +217,21 @@ final class StereoShrinkTests: XCTestCase {
 
         let finished = expectation(description: "compared")
         var onGPU: [StereoMatcher.Reading]?
-        shrink.match(pair) { readings in
+        // Sample the default lattice plus a dense region of interest in the upper-left wall.
+        let interests = [DepthSampling.Interest(across: -0.7, up: 0.5, radius: 0.2)]
+        shrink.match(pair, interests: interests) { readings in
             onGPU = readings
             finished.fulfill()
         }
         wait(for: [finished], timeout: 20)
-        let gpu = try XCTUnwrap(onGPU), cpu = shrink.matcher.measureLevels(pair)
-        XCTAssertEqual(shrink.matcher.levels.count, 2, "512 px width uses full- and half-resolution pyramid levels")
+        let matcher = shrink.matcher
+        XCTAssertTrue(matcher.sampled)
+        XCTAssertEqual(matcher.columns, 56, "StereoShrink doubles StereoMatcher's default grid resolution per axis")
+        let cells = try XCTUnwrap(matcher.cells(window: window, interests: interests))
+        let gpu = try XCTUnwrap(onGPU), cpu = matcher.measureLevels(pair, cells: cells)
+        XCTAssertEqual(matcher.levels.count, 2, "512 px width uses full- and half-resolution pyramid levels")
         XCTAssertEqual(gpu.count, cpu.count)
+        XCTAssertEqual(gpu.count, matcher.columns * matcher.rows)
         // GPU mipmap filtering can differ by 1 LSB from CPU box filtering, flipping thresholded
         // cells right at the confidence cutoff; interior confident cells must agree.
         var believed = 0, differing = 0
@@ -237,17 +244,30 @@ final class StereoShrinkTests: XCTestCase {
             believed += 1
             XCTAssertEqual(a.nearness, b.nearness, accuracy: 0.03, "cell \(index)")
         }
-        XCTAssertGreaterThan(believed, gpu.count * 6 / 10)
-        XCTAssertLessThan(differing, gpu.count / 25)
-        // Verify panel and wall depths in both high-contrast and low-contrast regions.
+        XCTAssertGreaterThan(believed, cells.count * 6 / 10)
+        XCTAssertLessThan(differing, cells.count / 25)
+        // Cells outside the sampled set are left unmatched.
+        let sampled = Set(cells)
+        XCTAssertTrue(gpu.indices.allSatisfy { sampled.contains($0) || gpu[$0].trust == 0 })
+        // Every cell inside the region of interest is matched at full grid density.
+        let dense = (0..<matcher.columns * matcher.rows).filter { index in
+            let across = -1 + (Float(index % matcher.columns) + 0.5) / Float(matcher.columns) * 2
+            let up = 0.8 - (Float(index / matcher.columns) + 0.5) / Float(matcher.rows) * 1.6
+            return hypot(across + 0.7, up - 0.5) < 0.15
+        }
+        XCTAssertGreaterThan(dense.count, 40)
+        XCTAssertGreaterThan(dense.filter { gpu[$0].trust > 0 }.count, dense.count * 8 / 10)
+        // Verify panel and wall depths in both high-contrast and low-contrast regions, reading the
+        // lattice cell (even column and row) at or just before each direction.
         func reading(across: Float, up: Float) -> StereoMatcher.Reading {
-            let column = Int((across + 1) / 2 * Float(shrink.matcher.columns)), row = Int((0.8 - up) / 1.6 * Float(shrink.matcher.rows))
-            return gpu[row * shrink.matcher.columns + column]
+            let column = Int((across + 1) / 2 * Float(matcher.columns)) / 2 * 2, row = Int((0.8 - up) / 1.6 * Float(matcher.rows)) / 2 * 2
+            return gpu[row * matcher.columns + column]
         }
         XCTAssertEqual(reading(across: 0, up: 0).nearness, 1, accuracy: 0.05)
         XCTAssertEqual(reading(across: -0.7, up: 0.5).nearness, 0.25, accuracy: 0.05)
-        XCTAssertGreaterThan(reading(across: 0.7, up: 0.5).trust, 0, "low-contrast region still matches via coarser pyramid level")
-        XCTAssertEqual(reading(across: 0.7, up: 0.5).nearness, 0.25, accuracy: 0.05)
+        // Sample below `thinnedAbove` so the even lattice cell at this direction is always included.
+        XCTAssertGreaterThan(reading(across: 0.7, up: 0.38).trust, 0, "low-contrast region still matches via coarser pyramid level")
+        XCTAssertEqual(reading(across: 0.7, up: 0.38).nearness, 0.25, accuracy: 0.05)
     }
 
     func testAFrameIsMeasuredFromItsCompressedSizeToReadings() throws {

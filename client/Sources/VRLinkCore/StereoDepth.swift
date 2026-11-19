@@ -245,6 +245,37 @@ extension DepthField {
          window.up - (Float(row) + 0.5) / Float(rows) * (window.up - window.down))
     }
 
+    /// Performs bilinear lookups on a row-major grid through an unsafe pointer.
+    /// This matches `nearness(across:up:)` while precomputing the tangent-to-cell
+    /// scale factors and avoiding per-call array bounds checks in tight loops.
+    struct Sampler {
+        let values: UnsafePointer<Float>
+        let columns: Int, rows: Int
+        let left: Float, up: Float
+        /// Converts tangent coordinates to grid cell coordinates along each axis.
+        let perAcross: Float, perDown: Float
+
+        init(_ values: UnsafePointer<Float>, columns: Int, rows: Int, window: Frustum) {
+            self.values = values
+            self.columns = columns
+            self.rows = rows
+            left = window.left
+            up = window.up
+            perAcross = Float(columns) / (window.right - window.left)
+            perDown = Float(rows) / (window.up - window.down)
+        }
+
+        @inline(__always) func callAsFunction(_ across: Float, _ up: Float) -> Float {
+            let cx = max(0, min(Float(columns - 1), (across - left) * perAcross - 0.5))
+            let cy = max(0, min(Float(rows - 1), (self.up - up) * perDown - 0.5))
+            let x0 = Int(cx), y0 = Int(cy), x1 = min(columns - 1, x0 + 1), y1 = min(rows - 1, y0 + 1)
+            let fx = cx - Float(x0), fy = cy - Float(y0)
+            let top = values[y0 * columns + x0] * (1 - fx) + values[y0 * columns + x1] * fx
+            let bottom = values[y1 * columns + x0] * (1 - fx) + values[y1 * columns + x1] * fx
+            return top * (1 - fy) + bottom * fy
+        }
+    }
+
     /// Reprojects each cell from `target` back into this field's original `pose`,
     /// returning the source `(across, up)` tangents in the original view and the
     /// updated inverse depth seen from `target`. Assumes a static world scene so
@@ -255,49 +286,69 @@ extension DepthField {
         // Position of `target` in this field's local coordinate frame.
         let step = from.local(target.position)
         let moved = step.dot(step) > 0.002 * 0.002
-        var out: [(across: Float, up: Float, nearness: Float)] = []
-        out.reserveCapacity(columns * rows)
-        for row in 0..<rows {
-            for column in 0..<columns {
-                let (x, y) = direction(column: column, row: row)
-                // Sight ray from `target` expressed in this field's coordinate frame.
-                let ray = target.right * x + target.up * y + target.forward
-                let line = Vec3(ray.dot(from.right), ray.dot(from.up), ray.dot(from.forward))
-                guard line.z > 0.05 else {
-                    // Mark rays pointing >= ~87 degrees away from the original forward axis as invalid.
-                    out.append((x, y, -1))
-                    continue
+        // Express `target`'s basis vectors in this field's coordinate frame so each cell's sight ray is a simple linear combination.
+        let right = Vec3(target.right.dot(from.right), target.right.dot(from.up), target.right.dot(from.forward))
+        let upward = Vec3(target.up.dot(from.right), target.up.dot(from.up), target.up.dot(from.forward))
+        let forward = Vec3(target.forward.dot(from.right), target.forward.dot(from.up), target.forward.dot(from.forward))
+        var out = [(across: Float, up: Float, nearness: Float)](repeating: (0, 0, -1), count: columns * rows)
+        nearness.withUnsafeBufferPointer { values in
+            let sample = Sampler(values.baseAddress!, columns: columns, rows: rows, window: window)
+            // Intersect a sight ray with the previous depth map's heightfield using fixed-point iteration.
+            // Each step projects the current point on the ray into the old view, samples the old depth there,
+            // and updates the ray distance `ahead` until the two agree.
+            @inline(__always) func settle(_ line: Vec3, from start: Float) -> (across: Float, up: Float, ahead: Float, miss: Float) {
+                var ahead = start, across = line.x / line.z, up = line.y / line.z, miss = Float.infinity
+                for round in 0..<4 {
+                    let z = step.z + line.z * ahead
+                    guard z > 0.05 else { return (across, up, ahead, .infinity) }
+                    across = (step.x + line.x * ahead) / z
+                    up = (step.y + line.y * ahead) / z
+                    let was = 1 / max(0.005, sample(across, up))                       // meters ahead of the old pose
+                    miss = abs(z - was) / was
+                    // Stop early once the ray distance converges, which usually happens on the first step between consecutive frames.
+                    if miss < 0.002 { break }
+                    if round < 3 { ahead = max(0.05, (was - step.z) / line.z) }
                 }
-                // Intersect the ray with the heightfield defined by the previous depth map using
-                // fixed-point iteration: evaluate the old depth at the current ray point's projected
-                // tangent and update the ray distance `ahead` until they agree.
-                func settle(from start: Float) -> (across: Float, up: Float, ahead: Float, miss: Float) {
-                    var ahead = start, across = line.x / line.z, up = line.y / line.z, miss = Float.infinity
-                    for round in 0..<4 {
-                        let point = step + line * ahead
-                        guard point.z > 0.05 else { return (across, up, ahead, .infinity) }
-                        across = point.x / point.z
-                        up = point.y / point.z
-                        let was = 1 / max(0.005, nearness(across: across, up: up))    // meters ahead of the old pose
-                        miss = abs(point.z - was) / was
-                        if round < 3 { ahead = max(0.05, (was - step.z) / line.z) }
+                return (across, up, ahead, miss)
+            }
+            for row in 0..<rows {
+                for column in 0..<columns {
+                    let (x, y) = direction(column: column, row: row)
+                    // Sight ray from `target` expressed in this field's coordinate frame.
+                    let line = Vec3(right.x * x + upward.x * y + forward.x, right.y * x + upward.y * y + forward.y,
+                                    right.z * x + upward.z * y + forward.z)
+                    // Leave rays pointing ~87 degrees or more from the original forward axis marked invalid.
+                    guard line.z > 0.05 else {
+                        out[row * columns + column] = (x, y, -1)
+                        continue
                     }
-                    return (across, up, ahead, miss)
-                }
-                // Seed from pure rotation, which is exact when the head has not translated.
-                let turned = 1 / max(0.005, nearness(across: line.x / line.z, up: line.y / line.z))
-                var found = settle(from: max(0.05, (turned - step.z) / line.z))
-                if moved {
-                    // Head translation can cause nearby geometry to occlude the rotation-seeded ray;
-                    // probe several closer starting distances and keep the nearest consistent hit.
-                    if found.miss > 0.15 { found.ahead = .infinity }
-                    for start: Float in [0.3, 0.6, 1.2, 2.5, 5] {
-                        let other = settle(from: start)
-                        if other.miss <= 0.15, other.ahead < found.ahead { found = other }
+                    // Seed from pure rotation, which is exact when the head has not translated.
+                    let turned = 1 / max(0.005, sample(line.x / line.z, line.y / line.z))
+                    let seed = max(0.05, (turned - step.z) / line.z)
+                    var found = settle(line, from: seed)
+                    if moved {
+                        // Head translation can cause nearby geometry to occlude the rotation-seeded ray;
+                        // probe several closer starting distances and keep the nearest consistent hit.
+                        let consistent = found.miss <= 0.15
+                        // Only run fixed-point iteration from a probe distance if the old depth map is
+                        // significantly closer at that point than the rotation-seeded hit.
+                        let behind = consistent ? step.z + line.z * found.ahead : Float.infinity
+                        if !consistent { found.ahead = .infinity }
+                        for start: Float in [0.3, 0.6, 1.2, 2.5, 5] {
+                            if consistent {
+                                guard start < found.ahead else { break }
+                                let z = step.z + line.z * start
+                                guard z > 0.05 else { continue }
+                                let was = 1 / max(0.005, sample((step.x + line.x * start) / z, (step.y + line.y * start) / z))
+                                guard was < 0.9 * behind else { continue }
+                            }
+                            let other = settle(line, from: start)
+                            if other.miss <= 0.15, other.ahead < found.ahead { found = other }
+                        }
+                        if !found.ahead.isFinite { found = settle(line, from: seed) }
                     }
-                    if !found.ahead.isFinite { found = settle(from: max(0.05, (turned - step.z) / line.z)) }
+                    out[row * columns + column] = (found.across, found.up, 1 / found.ahead)
                 }
-                out.append((found.across, found.up, 1 / found.ahead))
             }
         }
         return out
@@ -307,6 +358,11 @@ extension DepthField {
     /// computed on an earlier frame stay aligned with scene geometry on later frames.
     /// Returns `self` unchanged if `pose` is `nil`.
     public func moved(to target: Pose) -> DepthField {
+        // Skip reprojection when the field is already expressed in `target` (for example, after `fitted(to:)`).
+        if let pose {
+            let step = pose.position - target.position
+            if step.dot(step) < 1e-10, pose.forward.dot(target.forward) > 0.9999999, pose.right.dot(target.right) > 0.9999999 { return self }
+        }
         guard let sources = sources(seenFrom: target) else { return self }
         var out = self
         out.pose = target
@@ -328,11 +384,21 @@ extension DepthField {
     public func seen(by eye: Eye) -> DepthField {
         var out = DepthField(columns: columns, rows: rows, window: window, apart: 0, pose: pose)
         guard columns > 0, rows > 0 else { return out }
-        for row in 0..<rows {
-            let up = window.up - (Float(row) + 0.5) / Float(rows) * (window.up - window.down)
-            for column in 0..<columns {
-                let across = window.left + (Float(column) + 0.5) / Float(columns) * (window.right - window.left)
-                out.nearness[row * columns + column] = nearness(seenBy: eye, across: across, up: up)
+        let aside = (eye == .left ? -0.5 : 0.5) * apart
+        let wide = (window.right - window.left) / Float(columns), tall = (window.up - window.down) / Float(rows)
+        nearness.withUnsafeBufferPointer { values in
+            let sample = Sampler(values.baseAddress!, columns: columns, rows: rows, window: window)
+            for row in 0..<rows {
+                let up = window.up - (Float(row) + 0.5) * tall
+                for column in 0..<columns {
+                    let across = window.left + (Float(column) + 0.5) * wide
+                    // Run the same parallax search as `nearness(seenBy:across:up:)`, seeding from the nearest candidate before iterating.
+                    var found = max(max(sample(across, up), sample(across + aside, up)),
+                                    max(sample(across + aside * 2, up), sample(across + aside * DepthField.range.upperBound, up)))
+                    found = sample(across + aside * found, up)
+                    found = sample(across + aside * found, up)
+                    out.nearness[row * columns + column] = max(DepthField.range.lowerBound, min(DepthField.range.upperBound, found))
+                }
             }
         }
         return out
@@ -392,6 +458,13 @@ public struct StereoMatcher {
         Level(halvings: 2, reach: 8, grain: 0.5, worth: 0.6),
     ]
 
+    /// When `true`, `measured` only matches the subset of grid cells selected by
+    /// `DepthSampling.cells` instead of the full grid. It samples a sparser base
+    /// lattice across the view and fills in every cell inside the regions of
+    /// interest, such as around a hand or the foveal inset. `DepthSmoother` then
+    /// inpaints the unmeasured cells from nearby confident readings.
+    public var sampled = false
+
     public init() {}
 
     /// Returns a matcher whose pyramid levels are adjusted for input `width`,
@@ -406,13 +479,19 @@ public struct StereoMatcher {
     }
 
     /// Runs multi-scale matching on `pair` and packages the resulting `StereoMeasure`.
-    public func measured(_ pair: StereoPair) -> StereoMeasure {
-        StereoMeasure(readings: measureLevels(pair), columns: columns, rows: rows, window: pair.window, apart: pair.apart,
-                      pose: pair.pose)
+    public func measured(_ pair: StereoPair, interests: [DepthSampling.Interest] = []) -> StereoMeasure {
+        StereoMeasure(readings: measureLevels(pair, cells: cells(window: pair.window, interests: interests)),
+                      columns: columns, rows: rows, window: pair.window, apart: pair.apart, pose: pair.pose)
+    }
+
+    /// Returns the row-major cell indices to match for `window` when `sampled` is enabled, or `nil` to match every cell.
+    public func cells(window: Frustum, interests: [DepthSampling.Interest]) -> [Int]? {
+        sampled ? DepthSampling.cells(columns: columns, rows: rows, window: window, interests: interests) : nil
     }
 
     /// Evaluates each pyramid level in `levels` and selects the finest confident reading per cell.
-    public func measureLevels(_ pair: StereoPair) -> [Reading] {
+    /// When `cells` is given, only those row-major cell indices are matched.
+    public func measureLevels(_ pair: StereoPair, cells: [Int]? = nil) -> [Reading] {
         var sized = pair, halvings = 0, found: [[Reading]] = []
         for level in levels {
             while halvings < level.halvings {
@@ -422,7 +501,7 @@ public struct StereoMatcher {
             var one = self
             one.reach = level.reach
             one.grain = level.grain
-            found.append(one.measure(sized))
+            found.append(one.measure(sized, cells: cells))
         }
         return StereoMatcher.finest(found, worth: levels.map(\.worth))
     }
@@ -439,7 +518,15 @@ public struct StereoMatcher {
         return out
     }
 
-    public func measure(_ pair: StereoPair) -> [Reading] {
+    /// Matches `pair` at a single scale. When `cells` is given, only those row-major
+    /// cell indices are matched and the rest are returned with zero confidence.
+    public func measure(_ pair: StereoPair, cells: [Int]? = nil) -> [Reading] {
+        var wanted: [Bool]?
+        if let cells {
+            var chosen = [Bool](repeating: false, count: columns * rows)
+            for cell in cells where chosen.indices.contains(cell) { chosen[cell] = true }
+            wanted = chosen
+        }
         let width = pair.left.width, height = pair.left.height
         let none = Reading(nearness: 0, trust: 0)
         guard width == pair.right.width, height == pair.right.height, width > 4 * reach, height > 4 * reach,
@@ -460,6 +547,7 @@ public struct StereoMatcher {
                           cy + reach < min(pair.leftCovered.y.upperBound, pair.rightCovered.y.upperBound)
                     else { continue }
                     for column in 0..<columns {
+                        if let wanted, !wanted[row * columns + column] { continue }
                         let cx = Int((Float(column) + 0.5) / Float(columns) * Float(width))
                         // Split integer disparity `shift` symmetrically around the cyclopean cell center (`+shift/2` in left, `-shift/2` in right).
                         var best = -1
@@ -519,6 +607,95 @@ public struct StereoMatcher {
             }
         }
         return out
+    }
+}
+
+/// Chooses the subset of depth grid cells to stereo-match on a given frame.
+public enum DepthSampling {
+    /// Defines a circular region in cyclopean tangent space (`across`, `up`, and `radius`)
+    /// where every depth grid cell is matched.
+    public struct Interest: Equatable {
+        public var across: Float, up: Float, radius: Float
+        public init(across: Float, up: Float, radius: Float) {
+            self.across = across
+            self.up = up
+            self.radius = radius
+        }
+
+        /// Creates a region covering `reach` meters around world-space `point` as seen from `pose`,
+        /// or returns `nil` if `point` is behind or nearly beside the head.
+        public init?(around point: Vec3, reach: Float, seenFrom pose: Pose) {
+            let seen = pose.local(point)
+            guard seen.z > 0.1 else { return nil }
+            self.init(across: seen.x / seen.z, up: seen.y / seen.z, radius: max(0.1, min(0.45, reach / seen.z)))
+        }
+    }
+
+    /// Each hand or controller is sampled at full density within this world-space radius (in meters),
+    /// which covers the hand, held objects, and motion since the frame was rendered.
+    public static let handReach: Float = 0.17
+    /// The region around the center of the host's foveal inset is sampled at full density within this tangent radius.
+    public static let sharpRadius: Float = 0.3
+    /// Beyond `thinnedAbove` vertically or `thinnedBeside` horizontally, the base lattice skips half of its remaining cells.
+    public static let thinnedAbove: Float = 0.45, thinnedBeside: Float = 0.85
+
+    /// Builds the regions of interest for `layout` from the current `hands` positions
+    /// and the host's foveal inset. Each visible hand or controller gets a region sized
+    /// by its distance, and another region is placed at the center of the feathered
+    /// foveal inset (which tracks gaze when eye tracking is active, or falls back to
+    /// straight ahead when the layout has no inset).
+    public static func interests(layout: FrameLayout, hands: [Vec3]) -> [Interest] {
+        guard let middle = layout.middle else { return [] }
+        var out = hands.compactMap { Interest(around: $0, reach: handReach, seenFrom: middle) }
+        let insets = layout.views.compactMap { $0.tiles.last(where: { $0.feather > 0 })?.frustum }
+        if insets.count == layout.views.count, !insets.isEmpty {
+            let count = Float(insets.count)
+            out.append(Interest(across: insets.map { ($0.left + $0.right) / 2 }.reduce(0, +) / count,
+                                up: insets.map { ($0.down + $0.up) / 2 }.reduce(0, +) / count, radius: sharpRadius))
+        } else {
+            out.append(Interest(across: 0, up: 0, radius: sharpRadius))
+        }
+        return out
+    }
+
+    /// Returns the row-major cell indices to stereo-match, capped at `most` cells.
+    /// Sampling starts with a base lattice of every even row and column, drops half of
+    /// those cells in the upper (`thinnedAbove`) and far peripheral (`thinnedBeside`)
+    /// bands, and then appends every remaining cell inside `interests`.
+    public static func cells(columns: Int, rows: Int, window: Frustum, interests: [Interest], most: Int = 2048) -> [Int] {
+        guard columns > 0, rows > 0 else { return [] }
+        var chosen = [Bool](repeating: false, count: columns * rows), out: [Int] = []
+        func direction(_ column: Int, _ row: Int) -> (across: Float, up: Float) {
+            (window.left + (Float(column) + 0.5) / Float(columns) * (window.right - window.left),
+             window.up - (Float(row) + 0.5) / Float(rows) * (window.up - window.down))
+        }
+        for row in stride(from: 0, to: rows, by: 2) {
+            for column in stride(from: 0, to: columns, by: 2) {
+                let (across, up) = direction(column, row)
+                if up > thinnedAbove || abs(across) > thinnedBeside, (row / 2 + column / 2) % 2 == 1 { continue }
+                chosen[row * columns + column] = true
+                out.append(row * columns + column)
+            }
+        }
+        let wide = (window.right - window.left) / Float(columns), tall = (window.up - window.down) / Float(rows)
+        for interest in interests {
+            // Only check grid cells within the interest circle's bounding box.
+            let firstRow = max(0, Int(((window.up - interest.up - interest.radius) / tall).rounded(.down)))
+            let lastRow = min(rows - 1, Int(((window.up - interest.up + interest.radius) / tall).rounded(.up)))
+            let firstColumn = max(0, Int(((interest.across - interest.radius - window.left) / wide).rounded(.down)))
+            let lastColumn = min(columns - 1, Int(((interest.across + interest.radius - window.left) / wide).rounded(.up)))
+            guard firstRow <= lastRow, firstColumn <= lastColumn else { continue }
+            for row in firstRow...lastRow {
+                for column in firstColumn...lastColumn where !chosen[row * columns + column] {
+                    let (across, up) = direction(column, row)
+                    let dx = across - interest.across, dy = up - interest.up
+                    guard dx * dx + dy * dy <= interest.radius * interest.radius, out.count < most else { continue }
+                    chosen[row * columns + column] = true
+                    out.append(row * columns + column)
+                }
+            }
+        }
+        return Array(out.prefix(most))
     }
 }
 
@@ -593,18 +770,19 @@ public struct DepthSmoother {
             field = before
             // Reproject both the previous depth estimates and their confidence values to the current head pose.
             if let pose = measure.pose, let sources = before.sources(seenFrom: pose) {
-                let believed = DepthField(columns: columns, rows: rows, window: before.window, apart: 0, nearness: trust)
-                for (index, source) in sources.enumerated() {
-                    if source.nearness < 0 {
-                        field.nearness[index] = DepthSmoother.far
-                        trust[index] = 0
-                    } else {
-                        field.nearness[index] = source.nearness
-                        trust[index] = believed.nearness(across: source.across, up: source.up)
-                        // Reset confidence for rays that rotated outside the previous frame's view frustum.
-                        if source.across < before.window.left || source.across > before.window.right
-                            || source.up < before.window.down || source.up > before.window.up {
+                let old = trust, window = before.window
+                old.withUnsafeBufferPointer { values in
+                    let believed = DepthField.Sampler(values.baseAddress!, columns: columns, rows: rows, window: window)
+                    for (index, source) in sources.enumerated() {
+                        if source.nearness < 0 {
+                            field.nearness[index] = DepthSmoother.far
                             trust[index] = 0
+                        } else {
+                            field.nearness[index] = source.nearness
+                            // Reset confidence for rays that rotated outside the previous frame's view frustum.
+                            let outside = source.across < window.left || source.across > window.right
+                                || source.up < window.down || source.up > window.up
+                            trust[index] = outside ? 0 : believed(source.across, source.up)
                         }
                     }
                 }
@@ -623,37 +801,35 @@ public struct DepthSmoother {
             held = field
             return field
         }
-        func around(_ index: Int) -> [Int] {
-            let row = index / columns, column = index % columns
-            var out: [Int] = []
-            for r in max(0, row - 1)...min(rows - 1, row + 1) {
-                for c in max(0, column - 1)...min(columns - 1, column + 1) { out.append(r * columns + c) }
-            }
-            return out
-        }
-        // Neighboring cells within `reach`, paired with their `(across, down)` grid offsets.
-        func near(_ index: Int, reach: Int) -> [(index: Int, across: Int, down: Int)] {
-            let row = index / columns, column = index % columns
-            var out: [(index: Int, across: Int, down: Int)] = []
-            for r in max(0, row - reach)...min(rows - 1, row + reach) {
-                for c in max(0, column - reach)...min(columns - 1, column + reach) where r != row || c != column {
-                    out.append((r * columns + c, c - column, r - row))
-                }
-            }
-            return out
-        }
-        // Keep a reading if at least two neighbors within 2 cells agree with it, allowing narrow
-        // objects (1-2 cells wide) to survive while rejecting single-cell spikes. When fewer than
-        // three neighbors have readings, also accept readings that match the smoothed cell or previous frame.
-        func alike(_ a: Float, _ b: Float) -> Bool { abs(a - b) <= max(0.12, 0.35 * max(a, b)) }
+        @inline(__always) func alike(_ a: Float, _ b: Float) -> Bool { abs(a - b) <= max(0.12, 0.35 * max(a, b)) }
+        // Neighborhood radii are specified for a 28-column grid and scale up on finer grids.
+        let finer = max(1, columns / 28)
+
+        // Keep a reading if at least two neighbors within `checkReach` cells agree with it, preserving
+        // narrow objects (1-2 cells wide) while rejecting single-cell spikes. When fewer than three
+        // neighbors have readings, also accept readings that match the smoothed cell or previous frame.
         var kept = readings
-        for index in readings.indices where readings[index].trust > 0 {
-            let others = near(index, reach: 2).filter { readings[$0.index].trust > 0 }.map { readings[$0.index].nearness }
-            if others.filter({ alike(readings[index].nearness, $0) }).count >= 2 { continue }
-            let repeats = (trust[index] > 0.3 && alike(readings[index].nearness, field.nearness[index]))
-                || (pending.count == readings.count && pending[index].trust > 0
-                    && alike(readings[index].nearness, pending[index].nearness))
-            if others.count >= 3 || !repeats { kept[index].trust = 0 }
+        let checkReach = 2 * finer
+        readings.withUnsafeBufferPointer { all in
+            for index in 0..<all.count where all[index].trust > 0 {
+                let row = index / columns, column = index % columns, mine = all[index].nearness
+                var others = 0, agreeing = 0
+                rows: for r in max(0, row - checkReach)...min(rows - 1, row + checkReach) {
+                    for c in max(0, column - checkReach)...min(columns - 1, column + checkReach) {
+                        let other = all[r * columns + c]
+                        guard other.trust > 0, r != row || c != column else { continue }
+                        others += 1
+                        if alike(mine, other.nearness) {
+                            agreeing += 1
+                            if agreeing >= 2 { break rows }
+                        }
+                    }
+                }
+                if agreeing >= 2 { continue }
+                let repeats = (trust[index] > 0.3 && alike(mine, field.nearness[index]))
+                    || (pending.count == all.count && pending[index].trust > 0 && alike(mine, pending[index].nearness))
+                if others >= 3 || !repeats { kept[index].trust = 0 }
+            }
         }
         pending = readings
         for index in kept.indices {
@@ -666,54 +842,134 @@ public struct DepthSmoother {
                 trust[index] *= fading
             }
         }
+
         // Inpaint cells that lacked a reading this frame using nearby confident cells. Because planar
         // surfaces (floors, walls, ceilings) have linear inverse depth in tangent space, we fit a
         // weighted least-squares plane `n = a + b*x + c*y` to confident neighbors so partially
-        // textured floors extrapolate at the right slope. When all confident neighbors lie to one
-        // side of the cell (for example, sky next to a foreground object), blend back toward `far`
-        // instead of extrapolating the foreground plane outward.
-        let before = field.nearness, believed = trust
-        for index in before.indices where kept[index].trust == 0 {
-            var w: Float = 0, wx: Float = 0, wy: Float = 0, wxx: Float = 0, wxy: Float = 0, wyy: Float = 0
-            var wn: Float = 0, wxn: Float = 0, wyn: Float = 0, least = Float.infinity, most = -Float.infinity, count = 0
-            for other in near(index, reach: fillReach) where believed[other.index] > 0.3 {
-                let x = Float(other.across), y = Float(other.down), n = before[other.index]
-                let share = believed[other.index] * exp(-(x * x + y * y) / (2 * fillSpread * fillSpread))
-                w += share; wx += share * x; wy += share * y
-                wxx += share * x * x; wxy += share * x * y; wyy += share * y * y
-                wn += share * n; wxn += share * x * n; wyn += share * y * n
-                least = min(least, n); most = max(most, n)
-                count += 1
+        // textured floors extrapolate at the right slope. Only neighbors on the same surface as the
+        // highest-weighted one are fitted, so a hand in front of the floor is not averaged with it.
+        // When all confident neighbors lie to one side of the cell (for example, sky next to a
+        // foreground object), blend back toward `far` instead of extrapolating the foreground plane outward.
+        //
+        // Because inpainting visits up to a 17 x 17 neighborhood for thousands of cells per frame,
+        // we precompute the Gaussian weights into a flat table and avoid allocations in the loop.
+        // We keep this loop scalar rather than using `SIMD4` or `SIMD8` because most neighbors have
+        // zero weight; skipping them with a branch is faster in benchmarks than evaluating empty
+        // vector lanes.
+        let fillReach = self.fillReach * finer, span = 2 * fillReach + 1
+        var gauss = [Float](repeating: 0, count: span * span)
+        for dy in -fillReach...fillReach {
+            for dx in -fillReach...fillReach {
+                // Normalize offsets to 28-column grid units so the Gaussian falloff stays the same physical width on finer grids.
+                let x = Float(dx) / Float(finer), y = Float(dy) / Float(finer)
+                gauss[(dy + fillReach) * span + dx + fillReach] = exp(-(x * x + y * y) / (2 * fillSpread * fillSpread))
             }
-            var target = DepthSmoother.far
-            if count >= 3, w > 0.05 {
-                // Evaluate the weighted plane fit `n = a + b*x + c*y` at the cell center `(x = 0, y = 0)`, which equals `a`.
-                let det = w * (wxx * wyy - wxy * wxy) - wx * (wx * wyy - wxy * wy) + wy * (wx * wxy - wxx * wy)
-                var fitted = wn / w
-                if abs(det) > 1e-4 * w * w * w {
-                    fitted = (wn * (wxx * wyy - wxy * wxy) - wx * (wxn * wyy - wxy * wyn) + wy * (wxn * wxy - wxx * wyn)) / det
+        }
+        // Zero the center entry so a cell never contributes to its own neighborhood fit.
+        gauss[fillReach * span + fillReach] = 0
+        let before = field.nearness, perCell = 1 / Float(finer)
+        // Only cells on the sampled lattice or inside regions of interest build up confidence,
+        // so we pack cells with `trust > 0.3` into contiguous row-ordered arrays before inpainting.
+        // `firstFrom[r * (columns + 1) + c]` stores the starting index in the packed arrays for
+        // entries in row `r` at or after column `c`.
+        var packedColumn: [Int32] = [], packedTrust: [Float] = [], packedValue: [Float] = []
+        var firstFrom = [Int](repeating: 0, count: rows * (columns + 1))
+        for row in 0..<rows {
+            for column in 0..<columns {
+                firstFrom[row * (columns + 1) + column] = packedColumn.count
+                if trust[row * columns + column] > 0.3 {
+                    packedColumn.append(Int32(column))
+                    packedTrust.append(trust[row * columns + column])
+                    packedValue.append(before[row * columns + column])
                 }
-                // Clamp plane extrapolation to stay near the observed neighbor range.
-                fitted = max(least * 0.8, min(most * 1.2, fitted))
-                // Measure how one-sided the neighbor distribution is via the weighted centroid offset (in cells).
-                let aside = ((wx / w) * (wx / w) + (wy / w) * (wy / w)).squareRoot()
-                let among = max(0, min(1, 2 - aside)) * min(1, w / fillEnough)
-                target = fitted * among + DepthSmoother.far * (1 - among)
             }
-            field.nearness[index] += (target - before[index]) * (1 - trust[index]) * filling
+            firstFrom[row * (columns + 1) + columns] = packedColumn.count
+        }
+        gauss.withUnsafeBufferPointer { gauss in
+        packedColumn.withUnsafeBufferPointer { packedColumn in
+            packedTrust.withUnsafeBufferPointer { packedTrust in
+                packedValue.withUnsafeBufferPointer { packedValue in
+                    for index in 0..<before.count where kept[index].trust == 0 {
+                        let row = index / columns, column = index % columns
+                        let firstRow = max(0, row - fillReach), lastRow = min(rows - 1, row + fillReach)
+                        let firstColumn = max(0, column - fillReach), lastColumn = min(columns - 1, column + fillReach)
+                        // First, find the highest-weighted confident neighbor to set the reference depth `surface`
+                        // for this cell, breaking ties by row-major order.
+                        var strongest: Float = 0, surface: Float = 0
+                        for r in firstRow...lastRow {
+                            let table = (r - row + fillReach) * span + fillReach - column
+                            for entry in firstFrom[r * (columns + 1) + firstColumn]..<firstFrom[r * (columns + 1) + lastColumn + 1] {
+                                let share = packedTrust[entry] * gauss[table + Int(packedColumn[entry])]
+                                if share > strongest {
+                                    strongest = share
+                                    surface = packedValue[entry]
+                                }
+                            }
+                        }
+                        var target = DepthSmoother.far
+                        if strongest > 0 {
+                            // Next, accumulate the weighted least-squares plane fit over neighbors that match `surface`.
+                            var w: Float = 0, wx: Float = 0, wy: Float = 0, wxx: Float = 0, wxy: Float = 0, wyy: Float = 0
+                            var wn: Float = 0, wxn: Float = 0, wyn: Float = 0, least = Float.infinity, most = -Float.infinity, count = 0
+                            let tolerance = max(0.12, 0.35 * surface)
+                            for r in firstRow...lastRow {
+                                let table = (r - row + fillReach) * span + fillReach - column
+                                let y = Float(r - row) * perCell
+                                for entry in firstFrom[r * (columns + 1) + firstColumn]..<firstFrom[r * (columns + 1) + lastColumn + 1] {
+                                    let c = Int(packedColumn[entry]), n = packedValue[entry]
+                                    let share = packedTrust[entry] * gauss[table + c]
+                                    // Inline `alike(n, surface)` using the precomputed `tolerance` so most neighbors only need one comparison.
+                                    guard share > 0, abs(n - surface) <= tolerance || abs(n - surface) <= 0.35 * n else { continue }
+                                    let x = Float(c - column) * perCell
+                                    w += share; wx += share * x; wy += share * y
+                                    wxx += share * x * x; wxy += share * x * y; wyy += share * y * y
+                                    wn += share * n; wxn += share * x * n; wyn += share * y * n
+                                    least = min(least, n); most = max(most, n)
+                                    count += 1
+                                }
+                            }
+                            if count >= 3, w > 0.05 {
+                                // Evaluate the weighted plane fit `n = a + b*x + c*y` at the cell center `(x = 0, y = 0)`, which equals `a`.
+                                let det = w * (wxx * wyy - wxy * wxy) - wx * (wx * wyy - wxy * wy) + wy * (wx * wxy - wxx * wy)
+                                var fitted = wn / w
+                                if abs(det) > 1e-4 * w * w * w {
+                                    fitted = (wn * (wxx * wyy - wxy * wxy) - wx * (wxn * wyy - wxy * wyn) + wy * (wxn * wxy - wxx * wyn)) / det
+                                }
+                                // Clamp plane extrapolation to stay near the observed neighbor range.
+                                fitted = max(least * 0.8, min(most * 1.2, fitted))
+                                // Measure how one-sided the neighbor distribution is via the weighted centroid offset (in cells).
+                                let aside = ((wx / w) * (wx / w) + (wy / w) * (wy / w)).squareRoot()
+                                let among = max(0, min(1, 2 - aside)) * min(1, w / fillEnough)
+                                target = fitted * among + DepthSmoother.far * (1 - among)
+                            }
+                        }
+                        field.nearness[index] += (target - before[index]) * (1 - trust[index]) * filling
+                    }
+                }
+            }
+        }
         }
         held = field
-        // Apply a 3x3 tent blur (center weight 4, axial neighbors 2, diagonal neighbors 1).
+        // Apply a 3x3 tent blur (center weight 4, axial neighbors 2, diagonal neighbors 1), skipping
+        // neighbors across a depth discontinuity so foreground edges stay sharp.
         var smooth = field
-        for index in field.nearness.indices {
-            let row = index / columns, column = index % columns
-            var sum: Float = 0, weight: Float = 0
-            for other in around(index) {
-                let share: Float = other == index ? 4 : (other / columns == row || other % columns == column) ? 2 : 1
-                sum += field.nearness[other] * share
-                weight += share
+        field.nearness.withUnsafeBufferPointer { values in
+            for row in 0..<rows {
+                for column in 0..<columns {
+                    let mine = values[row * columns + column]
+                    var sum: Float = 0, weight: Float = 0
+                    for r in max(0, row - 1)...min(rows - 1, row + 1) {
+                        for c in max(0, column - 1)...min(columns - 1, column + 1) {
+                            let other = values[r * columns + c]
+                            guard alike(other, mine) else { continue }
+                            let share: Float = (r == row ? 2 : 1) * (c == column ? 2 : 1)
+                            sum += other * share
+                            weight += share
+                        }
+                    }
+                    smooth.nearness[row * columns + column] = sum / weight
+                }
             }
-            smooth.nearness[index] = sum / weight
         }
         return smooth
     }
