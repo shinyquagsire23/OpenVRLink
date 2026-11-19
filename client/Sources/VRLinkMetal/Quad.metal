@@ -11,18 +11,28 @@ using namespace metal;
 // One corner of a quad, for up to two eyes: each eye has its own position
 // on screen and its own part of the decoded frame to show.
 // alphaUV is where the same corner is in the picture of transparency, when there is one.
-struct Vertex { float4 position[2]; float2 uv[2]; float2 alphaUV[2]; float2 tile; };
-struct Fragment { float4 position [[position]]; float2 uv; float2 alphaUV; float2 tile; uint eye [[flat]]; };
+// `ahead` stores each vertex's forward distance from the rendering eye for projective UV interpolation.
+struct Vertex { float4 position[2]; float2 uv[2]; float2 alphaUV[2]; float2 tile; float2 ahead; };
+struct Fragment { float4 position [[position]]; float2 uv; float2 alphaUV; float2 tile; float ahead; uint eye [[flat]]; };
 
 // With vertex amplification every triangle is drawn once per eye, and
-// amplification_id says which eye this copy is for.
+// amplification_id selects the target eye.
 vertex Fragment vertexMain(uint index [[vertex_id]], ushort eye [[amplification_id]],
                            const device Vertex *vertices [[buffer(0)]]) {
     Fragment out;
+    // Texture UVs are perspective-projected from the host's rendering eye. When a
+    // quad is depth-warped and viewed from a translated display eye, standard
+    // perspective-correct rasterization interpolates linearly across the warped
+    // triangle surface rather than the rendering eye's view plane. Multiplying UVs
+    // by the rendering-eye depth (`ahead`) here and dividing in the fragment shader
+    // restores projective texturing from the rendering eye (and reduces to standard
+    // UV interpolation when `ahead` is constant across a flat quad).
+    float ahead = vertices[index].ahead[eye];
     out.position = vertices[index].position[eye];
-    out.uv = vertices[index].uv[eye];
-    out.alphaUV = vertices[index].alphaUV[eye];
-    out.tile = vertices[index].tile;
+    out.uv = vertices[index].uv[eye] * ahead;
+    out.alphaUV = vertices[index].alphaUV[eye] * ahead;
+    out.tile = vertices[index].tile * ahead;
+    out.ahead = ahead;
     out.eye = eye;
     return out;
 }
@@ -104,8 +114,9 @@ fragment Blended fragmentMain(Fragment in [[stage_in]], texture2d<float> atlas [
         out.cover = float4(style.fill.a);
         return out;
     }
-    half3 color = in.eye == 0 ? half3(atlas.sample(atlasSampler, in.uv).rgb)
-                              : half3(otherEyeAtlas.sample(atlasSampler, in.uv).rgb);
+    float2 uv = in.uv / in.ahead, alphaUV = in.alphaUV / in.ahead, tile = in.tile / in.ahead;
+    half3 color = in.eye == 0 ? half3(atlas.sample(atlasSampler, uv).rgb)
+                              : half3(otherEyeAtlas.sample(atlasSampler, uv).rgb);
     half4 colorOut = half4(color.rgb, 1.0);
     // A host that sends transparency sends it as a picture of its own,
     // whose brightness is how opaque the colors are; the colors come
@@ -113,7 +124,7 @@ fragment Blended fragmentMain(Fragment in [[stage_in]], texture2d<float> atlas [
     // drawn, and no depth: the room shows.
     float opacity = 1.0;
     if (style.hasAlpha != 0.0) {
-        opacity = in.eye == 0 ? alpha.sample(atlasSampler, in.alphaUV).r : otherEyeAlpha.sample(atlasSampler, in.alphaUV).r;
+        opacity = in.eye == 0 ? alpha.sample(atlasSampler, alphaUV).r : otherEyeAlpha.sample(atlasSampler, alphaUV).r;
         if (opacity < 0.02) {
             discard_fragment();
         }
@@ -137,7 +148,7 @@ fragment Blended fragmentMain(Fragment in [[stage_in]], texture2d<float> atlas [
     // A feathered quad (the fovea) fades into the one behind it: it
     // adds its own color times the feather and keeps the rest of what
     // was there, whatever the key has done to either.
-    float toEdge = min(min(in.tile.x, 1.0 - in.tile.x), min(in.tile.y, 1.0 - in.tile.y));
+    float toEdge = min(min(tile.x, 1.0 - tile.x), min(tile.y, 1.0 - tile.y));
     float feather = style.feather > 0.0 ? saturate(toEdge / style.feather) : 1.0;
     out.color = keyed * feather;
     out.cover = float4(feather * opacity);

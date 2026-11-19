@@ -15,6 +15,7 @@ final class SettingsTests: XCTestCase {
         settings.chromaKeyColor = [0.25, 0.5, 0.75]
         settings.fovScaleHorizontal = 1.2
         settings.gazePinchRays = true
+        settings.depthFromPicture = true
         settings.save(to: file)
         XCTAssertEqual(Settings.load(from: file), settings)
     }

@@ -50,6 +50,11 @@ public final class CompositorDisplay {
     private var framesShown = 0
     /// Last logged gaze tangents, used to throttle log messages until gaze moves noticeably.
     private var gazeNoted: (Float, Float) = (9, 9)
+    /// Estimates scene depth from stereo disparity when `Settings.depthFromPicture` is enabled.
+    private let depth: DepthEstimator
+    private var depthNoted: Double = 0
+    /// Retained so the debug depth overlay setting can toggle diagnostic image dumps.
+    private let shrink: StereoShrink?
     /// Number of presentation timestamps to collect before measuring display
     /// parameters so we report an accurate refresh rate from the start.
     private static let framesBeforeMeasuring = 8
@@ -83,6 +88,11 @@ public final class CompositorDisplay {
         self.settings = settings
         self.measured = measured
         self.measureOnly = measureOnly
+        // Hardware-decoded VideoToolbox buffers use lossless compression that only the GPU sampler can read,
+        // so downsampling and stereo matching run on Metal.
+        let shrink = StereoShrink(device: layerRenderer.device)
+        self.shrink = shrink
+        depth = DepthEstimator(measure: shrink.map { shrink in { shrink.measure($0, done: $1) } } ?? { $1(nil) })
         renderer.chromaKey = settings.current.chromaKeying(inGame: false)
         // Forward system spatial pinch events (including their gaze-targeted rays) to PinchRays.
         layerRenderer.onSpatialEvent = { [pinches = inputs.pinches] in pinches.handle($0) }
@@ -293,6 +303,7 @@ public final class CompositorDisplay {
         if let anchor { lastOriginFromDevice = anchor.originFromAnchorTransform }
 
         let picked = connection.frames.next()
+        followDepth(picked, at: displayTime)
         if let session = connection.session, let period = refreshPeriod() {
             // Convert presentation timestamps from the CACurrentMediaTime() clock to monotonic system uptime.
             func uptime(_ time: TimeInterval) -> UInt64 {
@@ -319,6 +330,31 @@ public final class CompositorDisplay {
         }
         commands.commit()
         frame.endSubmission()
+    }
+
+    /// Submits newly decoded frames to the depth estimator while `Settings.depthFromPicture`
+    /// is enabled and logs summary statistics every few seconds.
+    private func followDepth(_ picked: (frame: DecodedFrame, isNew: Bool)?, at seconds: Double) {
+        guard settings.current.depthFromPicture, !measureOnly else {
+            if depthNoted != 0 {
+                depthNoted = 0
+                depth.forget()
+            }
+            return
+        }
+        shrink?.savesPictures = settings.current.showDepth
+        if let picked, picked.isNew { depth.offer(picked.frame) }
+        if depthNoted == 0 { depthNoted = seconds }
+        guard seconds - depthNoted > 5 else { return }
+        depthNoted = seconds
+        guard let report = depth.report else {
+            Log.note("depth: no depth estimate available yet")
+            return
+        }
+        Log.note(String(format: "depth: %.0f%% coverage; center %.2f m, nearest %.2f m; "
+                            + "%.1f ms latency, %d frames processed, %d skipped",
+                        report.measured * 100, 1 / max(0.001, report.ahead), 1 / max(0.001, report.nearest),
+                        report.behind, report.taken, report.passed))
     }
 
     /// Updates the tracked head offset to follow live eye-view shifts.
@@ -348,11 +384,14 @@ public final class CompositorDisplay {
         // passthrough regardless of color, so we draw an explicit black backdrop
         // quad that writes depth behind the video quads.
         let roomBehind = frame == nil || profile == nil || renderer.chromaKey != nil || frame?.layout.transparent == true
+        let field = settings.current.depthFromPicture ? depth.field : nil
+        let shownDepth = settings.current.showDepth ? field : nil
         let eyes = drawQuads(into: drawable, commands: commands, renderer: renderer, frame: frame,
                              originFromDevice: lastOriginFromDevice,
                              behind: MTLClearColor(red: 0, green: 0, blue: 0, alpha: roomBehind ? 0 : 1)) { eye, view in
             guard let frame, let profile else { return [] }
-            let picture = Composition.quads(for: eye, layout: frame.layout)
+            let picture = Composition.quads(for: eye, layout: frame.layout, depth: field)
+                + (shownDepth.map { Composition.picture(of: $0, for: eye, layout: frame.layout) } ?? [])
             guard !roomBehind else { return picture }
             return [Quad.backdrop(for: view, distance: CompositorDisplay.backdropDistance, color: [0, 0, 0, 1])] + picture
         }

@@ -52,7 +52,18 @@ public final class RealityKitDisplay {
     private struct PlaneSet {
         var texture: LowLevelTexture
         var planes: [ModelEntity]            // left eye, right eye
+        /// Per-eye deformable meshes used when `Settings.depthFromPicture` is enabled; empty otherwise.
+        var bent: [BentPlane] = []
     }
+    /// Estimates scene depth from stereo disparity when `Settings.depthFromPicture` is enabled.
+    private let depth: DepthEstimator
+    private var depthNoted: Double = 0
+    /// Retained so the debug depth overlay setting can toggle diagnostic image dumps.
+    private let shrink: StereoShrink?
+    /// Tracks whether the current `PlaneSet` buffers were allocated with deformable `BentPlane` meshes.
+    private var madeBent = false
+    /// Mesh subdivision counts when flattening without foveation; foveated targets match the foveation zone grid.
+    private static let bentCells = (across: 110, down: 100)
     private var sets: [PlaneSet] = []
     private var materials: [ShaderGraphMaterial] = []      // left eye, right eye
     private let root = Entity()
@@ -87,6 +98,11 @@ public final class RealityKitDisplay {
         self.persona = persona
         self.queue = queue
         self.renderer = renderer
+        // Hardware-decoded VideoToolbox buffers use lossless compression that only the GPU sampler can read,
+        // so downsampling and stereo matching run on Metal.
+        let shrink = StereoShrink(device: device)
+        self.shrink = shrink
+        depth = DepthEstimator(measure: shrink.map { shrink in { shrink.measure($0, done: $1) } } ?? { $1(nil) })
     }
 
     /// Populates the RealityKit scene and attaches the Persona camera anchor entity.
@@ -192,8 +208,12 @@ public final class RealityKitDisplay {
     }
 
     /// Allocates or resizes the three buffered render targets and eye planes for `eyePixels` and `frusta`.
-    private func makeSets(for eyePixels: (width: Int, height: Int), frusta: [Frustum]) {
+    private func makeSets(for eyePixels: (width: Int, height: Int), frusta: [Frustum], bent: Bool) {
         guard materials.count == 2 else { return }
+        if bent != madeBent {
+            madeBent = bent
+            eyeSize = (0, 0)
+        }
         // Use a foveated target when supported (`FoveatedFlatten`), falling back
         // to a scaled uniform texture large enough to preserve foveal tile detail.
         var scale = RealityKitDisplay.flattenScale
@@ -226,19 +246,43 @@ public final class RealityKitDisplay {
                 Log.note("realitykit: no texture of \(stored.width)x\(stored.height)")
                 return
             }
+            // Build per-eye deformable meshes subdivided to align with the foveation zone grid;
+            // each triple-buffered PlaneSet owns its own mesh instances so updates stay in sync with its texture.
+            var sheets: [BentPlane] = []
+            if bent {
+                sheets = Eye.allCases.compactMap { eye -> BentPlane? in
+                    guard let foveated else {
+                        return BentPlane(across: RealityKitDisplay.bentCells.across, down: RealityKitDisplay.bentCells.down) { x, y in
+                            [x, 1 - y]
+                        }
+                    }
+                    return BentPlane(across: Foveation.zonesAcross * 2, down: Foveation.zonesDown * 2) { x, y in
+                        let (fromLeft, fromTop) = foveated.target.stored(eye, x: x, y: y)
+                        // Pre-compensate for the stereo material's 0.5x scale and per-eye offset on V, matching FoveatedFlatten.
+                        let fromBottom = 1 - fromTop
+                        return [fromLeft, eye == .left ? fromBottom * 2 : fromBottom * 2 - 1]
+                    }
+                }
+                if sheets.count != 2 {
+                    Log.note("realitykit: failed to create deformable depth meshes; falling back to flat planes")
+                    sheets = []
+                }
+            }
             let planes = Eye.allCases.map { eye -> ModelEntity in
                 var material = materials[eye.rawValue]
                 try? material.setParameter(name: "texture", value: .textureResource(resource))
                 material.faceCulling = .none
-                let plane = ModelEntity(mesh: foveated?.meshes[eye.rawValue] ?? sheet, materials: [material])
+                let plane = ModelEntity(mesh: sheets.isEmpty ? (foveated?.meshes[eye.rawValue] ?? sheet) : sheets[eye.rawValue].resource,
+                                        materials: [material])
                 plane.isEnabled = false
                 root.addChild(plane)
                 return plane
             }
-            sets.append(PlaneSet(texture: texture, planes: planes))
+            sets.append(PlaneSet(texture: texture, planes: planes, bent: sheets))
         }
         Log.note("realitykit: flattening each eye to \(size.width)x\(size.height)"
-                 + (foveated == nil ? "" : ", foveated: both eyes stored in \(stored.width)x\(stored.height)"))
+                 + (foveated == nil ? "" : ", foveated: both eyes stored in \(stored.width)x\(stored.height)")
+                 + (bent ? ", with depth-warped meshes" : ""))
     }
     private var foveated: FoveatedFlatten?
     private var foveationFailed = false
@@ -283,7 +327,9 @@ public final class RealityKitDisplay {
             return
         }
         let frame = picked.frame
-        makeSets(for: frame.layout.eyePixels, frusta: profile.eyeFrusta)
+        let field = followDepth(frame, at: began)
+        let shownDepth = settings.current.showDepth ? field : nil
+        makeSets(for: frame.layout.eyePixels, frusta: profile.eyeFrusta, bent: settings.current.depthFromPicture)
         guard sets.count == 3, let commands = queue.makeCommandBuffer() else { return }
         framesDrawn += 1
         let set = sets[framesDrawn % 3]
@@ -311,7 +357,10 @@ public final class RealityKitDisplay {
             encoder.setViewport(foveated?.target.viewport(eye)
                                 ?? MTLViewport(originX: 0, originY: eye == .left ? Double(eyeSize.height) : 0,
                                                width: Double(eyeSize.width), height: Double(eyeSize.height), znear: 0, zfar: 1))
-            renderer.draw(Composition.quads(for: eye, layout: frame.layout), of: frame,
+            // Flatten tiles onto flat quads from the host's rendering eye pose; scene depth
+            // is applied afterward by warping the RealityKit display mesh.
+            renderer.draw(Composition.quads(for: eye, layout: frame.layout)
+                              + (shownDepth.map { Composition.picture(of: $0, for: eye, layout: frame.layout) } ?? []), of: frame,
                           from: EyeView(eye: hostEye, frustum: profile.eyeFrusta[eye.rawValue]),
                           with: encoder, commands: commands)
             encoder.endEncoding()
@@ -330,6 +379,14 @@ public final class RealityKitDisplay {
                 + hostEye.right * ((frustum.left + frustum.right) / 2 * distance)
                 + hostEye.up * ((frustum.down + frustum.up) / 2 * distance)
             let plane = set.planes[eye.rawValue]
+            if set.bent.count == 2 {
+                // BentPlane vertices are written directly in world space along this eye's rays
+                // using the depth field reprojected to this frame's pose.
+                set.bent[eye.rawValue].place(eye: hostEye, frustum: frustum, depth: field?.fitted(to: frame.layout).seen(by: eye),
+                                             flatAt: distance)
+                plane.transform = Transform()
+                continue
+            }
             plane.position = [middle.x, middle.y, middle.z]
             // Build a rotation from the eye's basis vectors, then pitch +90 degrees
             // around X to stand the XZ plane upright facing the eye.
@@ -344,6 +401,33 @@ public final class RealityKitDisplay {
             sets[other].planes.forEach { $0.isEnabled = other == framesDrawn % 3 }
         }
         showBackdrop(true)
+    }
+
+    /// Submits `frame` to the depth estimator while `Settings.depthFromPicture` is
+    /// enabled, logs summary statistics every few seconds, and returns the latest depth field.
+    private func followDepth(_ frame: DecodedFrame, at seconds: Double) -> DepthField? {
+        guard settings.current.depthFromPicture else {
+            if depthNoted != 0 {
+                depthNoted = 0
+                depth.forget()
+            }
+            return nil
+        }
+        shrink?.savesPictures = settings.current.showDepth
+        depth.offer(frame)
+        if depthNoted == 0 { depthNoted = seconds }
+        if seconds - depthNoted > 5 {
+            depthNoted = seconds
+            if let report = depth.report {
+                Log.note(String(format: "depth: %.0f%% coverage; center %.2f m, nearest %.2f m; "
+                                    + "%.1f ms latency, %d frames processed, %d skipped",
+                                report.measured * 100, 1 / max(0.001, report.ahead), 1 / max(0.001, report.nearest),
+                                report.behind, report.taken, report.passed))
+            } else {
+                Log.note("depth: no depth estimate available yet")
+            }
+        }
+        return depth.field
     }
 
     /// Updates the Persona camera anchor to stay one meter in front of the user's head.

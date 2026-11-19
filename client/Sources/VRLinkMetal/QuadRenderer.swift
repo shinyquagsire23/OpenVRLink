@@ -26,6 +26,11 @@ public final class QuadRenderer {
     private var placeholder: MTLTexture?
     private var reportedTextureFailure = false
 
+    /// Number of `Float` elements per `Vertex` in `Quad.metal`.
+    private static let floatsPerVertex = 20
+
+    private var triangleBuffers: [Int: MTLBuffer] = [:]
+
     private let depthState: MTLDepthStencilState?
     private let linearOutput: Bool
     private let reversedDepth: Bool
@@ -129,7 +134,7 @@ public final class QuadRenderer {
     /// Returns Metal's combined biplanar YCbCr pixel format for hardware
     /// YUV-to-RGB conversion in the sampler, if supported for `pixelFormat`.
     /// See also: https://github.com/WebKit/WebKit/blob/f86d3400c875519b3f3c368f1ea9a37ed8a1d11b/Source/WebGPU/WebGPU/BindGroup.mm#L43
-    private static func samplerConvertedFormat(for pixelFormat: OSType) -> MTLPixelFormat? {
+    static func samplerConvertedFormat(for pixelFormat: OSType) -> MTLPixelFormat? {
         switch pixelFormat {
         case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
              kCVPixelFormatType_Lossless_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_Lossless_420YpCbCr8BiPlanarFullRange,
@@ -170,6 +175,23 @@ public final class QuadRenderer {
         return texture
     }
 
+    /// Returns a cached 16-bit triangle index buffer for a `columns` x `rows` vertex grid.
+    private func triangles(columns: Int, rows: Int) -> MTLBuffer? {
+        let key = columns << 16 | rows
+        if let made = triangleBuffers[key] { return made }
+        var indices: [UInt16] = []
+        indices.reserveCapacity(columns * rows * 6)
+        for row in 0..<rows {
+            for column in 0..<columns {
+                let topLeft = UInt16(row * (columns + 1) + column), bottomLeft = topLeft + UInt16(columns + 1)
+                indices += [topLeft, topLeft + 1, bottomLeft, topLeft + 1, bottomLeft + 1, bottomLeft]
+            }
+        }
+        let made = device.makeBuffer(bytes: indices, length: indices.count * MemoryLayout<UInt16>.size, options: .storageModeShared)
+        triangleBuffers[key] = made
+        return made
+    }
+
     /// Draw one eye's quads, in order, as seen from `view`.
     public func draw(_ quads: [Quad], of frame: DecodedFrame, from view: EyeView,
                      with encoder: MTLRenderCommandEncoder, commands: MTLCommandBuffer) {
@@ -201,52 +223,92 @@ public final class QuadRenderer {
             let quads = eyes[min(slot, eyes.count - 1)].quads
             return quads.indices.contains(index) ? quads[index] : nil
         }
+        // Batch all quad vertices into a single buffer and record per-quad draw calls.
+        struct Draw {
+            var first: Int, columns: Int, rows: Int
+            var style: [Float]
+            var shown: [MTLTexture?], alphas: [MTLTexture?]
+        }
+        var vertices: [Float] = [], draws: [Draw] = []
         for index in 0..<(eyes.map { $0.quads.count }.max() ?? 0) {
             let pair = (0..<2).map { quad($0, index) }
             guard let style = pair[0] ?? pair[1] else { continue }
             // Color texture for each eye's quad at this index.
             let shown = pair.map { $0.flatMap { picture($0.picture) } }
             if style.fill == nil, zip(pair, shown).contains(where: { $0 != nil && $1 == nil }) { continue }
-            encoder.setFragmentTexture(shown[0] ?? placeholder, index: 0)
-            encoder.setFragmentTexture(shown[1] ?? placeholder, index: 1)
             // Optional alpha texture for each eye's quad when the frame carries separate alpha.
             let alphas = pair.map { $0?.alpha.flatMap { picture($0.picture) } }
             let hasAlpha = style.fill == nil && !zip(pair, alphas).contains(where: { $0 != nil && $1 == nil })
-            encoder.setFragmentTexture(alphas[0] ?? placeholder, index: 2)
-            encoder.setFragmentTexture(alphas[1] ?? placeholder, index: 3)
-            // Build 4 triangle-strip vertices, each containing per-eye clip-space
-            // positions, per-eye color and alpha UVs, and local quad UV coordinates.
-            var vertices: [Float] = []
-            for corner in 0..<4 {
-                let across: Float = corner % 2 == 0 ? 0 : 1, down: Float = corner < 2 ? 0 : 1
-                var positions: [Float] = [], coordinates: [Float] = [], alphaCoordinates: [Float] = []
-                for slot in 0..<2 {
-                    let eye = eyes[min(slot, eyes.count - 1)]
-                    guard let quad = pair[slot] else {
-                        // Collapse all four corners to a single point so this eye draws a zero-area quad.
-                        positions += [0, 0, 0, 1]
-                        coordinates += [0, 0]
-                        alphaCoordinates += [0, 0]
-                        continue
+            // If either eye's quad has a depth grid, subdivide both eyes to the same grid
+            // dimensions; any flat quad in the pair is bilinearly interpolated across its corners.
+            let columns = pair.compactMap { $0?.grid?.columns }.max() ?? 1, rows = pair.compactMap { $0?.grid?.rows }.max() ?? 1
+            let first = vertices.count / QuadRenderer.floatsPerVertex
+            vertices.reserveCapacity(vertices.count + (columns + 1) * (rows + 1) * QuadRenderer.floatsPerVertex)
+            // Pack one vertex per grid point containing per-eye clip-space positions,
+            // color and alpha UVs, local tile UVs, and rendering-eye depth.
+            for row in 0...rows {
+                let down = Float(row) / Float(rows)
+                for column in 0...columns {
+                    let across = Float(column) / Float(columns)
+                    var ahead: (Float, Float) = (1, 1)
+                    for slot in 0..<2 {
+                        guard let quad = pair[slot] else {
+                            // Collapse all vertices to a single point so this eye renders degenerate zero-area triangles.
+                            vertices += [0, 0, 0, 1]
+                            continue
+                        }
+                        let eye = eyes[min(slot, eyes.count - 1)]
+                        let point: Vec3
+                        if let grid = quad.grid, grid.columns == columns, grid.rows == rows {
+                            point = grid.points[row * (columns + 1) + column]
+                            if slot == 0 { ahead.0 = grid.ahead[row * (columns + 1) + column] } else { ahead.1 = grid.ahead[row * (columns + 1) + column] }
+                        } else {
+                            // Bilinearly interpolate across the four corners when this eye's quad has no matching grid.
+                            let top = quad.corners[0] * (1 - across) + quad.corners[1] * across
+                            let bottom = quad.corners[2] * (1 - across) + quad.corners[3] * across
+                            point = top * (1 - down) + bottom * down
+                        }
+                        vertices += eye.view.frustum.project(point, from: eye.view.eye, near: near, far: far, reversed: reversedDepth)
                     }
-                    positions += eye.view.frustum.project(quad.corners[corner], from: eye.view.eye,
-                                                          near: near, far: far, reversed: reversedDepth)
-                    coordinates += [across == 0 ? quad.atlasLeft : quad.atlasRight,
-                                    down == 0 ? quad.atlasTop : quad.atlasBottom]
-                    alphaCoordinates += [(across == 0 ? quad.alpha?.left : quad.alpha?.right) ?? 0,
-                                         (down == 0 ? quad.alpha?.top : quad.alpha?.bottom) ?? 0]
+                    for quad in pair {
+                        vertices.append(quad.map { $0.atlasLeft + ($0.atlasRight - $0.atlasLeft) * across } ?? 0)
+                        vertices.append(quad.map { $0.atlasTop + ($0.atlasBottom - $0.atlasTop) * down } ?? 0)
+                    }
+                    for quad in pair {
+                        vertices.append(quad?.alpha.map { $0.left + ($0.right - $0.left) * across } ?? 0)
+                        vertices.append(quad?.alpha.map { $0.top + ($0.bottom - $0.top) * down } ?? 0)
+                    }
+                    vertices.append(across)
+                    vertices.append(down)
+                    vertices.append(ahead.0)
+                    vertices.append(ahead.1)
                 }
-                vertices += positions + coordinates + alphaCoordinates + [across, down, 0, 0]
             }
-            // Pack the `QuadStyle` uniform buffer: feather width, alpha flag,
-            // alignment padding, fill color, padded chroma-key color, and key thresholds.
-            let styleValues: [Float] = [style.feather, hasAlpha ? 1 : 0, 0, 0] + (style.fill ?? [0, 0, 0, 0])
-                + keyColor + [0, chromaKey?.near ?? 0, chromaKey?.far ?? 1, 0, 0]
-            encoder.setVertexBytes(vertices, length: vertices.count * MemoryLayout<Float>.size, index: 0)
-            encoder.setFragmentBytes(styleValues, length: styleValues.count * MemoryLayout<Float>.size, index: 0)
-            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+            // Pack the `QuadStyle` uniform buffer: feather width, alpha flag, alignment padding,
+            // fill color, padded chroma-key color, and key thresholds.
+            draws.append(Draw(first: first, columns: columns, rows: rows,
+                              style: [style.feather, hasAlpha ? 1 : 0, 0, 0] + (style.fill ?? [0, 0, 0, 0])
+                                  + keyColor + [0, chromaKey?.near ?? 0, chromaKey?.far ?? 1, 0, 0],
+                              shown: shown, alphas: alphas))
+        }
+        guard !vertices.isEmpty,
+              let buffer = device.makeBuffer(bytes: vertices, length: vertices.count * MemoryLayout<Float>.size,
+                                             options: .storageModeShared)
+        else { return }
+        encoder.setVertexBuffer(buffer, offset: 0, index: 0)
+        for draw in draws {
+            guard let triangles = triangles(columns: draw.columns, rows: draw.rows) else { continue }
+            encoder.setFragmentTexture(draw.shown[0] ?? placeholder, index: 0)
+            encoder.setFragmentTexture(draw.shown[1] ?? placeholder, index: 1)
+            encoder.setFragmentTexture(draw.alphas[0] ?? placeholder, index: 2)
+            encoder.setFragmentTexture(draw.alphas[1] ?? placeholder, index: 3)
+            encoder.setFragmentBytes(draw.style, length: draw.style.count * MemoryLayout<Float>.size, index: 0)
+            // Metal offsets `vertex_id` by `baseVertex`, so every quad reuses 0-based grid indices.
+            encoder.drawIndexedPrimitives(type: .triangle, indexCount: draw.columns * draw.rows * 6, indexType: .uint16,
+                                          indexBuffer: triangles, indexBufferOffset: 0, instanceCount: 1,
+                                          baseVertex: draw.first, baseInstance: 0)
         }
         let images = frame?.images
-        commands.addCompletedHandler { _ in _ = cvTextures; _ = images }
+        commands.addCompletedHandler { _ in _ = cvTextures; _ = images; _ = buffer }
     }
 }

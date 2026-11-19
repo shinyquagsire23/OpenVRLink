@@ -214,6 +214,14 @@ public final class FaceCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDel
         return wanted.count >= 2 ? EyeFeatures.average(wanted) : nil
     }
 
+    /// Returns buffered non-blink eye measurements captured after `time` (in
+    /// `CACurrentMediaTime` seconds), ordered oldest-first.
+    public func eyeSamples(after time: TimeInterval) -> [(features: EyeFeatures, time: TimeInterval)] {
+        lock.lock()
+        defer { lock.unlock() }
+        return history.filter { $0.time > time && !$0.blinking }.map { ($0.features, $0.time) }
+    }
+
     public func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
                               from connection: AVCaptureConnection) {
         guard let picture = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }

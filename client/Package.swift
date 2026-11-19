@@ -33,7 +33,7 @@ let package = Package(
         // Platform backends (see docs/client-architecture.md).
         .target(name: "VRLinkVideoToolbox", dependencies: ["VRLinkCore"]),            // hardware video decoder
         .target(name: "VRLinkMetal", dependencies: ["VRLinkCore", "VRLinkVideoToolbox"],    // Metal quad renderer for decoded frames
-                resources: [.copy("Quad.metal")]),
+                resources: [.copy("Quad.metal"), .copy("Shrink.metal")]),
         .target(name: "VRLinkAppleAudio", dependencies: ["VRLinkCore"]),              // audio playback and mic capture
         .target(name: "VRLinkAppleNetwork"),                                          // Bonjour discovery, Ethernet detection, OS version
         .target(name: "VRLinkAppleFace", dependencies: ["VRLinkCore"]),               // camera-based face and eye tracking

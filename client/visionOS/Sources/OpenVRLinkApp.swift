@@ -46,6 +46,8 @@ struct OpenVRLinkApp: App {
     @StateObject private var keptCalibration = Kept<GazeCalibrationSpace>()
     @StateObject private var faceCalibration = FaceCalibrationRun()
     @StateObject private var keptFaceCalibration = Kept<FaceCalibrationSpace>()
+    @StateObject private var vergence = VergenceTestRun()
+    @StateObject private var keptVergence = Kept<VergenceTestSpace>()
     private static var trackingStarted = false
     /// Lazily initialized bundle of tracking and session dependencies passed to the renderer.
     private let keptInputs = Kept<StreamInputs>()
@@ -76,7 +78,7 @@ struct OpenVRLinkApp: App {
                 SettingsView(store: store)
                     .tabItem { Label("Settings", systemImage: "gearshape") }
                 ExperimentsView(store: store, connection: connection, calibration: calibration,
-                                faceCalibration: faceCalibration, persona: persona)
+                                faceCalibration: faceCalibration, vergence: vergence, persona: persona)
                     .tabItem { Label("Experiments", systemImage: "flask") }
             }
             // Combined with `.windowResizability(.contentSize)` below, locks the window to a fixed size.
@@ -131,6 +133,17 @@ struct OpenVRLinkApp: App {
         ImmersiveSpace(id: "measure") {
             CompositorLayer(configuration: StreamLayerConfiguration()) { layerRenderer in
                 CompositorDisplay(layerRenderer, inputs: inputs, measureOnly: true)?.start()
+            }
+        }
+        .immersionStyle(selection: .constant(.mixed), in: .mixed)
+
+        // Immersive space for measuring Persona eye-vergence tracking accuracy (`VergenceTestSpace`).
+        ImmersiveSpace(id: "vergence-test") {
+            if let space = keptVergence.value(unless: \.stopped, make: {
+                VergenceTestSpace(head: head, persona: persona, store: store, run: vergence,
+                                  eyeMidpoint: measured.value?.eyeMidpoint)
+            }) {
+                VergenceTestView(space: space, persona: persona, settings: store.settings)
             }
         }
         .immersionStyle(selection: .constant(.mixed), in: .mixed)
@@ -512,6 +525,7 @@ struct ExperimentsView: View {
     @ObservedObject var connection: Connection
     @ObservedObject var calibration: GazeCalibrationRun
     @ObservedObject var faceCalibration: FaceCalibrationRun
+    @ObservedObject var vergence: VergenceTestRun
     let persona: PersonaTracking
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
     @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
@@ -525,6 +539,32 @@ struct ExperimentsView: View {
                 Text("Renderer")
             } footer: {
                 Text("Not recommended; may break in future updates")
+            }
+
+            Section {
+                Toggle("Estimate depth from stereo video", isOn: $store.settings.depthFromPicture)
+                Toggle("Display estimated depth (debug)", isOn: $store.settings.showDepth)
+                    .disabled(!store.settings.depthFromPicture)
+                /*if vergence.open {
+                    Text(vergence.status)
+                    Button("Stop measuring") { closeVergence() }
+                } else {
+                    Button("Measure eye convergence") {
+                        Task {
+                            vergence.finished = false
+                            vergence.findings = []
+                            vergence.status = ""
+                            if case .opened = await openImmersiveSpace(id: "vergence-test") { vergence.open = true }
+                        }
+                    }
+                    .disabled(!store.settings.faceFromCamera || connection.immersed || calibration.open || faceCalibration.open)
+                    if !vergence.status.isEmpty { Text(vergence.status).foregroundStyle(.secondary) }
+                    ForEach(vergence.findings, id: \.self) { Text($0).font(.caption).foregroundStyle(.secondary) }
+                }*/
+            } header: {
+                Text("Reprojection")
+            } footer: {
+                Text("Estimates scene depth from stream's stereo disparity, so nearby surfaces like the floor don't swim when head motion is overpredicted.")
             }
 
             Section {
@@ -566,7 +606,7 @@ struct ExperimentsView: View {
                             if case .opened = await openImmersiveSpace(id: "calibration") { calibration.open = true }
                         }
                     }
-                    .disabled(!store.settings.faceFromCamera || connection.immersed || faceCalibration.open)
+                    .disabled(!store.settings.faceFromCamera || connection.immersed || faceCalibration.open || vergence.open)
                     if !calibration.status.isEmpty { Text(calibration.status).foregroundStyle(.secondary) }
                 }
             }
@@ -584,12 +624,19 @@ struct ExperimentsView: View {
                             _ = await openImmersiveSpace(id: "face-calibration")
                         }
                     }
-                    .disabled(!store.settings.faceFromCamera || connection.immersed || calibration.open)
+                    .disabled(!store.settings.faceFromCamera || connection.immersed || calibration.open || vergence.open)
                     if !faceCalibration.status.isEmpty { Text(faceCalibration.status).foregroundStyle(.secondary) }
                 }
             }
         }
         .contentMargins(.top, 30, for: .scrollContent)
+    }
+
+    private func closeVergence() {
+        Task {
+            await dismissImmersiveSpace()
+            vergence.open = false
+        }
     }
 
     private func close() {

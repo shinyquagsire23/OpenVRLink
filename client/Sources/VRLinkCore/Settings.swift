@@ -71,6 +71,13 @@ public struct Settings: Codable, Equatable {
     /// foveation, but is required to keep the Spatial Persona camera active
     /// (docs/client-architecture.md, "Experiments").
     public var realityKitRenderer = false
+    /// Experimental (visionOS): estimate scene depth from stereo disparity
+    /// between the left and right eye images and warp the video quads to match
+    /// (`DepthField`) instead of projecting onto a flat plane at 10 m. This
+    /// reduces swim on nearby surfaces like the floor when head-pose prediction overshoots.
+    public var depthFromPicture = true
+    /// Overlay a translucent color-coded depth grid (red near, blue far) to visualize `depthFromPicture`.
+    public var showDepth = false
 
     public static let fovScaleRange: ClosedRange<Float> = 0.2...1.6
 
@@ -102,6 +109,8 @@ public struct Settings: Codable, Equatable {
         if let found = try? saved.decodeIfPresent(FaceCalibration.self, forKey: .faceCalibration) { faceCalibration = found }
         read(.closeWindowOnEntry, into: &closeWindowOnEntry)
         read(.realityKitRenderer, into: &realityKitRenderer)
+        read(.depthFromPicture, into: &depthFromPicture)
+        read(.showDepth, into: &showDepth)
         if let found = try? saved.decodeIfPresent(GazeCalibration.self, forKey: .gazeCalibration) { gazeCalibration = found }
         self = tidied()
     }
