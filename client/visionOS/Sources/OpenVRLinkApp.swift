@@ -209,14 +209,10 @@ enum AppVersion {
     static let changes = """
     What's changed?
 
-    • Fixed borders being transparent when chroma keying is off and FoV has been narrowed
-    • Fixed games exiting when the app exits; SteamVR will now only exit automatically if no games are running
-    • Fixed frame pacing graph not showing blue ping line
-    • Optimized packet handling to reduce unnecessary copies (improved battery life)
-    • SteamVR now shows available framerates, and will attempt to switch framerates if requested*
-    • SteamVR is now told the current running framerate
-    • Default resolution sent to SteamVR is now more accurate (except in RealityKit)
-    • Updated protocol to version 14
+    • Added a new stereo-disparity depth prediction Experiment, default On. If Wi-Fi or game timing is unstable, the view should be more stable. If you find an area or game that predicts particularly terribly, or if performance is significantly worse (especially on M2), please file feedback so I can tune it better.
+    • Added support for WiVRn hosts. Discovery may be a bit buggy, so use direct IP connection if needed.
+    • Fixed microphone session getting interrupted by calls; the app will now attempt to recover from microphone interruptions.
+    • Fixed the audio session not allowing mixing with other applications (Mac Virtual Display)
 
     ___________________________
 
@@ -224,8 +220,8 @@ enum AppVersion {
 
     • With the RealityKit renderer, taking the headset off and putting it back on does not resume the stream.
     • Framerate selection does not work correctly on M5 Vision Pros
-    • Streaming from ARM64 Linux machines (eg, DGX Spark) is currently not working.
-    • PSVR2 models requires installing some assets on your PC using scripts from the repo (companion app ETA son)
+    • Streaming from ARM64 Linux machines (eg, DGX Spark) for SteamVR Link is currently not working.
+    • PSVR2 models require installing some assets on your PC using scripts from the repo (companion app ETA son)
     """
 }
 
@@ -316,8 +312,24 @@ struct EntryView: View {
                 guard connection.active, connection.waitingForPicture else { return }
                 try? await Task.sleep(for: .milliseconds(20))
             }
-            guard case .opened = await openImmersiveSpace(id: realityKit ? "stream-realitykit" : "stream") else {
+            // Opening can fail transiently (most often right after the measurement space was dismissed,
+            // or while the system is busy with another scene), so retry briefly before giving up, and
+            // report the failure instead of silently returning to the host list.
+            var opened = false
+            for attempt in 0..<3 {
+                if attempt > 0 { try? await Task.sleep(for: .milliseconds(600)) }
+                guard connection.active, connection.waitingForPicture else { return }
+                let result = await openImmersiveSpace(id: realityKit ? "stream-realitykit" : "stream")
+                if case .opened = result {
+                    opened = true
+                    break
+                }
+                print("EntryView: opening the immersive space failed (\(result)), attempt \(attempt + 1) of 3")
+                if case .userCancelled = result { break }
+            }
+            guard opened else {
                 connection.stop()
+                connection.status = "Could not open the immersive space; try connecting again"
                 return
             }
             connection.immersed = true

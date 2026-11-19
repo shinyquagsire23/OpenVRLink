@@ -32,7 +32,11 @@ public final class AudioOutput {
     public init?(buffer: PlaybackBuffer) {
         self.buffer = buffer
         configureSession()
-        guard start() else { return nil }
+        // A failed first start is not fatal: the audio hardware can be briefly unavailable while
+        // connecting (for example, when another app such as Mac Virtual Display holds the output or
+        // the session is mid-interruption). The watchdog below keeps retrying, where returning nil
+        // here would leave the whole stream silent until the user reconnects.
+        if !start() { print("AudioOutput: output not available yet, will keep trying") }
         observeSession()
         let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in self?.check() }
         RunLoop.main.add(timer, forMode: .common)
