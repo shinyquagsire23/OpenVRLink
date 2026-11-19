@@ -2,12 +2,13 @@
 
 [Join the Testflight!](https://testflight.apple.com/join/VpfAxE6A)
 
-An open-source client compatible with Valve's Steam VR Link pairing and streaming protocol, written in Swift for visionOS (and eventually other platforms).
+An open-source client compatible with Valve's Steam VR Link (and WiVRn) pairing and streaming protocol, written in Swift for visionOS (and eventually other platforms).
 
 ## Added features
 
  - (visionOS) Persona-based dynamic foveation (30Hz, slow), with eye gaze calibration
  - (visionOS) Persona-based face tracking, with calibration
+ - Stereo disparity-based depth prediction for reprojection
  - Chroma keying, with the option to disable it in games only
  - Gaze-pinch interactions
  - Double-clack controllers to swap between controllers and hand tracking
