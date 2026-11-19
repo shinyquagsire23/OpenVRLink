@@ -50,8 +50,8 @@ Everything compiles into one Swift package.
 
 ## On the PC
 
-- **Controllers.** A PlayStation VR2 Sense controller is presented to SteamVR as a Touch controller drawn with the Sense model. 
-  The model has to be put on the PC once: run `tools/install-sense-model.ps1` there (it copies and adapts the models from SteamVR's own `playstation_vr2` driver folder), then restart SteamVR.
+- **Controllers.** A PlayStation VR2 Sense controller is presented to SteamVR as a Touch controller using the Sense render model.
+  To install the model on your PC, run `openvrlink-companion install` (see `companion/README.md`), which copies and adapts the models from an existing installation such as Sony's PlayStation VR2 App, then restart SteamVR. On Windows, you can also use the standalone `tools/install-sense-model.ps1` script.
 - **Face and eye tracking for other programs** (VRChat through VRCFaceTracking, for instance): in SteamVR's Steam Link settings turn on
   OSC, face tracking over OSC, and sharing eye tracking. Install the Steam Link module in VRCFaceTracking and give both the same port. SteamVR only offers these when the client says it has eye or face tracking, which it does when the Persona experiment is on.
 

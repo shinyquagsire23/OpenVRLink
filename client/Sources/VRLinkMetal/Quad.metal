@@ -42,7 +42,24 @@ vertex Fragment vertexMain(uint index [[vertex_id]], ushort eye [[amplification_
 // keyColor is in the same light as the sampled picture; keyRange is
 // the near and far blend distances.
 // hasAlpha: the frame has a picture of transparency (not zero), or is opaque.
-struct QuadStyle { float feather; float hasAlpha; float4 fill; float4 keyColor; float2 keyRange; };
+// gamma is FrameLayout.encodingGamma (1 means no gamma adjustment).
+// linearLight is non-zero when the atlas texture is sampled as linear light rather than sRGB.
+struct QuadStyle { float feather; float hasAlpha; float gamma; float linearLight; float4 fill; float4 keyColor; float2 keyRange; };
+
+// Restores sRGB values that the host encoded as v^(1/gamma) to preserve dark detail.
+// If the atlas was sampled as linear light, convert to sRGB before applying pow(v, gamma)
+// and convert back to linear light afterward.
+float3 undoEncodingGamma(float3 color, float gamma, bool linearLight) {
+    float3 encoded = saturate(color);
+    if (linearLight) {
+        encoded = mix(encoded * 12.92, 1.055 * pow(encoded, float3(1.0 / 2.4)) - 0.055, float3(encoded > 0.0031308));
+    }
+    encoded = pow(encoded, float3(gamma));
+    if (linearLight) {
+        encoded = mix(encoded / 12.92, pow((encoded + 0.055) / 1.055, float3(2.4)), float3(encoded > 0.04045));
+    }
+    return encoded;
+}
 
 // Whether there is chroma keying at all is fixed when the pipeline is
 // built, so that it costs nothing when off. Its color and distances
@@ -115,8 +132,11 @@ fragment Blended fragmentMain(Fragment in [[stage_in]], texture2d<float> atlas [
         return out;
     }
     float2 uv = in.uv / in.ahead, alphaUV = in.alphaUV / in.ahead, tile = in.tile / in.ahead;
-    half3 color = in.eye == 0 ? half3(atlas.sample(atlasSampler, uv).rgb)
-                              : half3(otherEyeAtlas.sample(atlasSampler, uv).rgb);
+    float3 sampled = in.eye == 0 ? atlas.sample(atlasSampler, uv).rgb : otherEyeAtlas.sample(atlasSampler, uv).rgb;
+    if (style.gamma > 1.0) {
+        sampled = undoEncodingGamma(sampled, style.gamma, style.linearLight != 0.0);
+    }
+    half3 color = half3(sampled);
     half4 colorOut = half4(color.rgb, 1.0);
     // A host that sends transparency sends it as a picture of its own,
     // whose brightness is how opaque the colors are; the colors come

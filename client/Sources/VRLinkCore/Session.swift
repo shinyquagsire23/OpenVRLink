@@ -70,6 +70,10 @@ public final class StreamSession: StreamingSession {
     public var microphoneSink: any MicrophoneSink { microphone }
     private var clock = ClockOffset()
     private var statisticsSent = 0
+    /// OpenVRLink extension handshake state; guarded by `lock`.
+    private var extensions = HostExtensions()
+    private var extensionsReported: UInt32?
+    private var gammaReported: Float = 1
     private let started = Uptime.nanoseconds
     private var sequence: UInt16 = 0
     private var frameCounter: Int32 = 0
@@ -412,7 +416,12 @@ public final class StreamSession: StreamingSession {
     /// rotating steady-state reception metric.
     private func statistics() -> SVLElement {
         var out = Bytes()
-        let steady = [("cRXpass", 100.0), ("cRXerr", 0.0), ("cFramePhase", 0.3)]
+        // Rotate the two extension handshake records alongside the steady-state metrics.
+        // An unpatched host stores and echoes them without acting on them.
+        lock.lock()
+        let ours = extensions.records(atMilliseconds: Uptime.nanoseconds / 1_000_000)
+        lock.unlock()
+        let steady = [("cRXpass", 100.0), ("cRXerr", 0.0), ("cFramePhase", 0.3)] + ours.map { ($0.key, $0.value) }
         statisticsSent &+= 1
         for (key, value) in [("cPingMS", Double(clock.roundTrip) / 1000), ("cPingAMS", Double(clock.peakDelay) / 1000),
                              steady[statisticsSent % steady.count]] {
@@ -490,6 +499,22 @@ public final class StreamSession: StreamingSession {
         }
     }
 
+    /// Feeds the host's extension records to the handshake and logs when a patched host is first recognized.
+    private func receive(extensionRecords: [(key: String, value: Double)]) {
+        let time = Uptime.nanoseconds / 1_000_000
+        lock.lock()
+        for record in extensionRecords { extensions.receive(key: record.key, value: record.value, atMilliseconds: time) }
+        let version = extensions.hostPresent(atMilliseconds: time) ? extensions.hostVersion : nil
+        let report = version != nil && version != extensionsReported
+        if report { extensionsReported = version }
+        let available = extensions.available
+        lock.unlock()
+        if report, let version {
+            onLog?("the host has the OpenVRLink extensions (version \(version)); encoding gamma "
+                   + (available.contains(.encodingGamma) ? "available" : "not available"))
+        }
+    }
+
     /// Send what the assembler wants resent and hand finished frames on.
     private func drainAssembler() {
         let requests = assembler.takeRequests()
@@ -499,7 +524,17 @@ public final class StreamSession: StreamingSession {
             lastFrame = (frame.frameID, time, UInt64(Date().timeIntervalSince1970 * 1_000_000))
             handedToDecoder[Int(frame.frameID) % StreamSession.framesRemembered] = time
             framesReceived += 1
-            onFrame?(EncodedFrame(frameID: frame.frameID, data: frame.data, layout: frame.metadata.layout(profile: profile)))
+            var layout = frame.metadata.layout(profile: profile)
+            lock.lock()
+            layout.encodingGamma = extensions.encodingGamma(atMilliseconds: Uptime.nanoseconds / 1_000_000)
+            let gammaChanged = layout.encodingGamma != gammaReported
+            gammaReported = layout.encodingGamma
+            lock.unlock()
+            if gammaChanged {
+                onLog?(layout.encodingGamma > 1 ? "frames now arrive with encoding gamma \(layout.encodingGamma)"
+                                                : "frames now arrive without encoding gamma")
+            }
+            onFrame?(EncodedFrame(frameID: frame.frameID, data: frame.data, layout: layout))
         }
     }
 
@@ -524,6 +559,7 @@ public final class StreamSession: StreamingSession {
                     }
                     clock.update(peerTime: descriptor.txTime, peerOffset: descriptor.hostClockOffset, localTime: now())
                     valuesCompleted(values.receive(descriptor.valueTransportBytes))
+                    if !descriptor.extensionRecords.isEmpty { receive(extensionRecords: descriptor.extensionRecords) }
                     assembler.accept(descriptor: descriptor, group: Int(element.index), now: now())
                 } else {
                     assembler.accept(packet: element, now: now())

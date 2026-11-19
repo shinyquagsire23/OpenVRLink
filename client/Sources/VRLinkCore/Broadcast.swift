@@ -23,7 +23,10 @@ public struct SessionArgs {
 
     init?(_ text: String) {
         let fields = text.split(separator: "~", omittingEmptySubsequences: false).map(String.init)
-        guard fields.count >= 8, let port = UInt16(fields[1]) else { return nil }
+        // Field 2 holds the stream's UDP port. Older hosts also repeat the port in field 1,
+        // while SteamVR 2.19.4+ sends `0` in field 1 (`<ip>~0~10400~…`), so field 1 is used only as a fallback.
+        guard fields.count >= 8, let port = [fields[2], fields[1]].compactMap({ UInt16($0) }).first(where: { $0 != 0 })
+        else { return nil }
         host = fields[0]
         self.port = port
         token = fields[7]

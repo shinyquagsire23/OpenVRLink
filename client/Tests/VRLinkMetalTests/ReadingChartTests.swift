@@ -55,6 +55,51 @@ final class ReadingChartTests: XCTestCase {
         XCTAssertTrue(lines.allSatisfy { $0.split(separator: " ").allSatisfy { $0.count == 3 } })
     }
 
+    /// Draws the chart with `QuadRenderer` into a 256x128 BGRA target and returns its bytes.
+    private func drawn(_ chart: DecodedFrame, colorFormat: MTLPixelFormat = .bgra8Unorm) throws -> [UInt8] {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let renderer = try XCTUnwrap(QuadRenderer(device: device, colorFormat: colorFormat))
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: colorFormat, width: 256, height: 128, mipmapped: false)
+        descriptor.usage = [.renderTarget]
+        let target = try XCTUnwrap(device.makeTexture(descriptor: descriptor))
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = target
+        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        pass.colorAttachments[0].storeAction = .store
+        let commands = try XCTUnwrap(device.makeCommandQueue()?.makeCommandBuffer())
+        let encoder = try XCTUnwrap(commands.makeRenderCommandEncoder(descriptor: pass))
+        let eye = Pose(position: Vec3(0, 0, 0), right: Vec3(1, 0, 0), up: Vec3(0, 1, 0), forward: Vec3(0, 0, -1))
+        let view = EyeView(eye: eye, frustum: Frustum(left: -1, right: 1, down: -0.5, up: 0.5))
+        let quad = Quad(corners: view.frustum.corners(from: eye, distance: 2), atlasLeft: 0, atlasTop: 0, atlasRight: 1, atlasBottom: 1)
+        renderer.draw([quad], of: chart, from: view, with: encoder, commands: commands)
+        encoder.endEncoding()
+        commands.commit()
+        commands.waitUntilCompleted()
+        var pixels = [UInt8](repeating: 0, count: 256 * 128 * 4)
+        target.getBytes(&pixels, bytesPerRow: 256 * 4, from: MTLRegionMake2D(0, 0, 256, 128), mipmapLevel: 0)
+        return pixels
+    }
+
+    /// Verifies that `QuadRenderer` raises sRGB values to `encodingGamma` when sampling either sRGB or linear textures.
+    func testTheRendererUndoesTheEncodingGamma() throws {
+        let plain = try XCTUnwrap(ReadingChart.frame(heading: "", lines: [], footing: "", seed: 3))
+        var layout = FrameLayout.empty
+        layout.encodingGamma = 2
+        let brightened = DecodedFrame(frameID: 0, images: plain.images, layout: layout)
+        for format in [MTLPixelFormat.bgra8Unorm, .bgra8Unorm_srgb] {
+            let before = try drawn(plain, colorFormat: format), after = try drawn(brightened, colorFormat: format)
+            // An sRGB render target re-encodes linear output to sRGB bytes, so both pixel formats produce matching byte values.
+            var checked = 0
+            for pixel in stride(from: 0, to: before.count, by: 4 * 97) where before[pixel + 1] > 24 {
+                let value = Double(before[pixel + 1]) / 255
+                XCTAssertEqual(Double(after[pixel + 1]) / 255, value * value, accuracy: 0.03, "\(format) at byte \(pixel)")
+                checked += 1
+            }
+            XCTAssertGreaterThan(checked, 50)
+        }
+    }
+
     /// Verifies that `QuadRenderer` samples the NV12 chart frame cleanly, preserving grayscale balance,
     /// the bright border, and bright text.
     func testTheRendererDrawsTheChart() throws {

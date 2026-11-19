@@ -17,6 +17,10 @@ client's shared libraries.
 | [svl-audio/](svl-audio/) | audio downlink, microphone uplink, audio FEC, jitter buffer | SVL elements |
 | [svl-timing/](svl-timing/) | clock sync, the frame phase loop, per-frame timing reports | SVL elements |
 
+[openvrlink-extensions.md](openvrlink-extensions.md) covers the optional
+protocol extensions negotiated between OpenVRLink and `driver_openvrlink` over
+the key/value channel.
+
 The sections above are ordered to follow a session from discovery to the first
 rendered frame. [client-architecture.md](client-architecture.md) covers the
 design of the cross-platform client built on top of these protocol layers.

@@ -92,7 +92,11 @@ public struct HostConnector {
         }
         if cancelled() { return nil }
         guard let session = StreamSession(args, profile: profile, interface: interface) else {
-            throw BroadcastError.badResponse("the host offered a transport this client does not have implemented yet (token kind \(args.token.prefix(4)))")
+            // Report whether session creation failed due to an unsupported transport token or a socket error.
+            guard SVLLink(token: args.token) != nil else {
+                throw BroadcastError.badResponse("the host offered a transport this client does not have implemented yet (token kind \(args.token.prefix(4)), \(args.token.count) characters)")
+            }
+            throw BroadcastError.badResponse("could not open a socket to \(args.host) port \(args.port)" + (interface.map { " on \($0)" } ?? ""))
         }
         log("transport: \(session.transportName)")
         return (session, host.hostname)

@@ -215,6 +215,7 @@ public final class QuadRenderer {
         // Match the chroma-key color space to the sampled texture values:
         // linear light when linearOutput is enabled, or encoded sRGB values otherwise.
         let keyColor = (linearOutput ? chromaKey?.linearColor : chromaKey?.color) ?? [0, 0, 0]
+        let encodingGamma = frame?.layout.encodingGamma ?? 1
         // Each eye can have a different quad layout or count (for example, when
         // eye-tracked foveation splits each eye's tiles differently). Each draw
         // call pairs one quad slot per eye; if one eye has fewer quads, its
@@ -284,10 +285,11 @@ public final class QuadRenderer {
                     vertices.append(ahead.1)
                 }
             }
-            // Pack the `QuadStyle` uniform buffer: feather width, alpha flag, alignment padding,
-            // fill color, padded chroma-key color, and key thresholds.
+            // Pack the `QuadStyle` uniform buffer: feather width, alpha flag, encoding gamma,
+            // linear-light flag, fill color, padded chroma-key color, and key thresholds.
             draws.append(Draw(first: first, columns: columns, rows: rows,
-                              style: [style.feather, hasAlpha ? 1 : 0, 0, 0] + (style.fill ?? [0, 0, 0, 0])
+                              style: [style.feather, hasAlpha ? 1 : 0, encodingGamma, linearOutput ? 1 : 0]
+                                  + (style.fill ?? [0, 0, 0, 0])
                                   + keyColor + [0, chromaKey?.near ?? 0, chromaKey?.far ?? 1, 0, 0],
                               shown: shown, alphas: alphas))
         }

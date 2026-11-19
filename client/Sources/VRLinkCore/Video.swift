@@ -88,6 +88,8 @@ struct FrameDescriptor {
     let metadata: FrameMetadata
     /// Value-transport payload extracted from the descriptor trailer (which follows haptics, stats records, and timing events).
     let valueTransportBytes: Bytes
+    /// Key-value records from the trailer that belong to the OpenVRLink extension handshake (`HostExtensions`).
+    let extensionRecords: [(key: String, value: Double)]
 
     init(_ element: SVLElement) {
         // `element.value` is a slice of the datagram; `byte` and `integer(at:)` index relative to `startIndex`.
@@ -107,10 +109,22 @@ struct FrameDescriptor {
         if value.count >= trailer + 16, byte(trailer + 0x0C) == 3 {
             let records = Int(byte(trailer + 0x0D)), events = Int(byte(trailer + 0x0E))
             let start = trailer + 0x10 + 32 * records + 8 * events
+            var extensions: [(key: String, value: Double)] = []
+            if trailer + 0x10 + 32 * records <= value.count {
+                for record in 0..<records {
+                    // Each record is a 20-byte NUL-padded key, a float64 value and a 32-bit timestamp.
+                    let at = trailer + 0x10 + 32 * record
+                    guard byte(at) == UInt8(ascii: "o"), byte(at + 1) == UInt8(ascii: "x") else { continue }
+                    let key = String(decoding: (0..<20).map { byte(at + $0) }.prefix { $0 != 0 }, as: UTF8.self)
+                    extensions.append((key, Double(bitPattern: value.integer(at: at + 0x14))))
+                }
+            }
+            extensionRecords = extensions
             let end = min(start + Int(byte(trailer + 0x0F)), value.count)
             valueTransportBytes = start < end ? Bytes(value.dropFirst(start).prefix(end - start)) : []
         } else {
             valueTransportBytes = []
+            extensionRecords = []
         }
     }
 }

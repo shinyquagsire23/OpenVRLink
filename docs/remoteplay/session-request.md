@@ -100,7 +100,7 @@ string.
 | field | meaning |
 |---|---|
 | 0 | host IP address (prepended by the client in step 3) |
-| 1, 2 | UDP port, repeated twice — `10400` in both fields in every capture. **Inferred**: one is the host port and one is the client port; see [../svl-transport/](../svl-transport/) |
+| 1, 2 | UDP port (`10400` in both fields in earlier captures). SteamVR 2.19.4 (2026-11-19, **observed** with streaming encryption enabled) returns `~0~10400~0,0,0~~~~AES0…` while binding its `vrlink` UDP socket to port 10400, so field 2 is the host port to connect to and field 1 can be `0`. The purpose of field 1 is unknown |
 | 3 | `sStartInfo`, three comma-separated integers. `0,0,0` in this project's captures, `0,0,1` in an older Klepton log. Meaning unknown |
 | 4–6 | empty |
 | 7 | transport key: a four-character prefix (`MID0`) followed by 44 characters of URL-safe base64 encoding 32 bytes. See [../svl-transport/](../svl-transport/) |

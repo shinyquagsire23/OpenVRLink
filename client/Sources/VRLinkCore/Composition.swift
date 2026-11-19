@@ -139,6 +139,9 @@ public struct FrameLayout {
     public var pictures: Int
     /// Effective per-eye resolution in pixels at peak stream density, used to size intermediate render targets.
     public var eyePixels: (width: Int, height: Int)
+    /// Encoding gamma applied by the host to this frame's sRGB values (`HostExtensions`).
+    /// The renderer restores the original values with `value^encodingGamma` (`1` means no gamma adjustment).
+    public var encodingGamma: Float = 1
 
     public init(views: [View], pictures: Int = 1, eyePixels: (width: Int, height: Int)) {
         self.views = views

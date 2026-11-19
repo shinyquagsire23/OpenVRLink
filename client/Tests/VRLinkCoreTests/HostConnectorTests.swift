@@ -219,4 +219,17 @@ final class HostConnectorTests: XCTestCase {
             XCTAssertEqual(interfacesAsked, 2, "\(kind)")
         }
     }
+
+    func testTheStreamPortIsTheThirdFieldOfTheSessionString() {
+        let token = "MID0" + String(repeating: "A", count: 44)
+        XCTAssertEqual(SessionArgs("192.0.2.10~10400~10400~0,0,0~~~~" + token)?.port, 10400)
+        // SteamVR 2.19.4+ sends 0 in field 1.
+        let updated = SessionArgs("192.0.2.10~0~10400~0,0,0~~~~" + token)
+        XCTAssertEqual(updated?.port, 10400)
+        XCTAssertEqual(updated?.host, "192.0.2.10")
+        XCTAssertEqual(updated?.token, token)
+        XCTAssertEqual(SessionArgs("192.0.2.10~10400~0~0,0,0~~~~" + token)?.port, 10400)
+        XCTAssertNil(SessionArgs("192.0.2.10~0~0~0,0,0~~~~" + token))
+        XCTAssertNil(SessionArgs("192.0.2.10~10400~10400"))
+    }
 }
