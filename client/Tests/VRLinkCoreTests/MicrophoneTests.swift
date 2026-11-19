@@ -90,4 +90,27 @@ final class MicrophoneTests: XCTestCase {
         taken += queue.take().reduce(0) { $0 + $1.count }
         XCTAssertEqual(taken, 2000 * 250)
     }
+
+    func testAStalledStreamIsRebuiltPromptlyThenLessOftenWhileItStaysDown() {
+        var stall = StallWatch(limit: 1, backedOff: 3)
+        // Do nothing while audio is still arriving within the 1s limit.
+        XCTAssertFalse(stall.shouldRestart(quietFor: 0.01))
+        XCTAssertFalse(stall.shouldRestart(quietFor: 0.9))
+        // Once silent past 1s, request a restart on each check for the first four attempts.
+        for attempt in 1...4 {
+            XCTAssertTrue(stall.shouldRestart(quietFor: 1.1), "attempt \(attempt)")
+            XCTAssertEqual(stall.restartsInARow, attempt)
+        }
+        // After four failed attempts in a row, wait for the 3s backoff interval before retrying.
+        XCTAssertFalse(stall.shouldRestart(quietFor: 1.6))
+        XCTAssertFalse(stall.shouldRestart(quietFor: 2.9))
+        XCTAssertTrue(stall.shouldRestart(quietFor: 3.1))
+        // Rebuilding resets the caller's silence timer, so 0.5s of silence shouldn't clear restartsInARow.
+        XCTAssertFalse(stall.shouldRestart(quietFor: 0.5))
+        XCTAssertEqual(stall.restartsInARow, 5)
+        // Fresh audio (< 0.1s since last sample) resets restartsInARow so the next stall retries after 1s again.
+        XCTAssertFalse(stall.shouldRestart(quietFor: 0.02))
+        XCTAssertEqual(stall.restartsInARow, 0)
+        XCTAssertTrue(stall.shouldRestart(quietFor: 1.2))
+    }
 }

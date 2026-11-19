@@ -344,7 +344,7 @@ public final class CompositorDisplay {
         }
         shrink?.savesPictures = settings.current.showDepth
         if let picked, picked.isNew {
-            // Sample depth densely around the hands or controllers and the host's foveal inset.
+            // Sample depth densely around the hands or controllers and straight ahead.
             depth.offer(picked.frame, interests: DepthSampling.interests(layout: picked.frame.layout, hands: inputs.handPositions()))
         }
         if depthNoted == 0 { depthNoted = seconds }

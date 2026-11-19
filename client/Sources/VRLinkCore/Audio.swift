@@ -263,3 +263,37 @@ public final class MicrophoneUplink: MicrophoneSink {
         return out
     }
 }
+
+/// Tracks silence duration and retry backoff for restarting stalled audio streams.
+///
+/// System events like incoming call banners, route changes, or another app taking
+/// audio hardware can stop `AVAudioEngine` without an error or an end-of-interruption
+/// notification. Callers poll `shouldRestart(quietFor:)` with the elapsed time since
+/// audio last flowed. Once silence exceeds `limit`, it triggers a restart on each poll
+/// up to `patience` times in a row, then backs off to `backedOff` seconds so we don't
+/// repeatedly hammer a device that is busy (such as during a phone call).
+public struct StallWatch {
+    /// How many seconds of silence count as a stall.
+    public var limit: Double
+    /// Retry interval in seconds after `patience` consecutive restarts fail to recover audio.
+    public var backedOff: Double
+    public var patience = 4
+    /// Silence shorter than this threshold (in seconds) resets `restartsInARow`.
+    public var healthy = 0.1
+    public private(set) var restartsInARow = 0
+
+    public init(limit: Double, backedOff: Double) {
+        self.limit = limit
+        self.backedOff = backedOff
+    }
+
+    /// Returns `true` if the caller should rebuild the audio stream, given how many seconds it has been quiet.
+    public mutating func shouldRestart(quietFor seconds: Double) -> Bool {
+        guard seconds > (restartsInARow >= patience ? backedOff : limit) else {
+            if seconds < healthy { restartsInARow = 0 }
+            return false
+        }
+        restartsInARow += 1
+        return true
+    }
+}

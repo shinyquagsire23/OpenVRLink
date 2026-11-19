@@ -414,7 +414,7 @@ public final class RealityKitDisplay {
             return nil
         }
         shrink?.savesPictures = settings.current.showDepth
-        // Sample depth densely around the hands or controllers and the host's foveal inset.
+        // Sample depth densely around the hands or controllers and straight ahead.
         depth.offer(frame, interests: DepthSampling.interests(layout: frame.layout, hands: inputs.handPositions()))
         if depthNoted == 0 { depthNoted = seconds }
         if seconds - depthNoted > 5 {

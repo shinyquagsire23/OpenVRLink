@@ -25,12 +25,9 @@ public final class AudioOutput {
     private var observers: [NSObjectProtocol] = []
     /// When the sound card last asked for audio.
     private let lastRender = Timestamp()
-    private var restartsInARow = 0
-
-    /// How long without a request for audio counts as stopped.
-    private static let silenceLimit = 0.5
-    /// After repeated restarts that did not help, wait this long between tries.
-    private static let backedOffLimit = 3.0
+    /// Treat the output as stopped after 0.5 seconds without a render callback,
+    /// backing off to 3 seconds after repeated restarts fail to recover it.
+    private var stall = StallWatch(limit: 0.5, backedOff: 3)
 
     public init?(buffer: PlaybackBuffer) {
         self.buffer = buffer
@@ -63,7 +60,9 @@ public final class AudioOutput {
                 // Make sure that the mic mode is set to do noise cancellation
                 try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.mixWithOthers, .allowBluetoothA2DP, .allowAirPlay])
             } else {
-                try session.setCategory(.playback, mode: .default)
+                // Allow mixing with audio from other apps (such as Mac Virtual Display running
+                // alongside an immersive space) so starting playback doesn't silence them.
+                try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
             }
             try session.setPreferredSampleRate(Double(PlaybackBuffer.sampleRate))
             try session.setActive(true)
@@ -113,12 +112,7 @@ public final class AudioOutput {
     }
 
     private func check() {
-        let limit = restartsInARow >= 4 ? AudioOutput.backedOffLimit : AudioOutput.silenceLimit
-        guard lastRender.secondsSince() > limit else {
-            if lastRender.secondsSince() < 0.1 { restartsInARow = 0 }
-            return
-        }
-        restartsInARow += 1
+        guard stall.shouldRestart(quietFor: lastRender.secondsSince()) else { return }
 
         print("AudioOutput: output went quiet, rebuilding...")
         resume()

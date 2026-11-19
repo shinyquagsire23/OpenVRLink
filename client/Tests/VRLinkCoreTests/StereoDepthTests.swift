@@ -301,7 +301,7 @@ final class StereoDepthTests: XCTestCase {
         XCTAssertEqual(DepthSampling.cells(columns: columns, rows: rows, window: window, interests: [outside]), lattice)
     }
 
-    func testPlacesOfInterestComeFromTheHandsAndTheSharpInset() {
+    func testPlacesOfInterestComeFromTheHandsAndStraightAhead() {
         func eye(_ aside: Float) -> Pose {
             Pose(position: Vec3(aside, 1.6, 0), right: Vec3(1, 0, 0), up: Vec3(0, 1, 0), forward: Vec3(0, 0, -1))
         }
@@ -318,9 +318,9 @@ final class StereoDepthTests: XCTestCase {
         XCTAssertEqual(found[0].across, 0.4, accuracy: 1e-4)
         XCTAssertEqual(found[0].up, -0.6, accuracy: 1e-4)
         XCTAssertEqual(found[0].radius, DepthSampling.handReach / 0.5, accuracy: 1e-4)
-        // The second interest region should sit at the center of the foveal inset.
-        XCTAssertEqual(found[1], DepthSampling.Interest(across: 0.3, up: -0.2, radius: DepthSampling.sharpRadius))
-        // Fall back to straight ahead when the layout has no foveal inset.
+        // The central interest region stays fixed at (0, 0) even when the gaze-tracked foveal inset is off-center.
+        XCTAssertEqual(found[1], DepthSampling.Interest(across: 0, up: 0, radius: DepthSampling.sharpRadius))
+        // Layouts without a foveal inset also place the central region at (0, 0).
         XCTAssertEqual(DepthSampling.interests(layout: layout(inset: nil), hands: []),
                        [DepthSampling.Interest(across: 0, up: 0, radius: DepthSampling.sharpRadius)])
         // Clamp the tangent radius for distant and very close hands.

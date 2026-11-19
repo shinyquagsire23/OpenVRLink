@@ -461,7 +461,7 @@ public struct StereoMatcher {
     /// When `true`, `measured` only matches the subset of grid cells selected by
     /// `DepthSampling.cells` instead of the full grid. It samples a sparser base
     /// lattice across the view and fills in every cell inside the regions of
-    /// interest, such as around a hand or the foveal inset. `DepthSmoother` then
+    /// interest, such as around a hand or straight ahead. `DepthSmoother` then
     /// inpaints the unmeasured cells from nearby confident readings.
     public var sampled = false
 
@@ -634,27 +634,22 @@ public enum DepthSampling {
     /// Each hand or controller is sampled at full density within this world-space radius (in meters),
     /// which covers the hand, held objects, and motion since the frame was rendered.
     public static let handReach: Float = 0.17
-    /// The region around the center of the host's foveal inset is sampled at full density within this tangent radius.
+    /// The region straight ahead is sampled at full density within this tangent radius.
     public static let sharpRadius: Float = 0.3
     /// Beyond `thinnedAbove` vertically or `thinnedBeside` horizontally, the base lattice skips half of its remaining cells.
     public static let thinnedAbove: Float = 0.45, thinnedBeside: Float = 0.85
 
-    /// Builds the regions of interest for `layout` from the current `hands` positions
-    /// and the host's foveal inset. Each visible hand or controller gets a region sized
-    /// by its distance, and another region is placed at the center of the feathered
-    /// foveal inset (which tracks gaze when eye tracking is active, or falls back to
-    /// straight ahead when the layout has no inset).
+    /// Builds the regions of interest for `layout` from the current `hands` positions.
+    /// Each visible hand or controller gets a region scaled by its distance, plus a
+    /// fixed region straight ahead. We keep the central region fixed rather than
+    /// tracking the host's gaze-driven foveal inset because moving the dense sampling
+    /// window with your eyes swaps cells between measured and inpainted depth on each
+    /// glance, causing noticeable depth shifts (the video stream itself still uses
+    /// dynamic foveation).
     public static func interests(layout: FrameLayout, hands: [Vec3]) -> [Interest] {
         guard let middle = layout.middle else { return [] }
         var out = hands.compactMap { Interest(around: $0, reach: handReach, seenFrom: middle) }
-        let insets = layout.views.compactMap { $0.tiles.last(where: { $0.feather > 0 })?.frustum }
-        if insets.count == layout.views.count, !insets.isEmpty {
-            let count = Float(insets.count)
-            out.append(Interest(across: insets.map { ($0.left + $0.right) / 2 }.reduce(0, +) / count,
-                                up: insets.map { ($0.down + $0.up) / 2 }.reduce(0, +) / count, radius: sharpRadius))
-        } else {
-            out.append(Interest(across: 0, up: 0, radius: sharpRadius))
-        }
+        out.append(Interest(across: 0, up: 0, radius: sharpRadius))
         return out
     }
 
