@@ -56,8 +56,8 @@ To distinguish a live peer from echoed records, both sides increment a heartbeat
 counter every 250 ms (`oxClient` and `oxHost`). Echoed keys repeat a static
 value, while a live peer's heartbeat keeps advancing. Each side considers its
 peer active only if the peer's heartbeat has changed within the last 1.5 s; if
-the heartbeat stops advancing, all extensions turn off (**tested**: `ext::tests`,
-`HostExtensionsTests`).
+the heartbeat stops advancing, all extensions turn off (**tested**:
+`HostSideTests`, `HostExtensionsTests`).
 
 ### Sending records
 
@@ -70,7 +70,7 @@ record list for each frame descriptor. When `driver_openvrlink` detects a live
 OpenVRLink client, it hooks that call and overwrites the first record (the slow
 round-robin slot) on every second batch, cycling through `oxHost`, `oxAvail`,
 `oxOn`, and `oxGamma`. Non-OpenVRLink clients never receive `ox` keys
-(**tested** under Wine, `companion/tests/wine`).
+(**tested**: `companion/Tests/DriverHarness`).
 
 Visual features take effect within a few frames of negotiation rather than on a
 synchronized frame boundary. OpenVRLink tags each incoming frame with the active
@@ -94,22 +94,42 @@ client:  v  = v' ^ gamma                          applied before converting sRGB
 
 ### Host (Linux)
 
-On Linux, `driver_vrlink.so` prepares each eye for encoding using Vulkan compute
-shaders loaded from `resources/shaders/genforencode_comp_{rgb,luma,chroma}.spv`
-via `LoadSpirvFile` (**static**). Each shader finishes by converting the
-filtered linear color to sRGB one channel at a time. `ovrl_core::spirv` patches
-the SPIR-V bytecode to raise those three sRGB channels to `1/gamma`, reading
-`gamma` from `g_nonFovealColor.w` in the shader's uniform constant block.
-`SVLHMDDriver::UpdateConstantBuffer` populates that field (**static**), and the
-stock shader never reads it. The patched shader only applies gamma when the
-constant is in `(1, 4]`, so unpatched constants leave the output unchanged. All
-three shaders in Linux build `b30b2657…` patch cleanly and pass `spirv-val`
-(**tested**).
+On Linux, encoding gamma was verified **live** against the October 2026
+`driver_vrlink.so` build (stripped, build ID `f677267e…`, running x86-64 under
+FEX on an arm64 Ubuntu 24.04 machine): `driver_openvrlink` patched all three
+Vulkan compute shaders when the client connected, and the macOS viewer streamed
+at 120 fps with encoding gamma 1.8.
+
+`driver_vrlink.so` prepares each eye for encoding with Vulkan compute shaders
+loaded via `LoadSpirvFile` (**static**):
+`resources/shaders/genforencode_comp_{rgb,luma,chroma}.spv` in the July 2026
+build, and `resources/shaders/vulkan/genforencode_cs_{rgb,luma,chroma}.spv` in
+the October 2026 build. Each shader finishes by converting the filtered linear
+color to sRGB one channel at a time. `SPIRV.patchGamma`
+(`companion/Sources/PatchCore`) patches the SPIR-V bytecode to raise those three
+sRGB channels to `1/gamma`.
+
+The patched shader reads `gamma` from its uniform constant block. Because the
+October 2026 shaders strip debug names and expand the block from 80 bytes to
+128 bytes, `SPIRV.patchGamma` scans the SPIR-V instructions for the last float
+or float-vector member that the shader never reads and returns its float offset.
+That selects `g_GameTexSize` (float 12) in the July 2026 shaders and float 30 in
+the October 2026 shaders, which `UpdateConstantBuffer` (`0xbe410`) leaves zeroed
+(**static**). The patched shader only applies gamma when the constant is in
+`(1, 4]`, so unpatched constants leave the output unchanged. All six shaders
+across both Linux builds patch cleanly and pass `spirv-val` (**tested**).
 
 At runtime, `driver_openvrlink` intercepts `LoadSpirvFile`, substitutes a
 patched shader written to `/tmp`, and writes the active gamma value into the
-constant buffer for each eye. It marks `gammaAvailable` true once at least one
-encode shader has been patched and none have failed.
+constant buffer after `UpdateConstantBuffer` runs. Because
+`UpdateConstantBuffer`'s signature changed between the July and October 2026
+builds (passing the float buffer in argument 5 in July and argument 6 in
+October), the hook wrapper forwards all six integer/pointer register arguments
+and writes to whichever parameter holds the buffer for the matched signature.
+`gammaAvailable` becomes true once at least one encode shader has been patched
+and none have failed. On unstripped builds (July 2026), `driver_openvrlink`
+resolves functions from `.symtab`; on stripped builds (October 2026), it matches
+function prologues by byte signature.
 
 ### Host (Windows)
 
@@ -156,9 +176,8 @@ populates only the first `0x28` bytes. According to the DXBC reflection chunk
 
 Both copy-view pixel shaders end with the linear-to-sRGB conversion
 (`ge t, 0.0031308, c` followed by `movc o0.xyz, t, low, high`), whereas the
-downstream `encode_rgb_to_yuv` shaders operate in sRGB space.
-`ovrl_core::dxbc::patch_gamma` redirects that `movc` output into a new temporary
-register, appends:
+downstream `encode_rgb_to_yuv` shaders operate in sRGB space. `DXBC.patchGamma`
+redirects that `movc` output into a new temporary register, appends:
 
 ```
 max r.w, cb2[2].z, 1.0      min r.w, r.w, 4.0      div r.w, 1.0, r.w
@@ -214,10 +233,6 @@ the handshake version; peers ignore heartbeats with an unrecognized version.
 
 ## Open questions
 
-- Does `vrserver` on Linux load `driver_openvrlink` before `driver_vrlink`
-  builds its Vulkan encode pipelines? If `driver_vrlink` loads its shaders
-  first, `LoadSpirvFile` will not be intercepted in time, and encoding gamma
-  will remain unavailable for that session.
 - Visual quality in an OLED headset still needs evaluation; live testing has
   only verified that both ends negotiate and apply the gamma curve.
 - Does the SteamVR dashboard render the injected `requires` and `label` settings
