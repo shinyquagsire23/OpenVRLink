@@ -209,6 +209,7 @@ enum AppVersion {
     static let changes = """
     What's changed?
 
+    • (Hotfix) Fixed compatibility with SteamVR 2.19.4
     • Added a new stereo-disparity depth prediction Experiment, default On. If Wi-Fi or game timing is unstable, the view should be more stable. If you find an area or game that predicts particularly terribly, or if performance is significantly worse (especially on M2), please file feedback so I can tune it better.
     • Added support for WiVRn hosts. Discovery may be a bit buggy, so use direct IP connection if needed.
     • Fixed microphone session getting interrupted by calls; the app will now attempt to recover from microphone interruptions.
