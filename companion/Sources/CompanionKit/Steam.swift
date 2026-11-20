@@ -2,7 +2,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+#if canImport(FoundationEssentials)
+import FoundationEssentials
+#else
 import Foundation
+#endif
+#if os(Windows)
+import WinSDK
+#endif
 
 /// Locates Steam libraries and the SteamVR runtime, and updates the external driver list
 /// in `openvrpaths.vrpath` (the same registry file managed by `vrpathreg adddriver`).
@@ -26,6 +33,62 @@ public enum Steam {
         public var openVRPathsFile: URL { openVRConfig.appendingPathComponent("openvrpaths.vrpath") }
         public var drivers: URL { data.appendingPathComponent("drivers") }
 
+        /// A candidate Steam installation root and its associated config and data directories.
+        /// Sandboxed Linux builds of Steam (Snap and Flatpak) run with private home directories
+        /// and cannot read hidden directories in `$HOME`, so `openvrpaths.vrpath` and installed
+        /// drivers must be placed inside that sandbox's directories.
+        public struct Installation {
+            public var root: URL
+            /// Candidate config directories that may contain `openvr/openvrpaths.vrpath`, ordered by priority.
+            public var configHomes: [URL]
+            /// Base data directory where OpenVRLink installs its drivers.
+            public var dataHome: URL
+        }
+
+        /// Returns candidate Linux Steam installations for `home` and `environment`, checking
+        /// native Steam paths first, followed by the Snap and Flatpak sandboxes.
+        public static func linuxInstallations(home: URL, environment: [String: String]) -> [Installation] {
+            func folder(_ variable: String) -> URL? {
+                environment[variable].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
+            }
+            let dataHome = folder("XDG_DATA_HOME") ?? home.appendingPathComponent(".local/share")
+            let configHome = folder("XDG_CONFIG_HOME") ?? home.appendingPathComponent(".config")
+            var list: [Installation] = []
+            let native = [dataHome.appendingPathComponent("Steam")]
+                + [".local/share/Steam", ".steam/steam", ".steam/root", ".steam/debian-installation"].map { home.appendingPathComponent($0) }
+            for root in native { list.append(Installation(root: root, configHomes: [configHome], dataHome: dataHome)) }
+            let snap = home.appendingPathComponent("snap/steam/common")
+            list.append(Installation(root: snap.appendingPathComponent(".local/share/Steam"),
+                                     configHomes: [snap.appendingPathComponent(".config")], dataHome: snap.appendingPathComponent(".local/share")))
+            let flatpak = home.appendingPathComponent(".var/app/com.valvesoftware.Steam")
+            for root in [".local/share/Steam", "data/Steam"] {
+                list.append(Installation(root: flatpak.appendingPathComponent(root),
+                                         configHomes: [flatpak.appendingPathComponent(".config"), flatpak.appendingPathComponent("config")],
+                                         dataHome: flatpak.appendingPathComponent(".local/share")))
+            }
+            return list
+        }
+
+        /// Selects the active Steam installation for OpenVR config and driver storage while
+        /// keeping all candidate Steam roots for library discovery. Prefers the first
+        /// installation with SteamVR installed, falling back to the first with an existing
+        /// `openvrpaths.vrpath`, the first existing Steam root, or the first candidate.
+        public static func choosing(among installations: [Installation], dataFolder: String) -> Places {
+            precondition(!installations.isEmpty)
+            func exists(_ installation: Installation) -> Bool { isFolder(installation.root.appendingPathComponent("steamapps")) }
+            func config(_ installation: Installation) -> URL? {
+                installation.configHomes.first { isFile($0.appendingPathComponent("openvr/openvrpaths.vrpath")) }
+            }
+            func hasSteamVR(_ installation: Installation) -> Bool {
+                libraries(ofRoot: installation.root).contains { isFolder($0.appendingPathComponent("steamapps/common/SteamVR/drivers")) }
+            }
+            let present = installations.filter(exists)
+            let chosen = present.first(where: hasSteamVR) ?? present.first { config($0) != nil } ?? present.first ?? installations[0]
+            return Places(openVRConfig: (config(chosen) ?? chosen.configHomes[0]).appendingPathComponent("openvr"),
+                          steamRoots: installations.map(\.root),
+                          data: chosen.dataHome.appendingPathComponent(dataFolder))
+        }
+
         public static func ofThisMachine() -> Places {
             let environment = ProcessInfo.processInfo.environment
             func folder(_ variable: String) -> URL? {
@@ -33,40 +96,32 @@ public enum Steam {
             }
             #if os(Windows)
             let local = folder("LOCALAPPDATA") ?? URL(fileURLWithPath: ".")
-            var roots = [steamPathFromRegistry()].compactMap { $0 }
+            var roots = [registryFolder(HKEY_CURRENT_USER, "Software\\Valve\\Steam", "SteamPath"),
+                         registryFolder(HKEY_LOCAL_MACHINE, "SOFTWARE\\Valve\\Steam", "InstallPath")].compactMap { $0 }
             roots += ["ProgramFiles(x86)", "ProgramFiles"].compactMap { folder($0)?.appendingPathComponent("Steam") }
             return Places(openVRConfig: local.appendingPathComponent("openvr"), steamRoots: roots, data: local.appendingPathComponent("OpenVRLink"))
             #else
-            var home = folder("HOME") ?? URL(fileURLWithPath: ".")
-            // The Steam snap runs with its own home folder and cannot see hidden folders in
-            // the real one, so SteamVR's configuration and our drivers both belong inside it.
-            let snap = home.appendingPathComponent("snap/steam/common")
-            if isFolder(snap.appendingPathComponent(".local/share/Steam/steamapps")) { home = snap }
-            let roots = [".steam/steam", ".steam/root", ".local/share/Steam", ".steam/debian-installation",
-                         ".var/app/com.valvesoftware.Steam/.local/share/Steam", "snap/steam/common/.local/share/Steam"]
-                .map { home.appendingPathComponent($0) }
-            let inSnap = home.path == snap.path
-            return Places(openVRConfig: ((inSnap ? nil : folder("XDG_CONFIG_HOME")) ?? home.appendingPathComponent(".config")).appendingPathComponent("openvr"),
-                          steamRoots: roots,
-                          data: ((inSnap ? nil : folder("XDG_DATA_HOME")) ?? home.appendingPathComponent(".local/share")).appendingPathComponent("openvrlink"))
+            let home = folder("HOME") ?? URL(fileURLWithPath: ".")
+            return choosing(among: linuxInstallations(home: home, environment: environment), dataFolder: "openvrlink")
             #endif
         }
 
         #if os(Windows)
-        private static func steamPathFromRegistry() -> URL? {
-            let query = Process()
-            let output = Pipe()
-            query.executableURL = URL(fileURLWithPath: "C:\\Windows\\System32\\reg.exe")
-            query.arguments = ["query", "HKCU\\Software\\Valve\\Steam", "/v", "SteamPath"]
-            query.standardOutput = output
-            query.standardError = Pipe()
-            guard (try? query.run()) != nil else { return nil }
-            let text = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-            query.waitUntilExit()
-            guard let line = text.split(whereSeparator: \.isNewline).first(where: { $0.contains("SteamPath") }),
-                  let range = line.range(of: "REG_SZ") else { return nil }
-            let value = line[range.upperBound...].trimmingCharacters(in: .whitespaces)
-            return value.isEmpty ? nil : URL(fileURLWithPath: value, isDirectory: true)
+        /// Reads a directory path from a `REG_SZ` registry value, checking both 64-bit and 32-bit registry views.
+        private static func registryFolder(_ root: HKEY, _ key: String, _ value: String) -> URL? {
+            for view in [RRF_SUBKEY_WOW6464KEY, RRF_SUBKEY_WOW6432KEY] {
+                var buffer = [WCHAR](repeating: 0, count: 1024)
+                var size = DWORD(buffer.count * MemoryLayout<WCHAR>.size)
+                let status = key.withCString(encodedAs: UTF16.self) { key in
+                    value.withCString(encodedAs: UTF16.self) { value in
+                        RegGetValueW(root, key, value, DWORD(RRF_RT_REG_SZ) | DWORD(view), nil, &buffer, &size)
+                    }
+                }
+                guard status == ERROR_SUCCESS else { continue }
+                let text = String(decodingCString: buffer, as: UTF16.self)
+                if !text.isEmpty { return URL(fileURLWithPath: text, isDirectory: true) }
+            }
+            return nil
         }
         #endif
     }
@@ -90,15 +145,9 @@ public enum Steam {
         public var vrlink: URL? { steamVR?.appendingPathComponent("drivers").appendingPathComponent("vrlink") }
     }
 
-    static func isFolder(_ url: URL) -> Bool {
-        var folder: ObjCBool = false
-        return FileManager.default.fileExists(atPath: url.path, isDirectory: &folder) && folder.boolValue
-    }
+    static func isFolder(_ url: URL) -> Bool { OS.isFolder(url.path) }
 
-    static func isFile(_ url: URL) -> Bool {
-        var folder: ObjCBool = false
-        return FileManager.default.fileExists(atPath: url.path, isDirectory: &folder) && !folder.boolValue
-    }
+    static func isFile(_ url: URL) -> Bool { FileManager.default.fileExists(atPath: url.path) && !OS.isFolder(url.path) }
 
     /// The path as this system writes it (backslashes on Windows), for files other programs read.
     public static func nativePath(_ url: URL) -> String {
@@ -110,7 +159,7 @@ public enum Steam {
         func canonical(_ url: URL) -> String {
             let path = url.resolvingSymlinksInPath().standardizedFileURL.path
             #if os(Windows)
-            return path.lowercased().replacingOccurrences(of: "\\", with: "/")
+            return path.lowercased().replacing("\\", with: "/")
             #else
             return path
             #endif
@@ -141,17 +190,23 @@ public enum Steam {
         (value?.array ?? []).compactMap(\.string).map { URL(fileURLWithPath: $0, isDirectory: true) }
     }
 
+    /// Returns all existing Steam library folders for `root` (starting with `root` itself),
+    /// or an empty array if `root` does not contain `steamapps`.
+    static func libraries(ofRoot root: URL) -> [URL] {
+        guard isFolder(root.appendingPathComponent("steamapps")) else { return [] }
+        var libraries = [root]
+        for list in ["steamapps/libraryfolders.vdf", "config/libraryfolders.vdf"] {
+            guard let text = try? String(contentsOf: root.appendingPathComponent(list), encoding: .utf8) else { continue }
+            libraries += libraryPaths(inVDF: text).map { URL(fileURLWithPath: $0, isDirectory: true) }
+        }
+        return libraries.filter { isFolder($0.appendingPathComponent("steamapps")) }
+    }
+
     public static func find(_ places: Places) -> Found {
         var found = Found()
-        func add(_ library: URL) {
-            guard isFolder(library.appendingPathComponent("steamapps")), !found.libraries.contains(where: { samePlace($0, library) }) else { return }
-            found.libraries.append(library)
-        }
-        for root in places.steamRoots where isFolder(root.appendingPathComponent("steamapps")) {
-            add(root)
-            for list in ["steamapps/libraryfolders.vdf", "config/libraryfolders.vdf"] {
-                guard let text = try? String(contentsOf: root.appendingPathComponent(list), encoding: .utf8) else { continue }
-                for path in libraryPaths(inVDF: text) { add(URL(fileURLWithPath: path, isDirectory: true)) }
+        for root in places.steamRoots {
+            for library in libraries(ofRoot: root) where !found.libraries.contains(where: { samePlace($0, library) }) {
+                found.libraries.append(library)
             }
         }
         let paths = openVRPaths(places)

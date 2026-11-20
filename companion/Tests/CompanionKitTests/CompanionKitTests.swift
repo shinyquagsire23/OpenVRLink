@@ -176,20 +176,19 @@ final class InstallTests: XCTestCase {
 
     func testTheDriverFolderIsLaidOutForSteamVR() throws {
         let root = try scratch(self)
-        let library = root.appendingPathComponent("built.so"), runtime = root.appendingPathComponent("libruntime.so")
-        try write("library", to: library)
+        let runtime = root.appendingPathComponent("libruntime.so")
         try write("runtime", to: runtime)
         let driver = root.appendingPathComponent(Install.driverName)
-        try Install.writeDriver(to: driver, libraries: [library, runtime], windows: false, ownTab: true)
+        try Install.writeDriver(to: driver, library: Data("library".utf8), beside: [runtime], windows: false, ownTab: true)
         XCTAssertTrue(Steam.isFile(driver.appendingPathComponent("bin/linux64/driver_openvrlink.so")))
         XCTAssertTrue(Steam.isFile(driver.appendingPathComponent("bin/linux64/libruntime.so")))
         let manifest = try JSON(parsing: String(contentsOf: driver.appendingPathComponent("driver.vrdrivermanifest"), encoding: .utf8))
         XCTAssertEqual(manifest["name"]?.string, "openvrlink")
         let defaults = try JSON(parsing: String(contentsOf: driver.appendingPathComponent("resources/settings/default.vrsettings"), encoding: .utf8))
         XCTAssertEqual(defaults[Install.section]?[Install.gammaAvailableKey], .bool(false))
-        XCTAssertEqual(defaults[Install.section]?[Install.gammaValueKey], .number("1.8"))
+        XCTAssertEqual(defaults[Install.section]?[Install.gammaValueKey], .number("1.2"))
         XCTAssertTrue(Steam.isFile(driver.appendingPathComponent("resources/settings/settingsschema.vrsettings")))
-        try Install.writeDriver(to: driver, libraries: [library], windows: true, ownTab: false)
+        try Install.writeDriver(to: driver, library: Data("library".utf8), windows: true, ownTab: false)
         XCTAssertTrue(Steam.isFile(driver.appendingPathComponent("bin/win64/driver_openvrlink.dll")))
         XCTAssertFalse(Steam.isFile(driver.appendingPathComponent("resources/settings/settingsschema.vrsettings")))
     }
@@ -201,5 +200,194 @@ final class InstallTests: XCTestCase {
         let stock = try Install.editingVRLinkSchema(installed, present: false) ?? installed
         let added = try XCTUnwrap(Install.editingVRLinkSchema(stock, present: true))
         XCTAssertEqual(try JSON(parsing: try XCTUnwrap(Install.editingVRLinkSchema(added, present: false))), try JSON(parsing: stock))
+    }
+}
+
+final class PlacesTests: XCTestCase {
+    private func steam(_ root: URL, withSteamVR: Bool = false) throws {
+        try FileManager.default.createDirectory(at: root.appendingPathComponent(withSteamVR ? "steamapps/common/SteamVR/drivers" : "steamapps"), withIntermediateDirectories: true)
+    }
+
+    func testNativeSteamUsesDefaultHomeDirectories() throws {
+        let home = try scratch(self)
+        try steam(home.appendingPathComponent(".local/share/Steam"), withSteamVR: true)
+        let places = Steam.Places.choosing(among: Steam.Places.linuxInstallations(home: home, environment: [:]), dataFolder: "openvrlink")
+        XCTAssertEqual(places.openVRConfig.path, home.appendingPathComponent(".config/openvr").path)
+        XCTAssertEqual(places.data.path, home.appendingPathComponent(".local/share/openvrlink").path)
+        XCTAssertNotNil(Steam.find(places).steamVR)
+    }
+
+    func testNativeSteamRespectsXDGEnvironmentVariables() throws {
+        let home = try scratch(self)
+        let data = home.appendingPathComponent("elsewhere/data")
+        try steam(data.appendingPathComponent("Steam"))
+        let installations = Steam.Places.linuxInstallations(home: home, environment: ["XDG_DATA_HOME": data.path, "XDG_CONFIG_HOME": home.appendingPathComponent("cfg").path])
+        let places = Steam.Places.choosing(among: installations, dataFolder: "openvrlink")
+        XCTAssertEqual(places.openVRConfig.path, home.appendingPathComponent("cfg/openvr").path)
+        XCTAssertEqual(places.data.path, data.appendingPathComponent("openvrlink").path)
+        XCTAssertEqual(Steam.find(places).libraries.count, 1)
+    }
+
+    func testSandboxedSteamUsesSandboxDirectories() throws {
+        let home = try scratch(self)
+        let snap = home.appendingPathComponent("snap/steam/common")
+        try steam(snap.appendingPathComponent(".local/share/Steam"), withSteamVR: true)
+        var places = Steam.Places.choosing(among: Steam.Places.linuxInstallations(home: home, environment: [:]), dataFolder: "openvrlink")
+        XCTAssertEqual(places.openVRConfig.path, snap.appendingPathComponent(".config/openvr").path)
+        XCTAssertEqual(places.data.path, snap.appendingPathComponent(".local/share/openvrlink").path)
+
+        // Prefer the Snap installation with SteamVR over a native Steam folder without SteamVR.
+        try steam(home.appendingPathComponent(".steam/steam"))
+        places = Steam.Places.choosing(among: Steam.Places.linuxInstallations(home: home, environment: [:]), dataFolder: "openvrlink")
+        XCTAssertEqual(places.data.path, snap.appendingPathComponent(".local/share/openvrlink").path)
+        XCTAssertEqual(Steam.find(places).libraries.count, 2)
+
+        // Support both `.config` and `config` OpenVR config paths inside the Steam Flatpak.
+        let other = try scratch(self)
+        let flatpak = other.appendingPathComponent(".var/app/com.valvesoftware.Steam")
+        try steam(flatpak.appendingPathComponent("data/Steam"))
+        try write("{}", to: flatpak.appendingPathComponent("config/openvr/openvrpaths.vrpath"))
+        places = Steam.Places.choosing(among: Steam.Places.linuxInstallations(home: other, environment: [:]), dataFolder: "openvrlink")
+        XCTAssertEqual(places.openVRConfig.path, flatpak.appendingPathComponent("config/openvr").path)
+        XCTAssertEqual(places.data.path, flatpak.appendingPathComponent(".local/share/openvrlink").path)
+    }
+}
+
+final class ComponentTests: XCTestCase {
+    /// Creates a mock host directory with SteamVR and Sony's PlayStation VR2 App installed.
+    private func machine() throws -> (root: URL, setup: Setup) {
+        let root = try scratch(self)
+        let library = root.appendingPathComponent("Steam")
+        let vrlink = library.appendingPathComponent("steamapps/common/SteamVR/drivers/vrlink")
+        try write(InstallTests.vrlinkSchema, to: vrlink.appendingPathComponent("resources/settings/settingsschema.vrsettings"))
+        for model in SenseModel.models {
+            try write("{\"x\":\"/input/r2\"}", to: library.appendingPathComponent("steamapps/common/PlayStation VR2 App/resources/rendermodels/\(model)/\(model).json"))
+        }
+        let places = Steam.Places(openVRConfig: root.appendingPathComponent("openvr"), steamRoots: [library], data: root.appendingPathComponent("data"))
+        return (root, Setup(places: places, found: Steam.find(places), windows: false, driverLibrary: Data("driver 1".utf8)))
+    }
+
+    private func again(_ setup: Setup) -> Setup {
+        var next = setup
+        next.found = Steam.find(setup.places)
+        return next
+    }
+
+    func testComponentsInstallUpdateAndUninstallIndependently() throws {
+        var (_, setup) = try machine()
+        XCTAssertEqual(Component.allCases.map { setup.state(of: $0).kind }, [.notInstalled, .notInstalled])
+        XCTAssertEqual(setup.state(of: .driver).action, "Install")
+
+        _ = try setup.install(.driver)
+        setup = again(setup)
+        XCTAssertEqual(setup.state(of: .driver).kind, .installed)
+        XCTAssertNil(setup.state(of: .driver).action)
+        XCTAssertEqual(setup.state(of: .models).kind, .notInstalled)
+        XCTAssertTrue(Install.vrlinkMenuPresent(inVRLink: try XCTUnwrap(setup.found.vrlink)))
+
+        // Flag an available update when the bundled driver binary differs from the installed copy.
+        setup.driverLibrary = Data("driver 2".utf8)
+        XCTAssertEqual(setup.state(of: .driver).kind, .updateAvailable)
+        _ = try setup.install(.driver)
+        XCTAssertEqual(again(setup).state(of: .driver).kind, .installed)
+        XCTAssertEqual(try Data(contentsOf: Install.libraryFile(inDriver: setup.folder(of: .driver), windows: false)), Data("driver 2".utf8))
+
+        // Flag an update if a SteamVR update overwrites settingsschema.vrsettings, and restore it on install.
+        let schema = try XCTUnwrap(setup.found.vrlink).appendingPathComponent("resources/settings/settingsschema.vrsettings")
+        try write(InstallTests.vrlinkSchema, to: schema)
+        XCTAssertEqual(setup.state(of: .driver).kind, .updateAvailable)
+        _ = try setup.install(.driver)
+        XCTAssertEqual(again(setup).state(of: .driver).kind, .installed)
+
+        _ = try setup.install(.models)
+        setup = again(setup)
+        XCTAssertEqual(setup.state(of: .models).kind, .installed)
+        XCTAssertEqual(setup.found.externalDrivers.count, 2)
+
+        _ = try setup.uninstall(.driver)
+        setup = again(setup)
+        XCTAssertEqual(setup.state(of: .driver).kind, .notInstalled)
+        XCTAssertEqual(setup.state(of: .models).kind, .installed)
+        XCTAssertFalse(Install.vrlinkMenuPresent(inVRLink: try XCTUnwrap(setup.found.vrlink)))
+        _ = try setup.uninstall(.models)
+        setup = again(setup)
+        XCTAssertEqual(setup.state(of: .models).kind, .notInstalled)
+        XCTAssertEqual(setup.found.externalDrivers.count, 0)
+    }
+
+    func testModelsOfferUpdateWhenPlayStationVR2AppIsInstalled() throws {
+        var (root, setup) = try machine()
+        let sony = root.appendingPathComponent("Steam/steamapps/common/PlayStation VR2 App")
+        let hidden = root.appendingPathComponent("hidden")
+        try FileManager.default.moveItem(at: sony, to: hidden)
+        XCTAssertEqual(setup.state(of: .models).kind, .unavailable)
+        for model in SenseModel.models {
+            try write("{}", to: try XCTUnwrap(setup.found.steamVR).appendingPathComponent("drivers/playstation_vr2/resources/rendermodels/\(model)/\(model).json"))
+        }
+        XCTAssertEqual(setup.state(of: .models).kind, .notInstalled)
+        _ = try setup.install(.models)
+        setup = again(setup)
+        XCTAssertEqual(setup.state(of: .models).kind, .installed)
+        try FileManager.default.moveItem(at: hidden, to: sony)
+        XCTAssertEqual(setup.state(of: .models).kind, .updateAvailable)
+        _ = try setup.install(.models)
+        XCTAssertEqual(again(setup).state(of: .models).kind, .installed)
+    }
+
+    func testComponentsAreUnavailableWithoutSteamVROrDriver() throws {
+        var (_, setup) = try machine()
+        setup.driverLibrary = nil
+        XCTAssertEqual(setup.state(of: .driver).kind, .unavailable)
+        XCTAssertThrowsError(try setup.install(.driver))
+        setup.found.steamVR = nil
+        XCTAssertEqual(setup.state(of: .models).kind, .unavailable)
+        XCTAssertThrowsError(try setup.install(.models))
+    }
+}
+
+final class ReleaseTests: XCTestCase {
+    func testNumericVersionComparison() {
+        XCTAssertEqual(Release.numbers("v0.1.0-8"), [0, 1, 0, 8])
+        XCTAssertTrue(Release.isNewer("v0.1.0-10", than: "0.1.0-9"))
+        XCTAssertTrue(Release.isNewer("0.2.0", than: "0.1.0-9"))
+        XCTAssertTrue(Release.isNewer("0.1.0-1", than: "0.1.0"))
+        XCTAssertFalse(Release.isNewer("v0.1.0-8", than: "0.1.0-8"))
+        XCTAssertFalse(Release.isNewer("0.1.0-7", than: "0.1.0-8"))
+    }
+
+    func testSelectsLatestPublishedReleaseWithMatchingAsset() throws {
+        let asset = Release.assetName(windows: true, architecture: Release.thisArchitecture)
+        func release(_ tag: String, _ assets: [String], flags: String = "") -> String {
+            let files = assets.map { "{\"name\": \"\($0)\", \"size\": 123, \"browser_download_url\": \"https://example.com/\(tag)/\($0)\"}" }.joined(separator: ",")
+            return "{\"tag_name\": \"\(tag)\", \(flags) \"assets\": [\(files)]}"
+        }
+        let list = "[" + [
+            release("v0.3.0", [asset], flags: "\"prerelease\": true,"),
+            release("v0.2.1", ["OpenVRLink.ipa"]),
+            release("v0.1.0-9", [asset, "other.zip"]),
+            release("v0.2.0", [asset], flags: "\"draft\": false, \"prerelease\": false,"),
+        ].joined(separator: ",") + "]"
+        XCTAssertEqual(try Release.newest(inReleaseList: list, asset: asset),
+                       Release.Offer(version: "0.2.0", url: "https://example.com/v0.2.0/\(asset)", size: 123))
+        XCTAssertEqual(try Release.update(from: "0.1.0-9", windows: true) { _ in Data(list.utf8) }?.version, "0.2.0")
+        XCTAssertNil(try Release.update(from: "0.2.0", windows: true) { _ in Data(list.utf8) })
+        XCTAssertNil(try Release.newest(inReleaseList: "[]", asset: asset))
+        XCTAssertThrowsError(try Release.newest(inReleaseList: "{\"message\": \"rate limited\"}", asset: asset))
+    }
+
+    func testSwapMovesExistingExecutableAside() throws {
+        let folder = try scratch(self)
+        let program = folder.appendingPathComponent("companion.exe")
+        try write("old", to: program)
+        let staged = try SelfUpdate.stage(Data("new".utf8), beside: program)
+        XCTAssertEqual(staged.pathExtension, "exe")
+        XCTAssertEqual(try String(contentsOf: program, encoding: .utf8), "old")
+        try SelfUpdate.swap(staged, into: program)
+        XCTAssertEqual(try String(contentsOf: program, encoding: .utf8), "new")
+        try write("left", to: folder.appendingPathComponent("companion.old-1234.exe"))
+        try write("keep", to: folder.appendingPathComponent("companion-notes.txt"))
+        XCTAssertTrue(SelfUpdate.clearLeftovers(beside: program))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted(), ["companion-notes.txt", "companion.exe"])
+        XCTAssertFalse(SelfUpdate.looksRunnable(Data("<html>".utf8), windows: true))
     }
 }

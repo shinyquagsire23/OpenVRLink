@@ -5,6 +5,17 @@
 
 import PackageDescription
 
+/// Windows linker flags for `openvrlink-companion`. Builds a GUI subsystem binary (so
+/// double-clicking it does not open a console window) using the standard `main` entry point,
+/// and embeds a manifest enabling themed common controls. When built with
+/// `--static-swift-stdlib`, the executable only depends on Windows system DLLs plus
+/// `MSVCP140.dll` and `VCRUNTIME140.dll`, which Steam installs alongside SteamVR.
+let windowsProgramFlags = [
+    "/SUBSYSTEM:WINDOWS", "/ENTRY:mainCRTStartup",
+    "/MANIFEST:EMBED",
+    "/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'",
+].flatMap { ["-Xlinker", $0] }
+
 let package = Package(
     name: "OpenVRLinkCompanion",
     platforms: [.macOS(.v13)],
@@ -19,7 +30,17 @@ let package = Package(
         // Steam discovery, Sense controller model setup, and driver installation.
         .target(name: "CompanionKit", dependencies: ["PatchCore"]),
         .testTarget(name: "CompanionKitTests", dependencies: ["CompanionKit"]),
-        .executableTarget(name: "openvrlink-companion", dependencies: ["CompanionKit", "PatchCore"]),
+        // C target exposing Win32 GUI, WinHTTP, and resource APIs on Windows (empty on other platforms).
+        .target(name: "WinAPI"),
+        // Installer and diagnostic tool; opens a GUI window on Windows when launched without arguments, or runs as a CLI tool.
+        .executableTarget(
+            name: "openvrlink-companion", dependencies: ["CompanionKit", "PatchCore", "WinAPI"],
+            linkerSettings: [
+                .linkedLibrary("winhttp", .when(platforms: [.windows])),
+                .linkedLibrary("comctl32", .when(platforms: [.windows])),
+                .linkedLibrary("gdi32", .when(platforms: [.windows])),
+                .unsafeFlags(windowsProgramFlags, .when(platforms: [.windows])),
+            ]),
         // C interface declarations for OpenVR vtables, ID3DBlob, and OS calls.
         .target(name: "DriverABI"),
         // SteamVR driver loaded into vrserver alongside driver_vrlink.

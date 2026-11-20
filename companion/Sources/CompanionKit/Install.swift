@@ -2,7 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+#if canImport(FoundationEssentials)
+import FoundationEssentials
+#else
 import Foundation
+#endif
+import PatchCore
 
 /// Installs the `openvrlink` SteamVR driver (`driver_openvrlink`, which patches
 /// `driver_vrlink` in memory) and registers its SteamVR settings controls.
@@ -24,7 +29,7 @@ public enum Install {
     public static let gammaAvailableKey = "gammaAvailable"
     /// Written by the driver: one line on what it managed to patch.
     public static let statusKey = "status"
-    public static let defaultGamma = 1.8
+    public static let defaultGamma = 1.2
     /// Marks a library that was in use when a newer one took its name.
     static let replacedMark = ".replaced-"
 
@@ -97,10 +102,10 @@ public enum Install {
         return ((try? editingVRLinkSchema(text, present: false)) ?? nil) != nil
     }
 
-    /// Writes the driver folder: manifest, default settings, the library and any
-    /// libraries it needs beside it. With `ownTab`, the options get a settings tab of
-    /// their own instead of the entries in the VR Link tab.
-    public static func writeDriver(to driver: URL, libraries: [URL], windows: Bool, ownTab: Bool) throws {
+    /// Writes the `driver_openvrlink` directory, including its manifest, default settings,
+    /// primary driver binary, and any companion runtime libraries. When `ownTab` is true,
+    /// writes a standalone OpenVRLink settings schema instead of using the VR Link tab.
+    public static func writeDriver(to driver: URL, library: Data, beside: [URL] = [], windows: Bool, ownTab: Bool) throws {
         let files = FileManager.default
         let place = libraryPlace(windows: windows)
         let settings = driver.appendingPathComponent("resources/settings"), bin = driver.appendingPathComponent("bin").appendingPathComponent(place.platform)
@@ -116,7 +121,7 @@ public enum Install {
             statusKey: .string("not loaded"),
         ])])
         try defaults.text.write(to: settings.appendingPathComponent("default.vrsettings"), atomically: true, encoding: .utf8)
-        let schema = settings.appendingPathComponent("settingsschema.vrsettings")
+        let schema = ownTabSchema(inDriver: driver)
         if ownTab {
             let tab = JSON.array([.object(["title": .string("OpenVRLink"), "values": .array(menuEntries)])])
             try tab.text.write(to: schema, atomically: true, encoding: .utf8)
@@ -124,23 +129,75 @@ public enum Install {
             try files.removeItem(at: schema)
         }
         // Clean up any `.replaced-*` binaries from previous updates once they are no longer locked.
-        for stale in (try? files.contentsOfDirectory(at: bin, includingPropertiesForKeys: nil)) ?? [] where stale.lastPathComponent.contains(replacedMark) {
+        for stale in (try? OS.entries(in: bin)) ?? [] where stale.lastPathComponent.contains(replacedMark) {
             try? files.removeItem(at: stale)
         }
-        for (index, library) in libraries.enumerated() {
-            // Rename the primary driver binary to match what SteamVR expects, and keep companion library filenames as-is.
-            let target = bin.appendingPathComponent(index == 0 ? place.name : library.lastPathComponent)
-            if files.fileExists(atPath: target.path) {
-                // On Windows, `steam.exe` keeps `driver_openvrlink.dll` mapped while Steam is open
-                // (`Platform.pinThisLibrary`). Locked DLLs cannot be deleted on Windows, so move
-                // the existing file aside if `removeItem` fails.
-                do {
-                    try files.removeItem(at: target)
-                } catch {
-                    try files.moveItem(at: target, to: bin.appendingPathComponent("\(target.lastPathComponent)\(replacedMark)\(UUID().uuidString)"))
-                }
+        /// Frees a target path in `bin`. On Windows, `steam.exe` keeps `driver_openvrlink.dll`
+        /// mapped while Steam is open (`Platform.pinThisLibrary`); locked DLLs cannot be
+        /// deleted, so rename the existing file if deletion fails.
+        func free(_ target: URL) throws {
+            guard files.fileExists(atPath: target.path) else { return }
+            do {
+                try files.removeItem(at: target)
+            } catch {
+                try files.moveItem(at: target, to: bin.appendingPathComponent("\(target.lastPathComponent)\(replacedMark)\(UUID().uuidString)"))
             }
-            try files.copyItem(at: library, to: target)
+        }
+        let target = libraryFile(inDriver: driver, windows: windows)
+        if (try? Data(contentsOf: target)) != library {
+            try free(target)
+            try library.write(to: target)
+        }
+        for other in beside {
+            let target = bin.appendingPathComponent(other.lastPathComponent)
+            try free(target)
+            try files.copyItem(at: other, to: target)
+        }
+    }
+
+    /// Path to the primary driver binary inside an installed driver directory.
+    public static func libraryFile(inDriver driver: URL, windows: Bool) -> URL {
+        let place = libraryPlace(windows: windows)
+        return driver.appendingPathComponent("bin").appendingPathComponent(place.platform).appendingPathComponent(place.name)
+    }
+
+    /// Path to the standalone settings schema created when `ownTab` is enabled.
+    public static func ownTabSchema(inDriver driver: URL) -> URL { driver.appendingPathComponent("resources/settings/settingsschema.vrsettings") }
+
+    /// Compatibility check results for patching a `driver_vrlink` binary.
+    public struct PatchReport: Equatable {
+        /// Whether the extension handshake functions can be hooked.
+        public var handshake: Bool
+        /// Whether the encode shaders and constant-buffer updates can also be patched.
+        public var gamma: Bool
+
+        public var summary: String {
+            switch (handshake, gamma) {
+            case (true, true): return "Compatible with the installed SteamVR VR Link build."
+            case (true, false): return "Partially compatible with this SteamVR VR Link build (encoding gamma is unavailable)."
+            default: return "Incompatible with this SteamVR VR Link build; the driver will stay inactive."
+            }
+        }
+    }
+
+    /// Checks which hook targets resolve in `bytes`, returning `nil` if `bytes` is not a PE or ELF64 binary.
+    public static func patchReport(vrlinkLibrary bytes: [UInt8]) -> PatchReport? {
+        bytes.withUnsafeBufferPointer { view -> PatchReport? in
+            guard Scan.isELF64(view) || Scan.isPE(view) else { return nil }
+            var foundNames: Set<String> = []
+            for (target, resolution) in Scan.resolveAll(inFile: view) {
+                if case .found = resolution { foundNames.insert("\(target.name)") }
+            }
+            func has(_ target: Scan.Target) -> Bool { foundNames.contains("\(target.name)") }
+            let handshake = has(Scan.parseRecords) && has(Scan.populateRecords)
+            let shaders: Bool
+            if Scan.isPE(view) {
+                shaders = has(Scan.updateConstantsD3D)
+                    && Scan.peImportSlot(view, mapped: false, library: Scan.shaderReadImport.library, function: Scan.shaderReadImport.function) != nil
+            } else {
+                shaders = has(Scan.loadSPIRV) && (has(Scan.updateConstants) || has(Scan.updateConstantsWide))
+            }
+            return PatchReport(handshake: handshake, gamma: handshake && shaders)
         }
     }
 }

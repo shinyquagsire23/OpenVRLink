@@ -16,7 +16,7 @@ enum Server {
     static let gammaValueKey: StaticString = "encodingGammaValue"
     static let gammaAvailableKey: StaticString = "gammaAvailable"
     static let statusKey: StaticString = "status"
-    static let defaultGamma: Float = 1.8
+    static let defaultGamma: Float = 1.2
 
     static func cString(_ text: StaticString) -> UnsafePointer<CChar> {
         UnsafeRawPointer(text.utf8Start).assumingMemoryBound(to: CChar.self)

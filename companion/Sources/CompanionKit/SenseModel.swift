@@ -2,7 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+#if canImport(FoundationEssentials)
+import FoundationEssentials
+#else
 import Foundation
+#endif
 
 /// Builds the `openvrlink_sense` resource-only SteamVR driver by copying PlayStation VR2
 /// Sense controller render models and remapping their input bindings for OpenVRLink.
@@ -44,7 +48,7 @@ public enum SenseModel {
     public static func renamingInputs(in modelJSON: String) -> (text: String, kinds: Int) {
         var text = modelJSON, kinds = 0
         for (from, to) in renames where text.contains("\"\(from)\"") {
-            text = text.replacingOccurrences(of: "\"\(from)\"", with: "\"\(to)\"")
+            text = text.replacing("\"\(from)\"", with: "\"\(to)\"")
             kinds += 1
         }
         return (text, kinds)
@@ -65,7 +69,7 @@ public enum SenseModel {
 
     private static func search(_ folder: URL, depth: Int, budget: inout Int) -> URL? {
         if let found = locate(in: folder) { return found }
-        guard depth > 0, let entries = try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) else { return nil }
+        guard depth > 0, let entries = try? OS.entries(in: folder) else { return nil }
         for entry in entries.sorted(by: { $0.path < $1.path }) {
             guard budget > 0 else { return nil }
             budget -= 1
@@ -78,7 +82,7 @@ public enum SenseModel {
 
     private static func apps(in library: URL, sonys: Bool) -> [URL] {
         let common = library.appendingPathComponent("steamapps/common")
-        let entries = (try? FileManager.default.contentsOfDirectory(at: common, includingPropertiesForKeys: nil)) ?? []
+        let entries = (try? OS.entries(in: common)) ?? []
         return entries.filter { $0.lastPathComponent.lowercased().contains("playstation") == sonys }.sorted { $0.path < $1.path }
     }
 

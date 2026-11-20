@@ -2,7 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+#if canImport(FoundationEssentials)
+import FoundationEssentials
+#else
 import Foundation
+#endif
 
 /// Minimal order-preserving JSON parser and serializer for SteamVR configuration files.
 /// Preserves key order and exact number formatting so editing a file only modifies the
@@ -49,6 +53,12 @@ public indirect enum JSON: Equatable {
             if let index = members.firstIndex(where: { $0.key == key }) { members[index].value = newValue } else { members.append((key, newValue)) }
             self = .object(members)
         }
+    }
+
+    /// Raw numeric literal text as written in the document.
+    public var number: String? {
+        if case .number(let text) = self { return text }
+        return nil
     }
 
     public var string: String? {
@@ -105,7 +115,7 @@ public indirect enum JSON: Equatable {
             case "\n": out += "\\n"
             case "\r": out += "\\r"
             case "\t": out += "\\t"
-            case _ where scalar.value < 0x20: out += String(format: "\\u%04x", scalar.value)
+            case _ where scalar.value < 0x20: out += "\\u00" + (scalar.value < 0x10 ? "0" : "") + String(scalar.value, radix: 16)
             default: out.unicodeScalars.append(scalar)
             }
         }

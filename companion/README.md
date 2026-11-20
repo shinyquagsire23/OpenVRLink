@@ -2,46 +2,132 @@
 
 `openvrlink-companion` configures a Windows or Linux SteamVR PC for OpenVRLink
 clients. It is structured as a Swift package with no dependencies outside
-Foundation:
+FoundationEssentials:
 
 | target | description |
 |---|---|
 | `PatchCore` | Locates functions in `driver_vrlink`, patches DXBC and SPIR-V shaders, and implements the host side of the extension handshake. Uses only raw memory and Swift value types (no Foundation) so `driver_openvrlink` can link it directly |
 | `CompanionKit` | Locates Steam and SteamVR, adapts Sense controller render models, and installs `driver_openvrlink` and its settings schema entries |
-| `openvrlink-companion` | Command-line installer and diagnostic tool |
+| `openvrlink-companion` | GUI and command-line installer and diagnostic tool |
+| `WinAPI` | C header declarations for Win32 GUI, WinHTTP, and resource APIs on Windows (empty on other platforms) |
 | `driver_openvrlink` | Device-less SteamVR driver loaded into `vrserver` alongside `driver_vrlink` to apply in-memory hooks |
 | `DriverABI` | C header declarations for OpenVR vtables, Direct3D's `ID3DBlob`, and OS memory/module APIs |
 
 ## Usage
 
+`openvrlink-companion` manages two independent components that can be installed,
+updated, and uninstalled separately:
+
+- **Sense controller models** (`models`). Searches for an existing copy of the
+  PlayStation VR2 Sense render models (checking Sony's PlayStation VR2 App
+  first, then registered external drivers, and finally the sparse models ALVR
+  places in SteamVR's `playstation_vr2` driver folder), copies them into a
+  resource-only driver named `openvrlink_sense`, and remaps their input paths to
+  match the Touch controller inputs sent by OpenVRLink. `openvrlink-companion`
+  flags an available update if a better model source is installed later (such as
+  installing Sony's app after using ALVR's models) or if the input remapping
+  changes.
+- **VR Link extensions driver** (`driver`). Installs `driver_openvrlink` and
+  adds its settings controls to SteamVR's VR Link settings tab.
+  `openvrlink-companion` flags an update when its bundled driver differs from
+  the installed binary, or when a SteamVR update overwrites `driver_vrlink`'s
+  settings schema and removes the OpenVRLink controls.
+
+### Windows
+
+`openvrlink-companion.exe` is a single executable with `driver_openvrlink.dll`
+embedded as a resource. Running it without arguments opens a GUI window showing
+each component's status, an **Install** or **Update** button when an action is
+available, and an **✕** button to uninstall it. The bottom of the window shows
+the current `openvrlink-companion` version and a button to check GitHub for a
+newer release, download it, and relaunch.
+
+Passing command-line arguments runs the same CLI interface as on Linux. Because
+`openvrlink-companion.exe` uses the Windows GUI subsystem, `cmd.exe` returns to
+the prompt immediately rather than waiting for it to exit; run
+`start /wait openvrlink-companion status` or redirect stdout if you want to wait
+for output synchronously.
+
+### Command line
+
 ```
-openvrlink-companion install      # installs models + extension driver; restart SteamVR afterward
-openvrlink-companion status       # shows detected paths, installed drivers, and patch compatibility
-openvrlink-companion uninstall
+openvrlink-companion status                  # show detected paths and component status
+openvrlink-companion install [models] [driver]
+openvrlink-companion uninstall [models] [driver]
+openvrlink-companion update [--check]        # update openvrlink-companion to the latest release
 ```
 
-`openvrlink-companion install` performs two independent setup steps:
+`install` accepts `--steamvr DIR` if SteamVR is not detected automatically,
+`--models DIR` to copy Sense models from a specific directory, `--driver FILE`
+to install an external `driver_openvrlink` binary instead of the bundled one,
+and `--own-tab` to place the settings controls in a dedicated OpenVRLink tab
+without modifying `driver_vrlink`'s schema file.
 
-1. **PlayStation VR2 Sense controller models.** It searches for an existing copy
-   of the Sense render models (checking Sony's PlayStation VR2 App first, then
-   registered external drivers, and finally the sparse models ALVR places in
-   SteamVR's `playstation_vr2` driver folder), copies them into a resource-only
-   driver named `openvrlink_sense`, and remaps the input paths to match the
-   Touch controller inputs sent by OpenVRLink. You can pass `--models DIR` to
-   copy from a specific directory containing `playstation_vr2_sense_left` and
-   `playstation_vr2_sense_right`.
-2. **VR Link extensions** (can be skipped with `--no-patches`). It installs
-   `driver_openvrlink` and adds its settings controls to SteamVR's VR Link
-   settings tab. Pass `--own-tab` to place those controls in a separate
-   OpenVRLink settings tab without modifying `driver_vrlink`'s schema file.
+On Linux, `openvrlink-companion` looks for `driver_openvrlink.so` next to the
+executable (matching the release archive layout, e.g. in `~/.local/bin`) or at
+`../lib/openvrlink/driver_openvrlink.so` and
+`../share/openvrlink/driver_openvrlink.so` for system packages.
+
+### Installation paths and Steam discovery
 
 Both drivers are installed under `%LOCALAPPDATA%\OpenVRLink` on Windows or
 `~/.local/share/openvrlink` on Linux, and registered in `openvrpaths.vrpath`
-(the same file `vrpathreg adddriver` edits). Unless `--own-tab` is used, the
-installer also adds entries to `driver_vrlink`'s `settingsschema.vrsettings`.
-Running `uninstall` removes those entries, and if a SteamVR update overwrites
-`settingsschema.vrsettings`, you can run `install` again to restore the menu
-controls.
+(the same file `vrpathreg adddriver` edits). The only file modified inside the
+SteamVR directory is `driver_vrlink`'s `settingsschema.vrsettings`, and passing
+`--own-tab` avoids touching that file as well.
+
+`openvrlink-companion` checks known Steam installation locations directly:
+
+- **Windows**: `HKCU\Software\Valve\Steam\SteamPath` and
+  `HKLM\SOFTWARE\Valve\Steam\InstallPath` (in both 64-bit and 32-bit registry
+  views), followed by `Steam` under `%ProgramFiles(x86)%` and `%ProgramFiles%`.
+- **Linux**: `$XDG_DATA_HOME/Steam`, `~/.local/share/Steam`, `~/.steam/steam`,
+  `~/.steam/root`, `~/.steam/debian-installation`, the Steam snap
+  (`~/snap/steam/common/.local/share/Steam`), and the Steam Flatpak
+  (`~/.var/app/com.valvesoftware.Steam/.local/share/Steam` and `data/Steam`).
+- **Steam libraries**: every library folder listed in each installation's
+  `libraryfolders.vdf`.
+
+Sandboxed Linux builds of Steam (Snap and Flatpak) run with private home
+directories and cannot read hidden directories in `$HOME`. When SteamVR is
+installed inside a Snap or Flatpak, `openvrlink-companion` places its drivers
+and edits `openvrpaths.vrpath` inside that sandbox's config and data directories
+(`~/snap/steam/common/.config` and `.local/share` for Snap, or
+`~/.var/app/com.valvesoftware.Steam/.config` / `config` and `.local/share` for
+Flatpak). If multiple Steam installations exist on the system, it selects the
+one that has SteamVR installed.
+
+### Self-updates
+
+`openvrlink-companion update` and the GUI **Check for updates** button query the
+OpenVRLink GitHub releases API and look for the latest non-prerelease tag with a
+higher numeric version (`v0.1.0-10` > `v0.1.0-9`) that includes an asset for the
+current platform:
+
+| platform | release asset | contents |
+|---|---|---|
+| Windows | `openvrlink-companion-windows-x86_64.exe` | single-file executable with embedded `driver_openvrlink.dll` |
+| Linux | `openvrlink-companion-linux-<arch>.tar.gz` | `openvrlink-companion` and `driver_openvrlink.so` |
+
+Builds default to `Release.sourceVersion`, which `package-windows.cmd VERSION`
+can override by stamping a `VERSION` resource into the Windows executable.
+
+During an update, the new binary is staged next to `openvrlink-companion` and
+invoked with `version` to verify that it runs and reports the expected version.
+Because Windows locks running executables against overwrites but allows renaming
+them, the updater renames the running executable to `<name>.old-<id>` and moves
+the new binary into place; the next launch deletes any leftover `.old-*` files.
+On Linux, the updater swaps both `openvrlink-companion` and
+`driver_openvrlink.so` in the same directory, or exits with an error if the
+directory is not writable (for example, when installed via a system package
+manager). Updating `openvrlink-companion` does not automatically modify the
+installed SteamVR drivers; afterward, any component whose bundled driver changed
+will show an available update.
+
+Downloads use WinHTTP on Windows and `curl` on Linux over HTTPS. To test the
+updater locally without publishing a GitHub release, set `OVRL_RELEASE_LIST` to
+a local JSON file in GitHub's releases API format (local file paths are accepted
+as download URLs when `OVRL_RELEASE_LIST` is set).
 
 ## Hooking and safety
 
@@ -71,8 +157,10 @@ Protocol details for the extensions are documented in
   `steam.exe` and immediately unloads it, which can crash libraries that bundle
   a language runtime. `driver_openvrlink` pins its module handle on the first
   call to `HmdDriverFactory`. Because `steam.exe` keeps the DLL mapped while
-  Steam is open, `install` renames any locked binary before copying a new build
-  into place.
+  Steam is open, `install` renames any locked binary before writing a new build
+  in its place, and `uninstall` moves locked files to
+  `%LOCALAPPDATA%\OpenVRLink\in-use` to be deleted on a later run after Steam
+  exits.
 - **Non-fatal initialization.** `Init` always returns `0` so hook failures never
   prevent SteamVR from starting, and SteamVR's safe mode can disable
   `driver_openvrlink` like any other third-party driver.
@@ -89,7 +177,14 @@ external dependencies minimal avoids library conflicts. With Swift 6.4.2:
 - **Static stdlib (default).** Building with `--static-swift-stdlib` produces a
   single 8.5 MB `driver_openvrlink.dll` that depends only on Windows system DLLs
   and the Visual C++ runtime already loaded by `driver_vrlink`.
-  `openvrlink-companion` links Foundation statically in the same way (64 MB).
+  `openvrlink-companion` is also statically linked and imports
+  `FoundationEssentials` instead of full `Foundation`, avoiding the 34 MB ICU
+  Unicode data table that `Foundation` pulls into static builds. Process
+  spawning, threading, locks, and string helpers are implemented directly on
+  Win32 and POSIX in `CompanionKit/OS.swift` and `Window.swift`, keeping the
+  binary at 18 MB on Windows (including the embedded driver DLL) and 22 MB on
+  Linux. On Windows, its only non-OS DLL dependencies are `MSVCP140.dll` and
+  `VCRUNTIME140.dll`, which Steam already installs alongside SteamVR.
 - **Dynamic stdlib.** Produces a 0.6 MB DLL, at the cost of bundling
   `swiftCore.dll` and related Swift runtime libraries alongside the driver.
 - **Embedded Swift.** `PatchCore` and `driver_openvrlink` avoid Foundation,
@@ -137,13 +232,23 @@ instructions rather than matching uniform names.
 swift build -c release --static-swift-stdlib     # native build on Windows or Linux
 ./cross-build-linux-x86_64.sh                    # cross-compile Linux x86-64 driver
 swift test                                       # unit tests (Windows, Linux, or macOS)
-
-# Optional tests against local SteamVR binaries and shaders (see Tests/PatchCoreTests/RealFiles.swift):
-OVRL_TEST_VRLINK_DLL=…/driver_vrlink.dll OVRL_TEST_VRLINK_SO=…/driver_vrlink.so \
-OVRL_TEST_VRLINK_FXO=…/vrlink/resources/shaders/d3d11 swift test
-
-Tests\DriverHarness\run.cmd                      # Windows end-to-end harness
+package-windows.cmd [VERSION]                    # build single-file Windows release
+./package-linux.sh                               # build Linux release archive
 ```
+
+`package-windows.cmd` compiles a release build and runs
+`openvrlink-companion pack`, which copies `openvrlink-companion.exe`, embeds
+`driver_openvrlink.dll` into its Win32 resources via `UpdateResource` (without
+requiring a separate resource compiler), and verifies that the packed binary
+starts. Unpacked development builds load `driver_openvrlink.dll` from the same
+directory instead. `package-linux.sh` builds `driver_openvrlink.so` natively on
+x86-64 hosts or via `cross-build-linux-x86_64.sh` on arm64 hosts (the arm64
+cross-build path has been tested; native x86-64 packaging has not).
+
+To inspect the Windows GUI layout headlessly, run
+`openvrlink-companion window --snapshot FILE.bmp` to render the window to a BMP
+file. Rendering requires an interactive desktop session (capturing directly over
+SSH produces a black image, so run it via a scheduled task with `/it`).
 
 `Tests/DriverHarness` compiles a mock `driver_vrlink.dll` (with matching
 function prologues) and a C host executable that loads `driver_openvrlink.dll`
