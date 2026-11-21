@@ -1,2 +1,5 @@
 .build/
 *.replaced-*
+build-on-pc.sh
+openvrlink-companion-x86_64.exe
+*.exe.part
