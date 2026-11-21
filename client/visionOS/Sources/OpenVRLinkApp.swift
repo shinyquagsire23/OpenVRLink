@@ -250,9 +250,11 @@ enum AppVersion {
     • Fixed Persona face/eye tracking sometimes not working
     • Fixed WiVRn sometimes crashing on entry 
     • Added companion app+driver to GitHub for extending features to Steam VR Link
+    • Added room setup GUI for headset. Room boundaries are sent to SteamVR for games to use
     • (Extension) Added encoding gamma for preserving dark detail
     • (Extension) Added aspect-correct resolution for Vision Pro
     • (Extension) Added helper for high-res encoding configuration
+    • (Extension) Fixed room floor borders not appearing
 
     ___________________________
 
@@ -262,6 +264,7 @@ enum AppVersion {
     • Framerate selection does not work correctly on M5 Vision Pros
     • Streaming from ARM64 Linux machines (DGX Spark et al) for SteamVR Link is not currently working.
     • PSVR2 models require installing some assets on your PC using scripts from the repo (companion app ETA son)
+    • Room wall appearance does not work in SteamVR for now, only showing the floor does
     """
 }
 
