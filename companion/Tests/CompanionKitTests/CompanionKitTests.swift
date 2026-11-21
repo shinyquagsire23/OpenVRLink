@@ -401,6 +401,66 @@ final class ComponentTests: XCTestCase {
 }
 
 final class ReleaseTests: XCTestCase {
+    func testSourceVersionMatchesRepositoryVersionJson() throws {
+        // Walk up from companion/Tests/CompanionKitTests/<file> to the repository root.
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        guard let text = try? String(contentsOf: root.appendingPathComponent("version.json"), encoding: .utf8) else {
+            throw XCTSkip("version.json not found above package root")
+        }
+        let json = try JSON(parsing: text)
+        let version = try XCTUnwrap(json["version"]?.string), build = try XCTUnwrap(json["build"]?.number)
+        XCTAssertEqual(Release.sourceVersion, "\(version)-\(build)",
+                       "version.json is \(version)-\(build); update Release.sourceVersion in Sources/CompanionKit/Release.swift to match")
+    }
+
+    func testIconResourceExtraction() throws {
+        // Construct a 2-image ICO: a 16x16 entry (5 bytes) and a 256x256 entry encoded with width/height 0 (3 bytes).
+        var file: [UInt8] = [0, 0, 1, 0, 2, 0]
+        file += [16, 16, 0, 0, 1, 0, 32, 0, 5, 0, 0, 0, 38, 0, 0, 0]
+        file += [0, 0, 0, 0, 1, 0, 32, 0, 3, 0, 0, 0, 43, 0, 0, 0]
+        file += [1, 2, 3, 4, 5, 9, 8, 7]
+        let parts = try XCTUnwrap(WindowsResources.icon(fromICO: file))
+        XCTAssertEqual(parts.images.map(\.id), [1, 2])
+        XCTAssertEqual(parts.images.map(\.data), [[1, 2, 3, 4, 5], [9, 8, 7]])
+        XCTAssertEqual(parts.group, [0, 0, 1, 0, 2, 0,
+                                     16, 16, 0, 0, 1, 0, 32, 0, 5, 0, 0, 0, 1, 0,
+                                     0, 0, 0, 0, 1, 0, 32, 0, 3, 0, 0, 0, 2, 0])
+        XCTAssertNil(WindowsResources.icon(fromICO: Array(file.dropLast())))
+        XCTAssertNil(WindowsResources.icon(fromICO: [0, 0, 2, 0, 1, 0]))
+        // Verify the checked-in companion icon parses cleanly.
+        let icon = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Resources/openvrlink-companion.ico")
+        let real = try XCTUnwrap(WindowsResources.icon(fromICO: [UInt8](try Data(contentsOf: icon))))
+        XCTAssertEqual(real.images.count, 9)
+        XCTAssertEqual(real.group.count, 6 + 14 * 9)
+    }
+
+    func testVersionInfoBinaryLayout() {
+        let info = WindowsResources.versionInfo(version: "1.2.3-45")
+        func word(_ at: Int) -> Int { Int(info[at]) | Int(info[at + 1]) << 8 }
+        func long(_ at: Int) -> Int { word(at) | word(at + 2) << 16 }
+        func text(_ at: Int, _ count: Int) -> String { String(decoding: (0..<count).map { UInt16(word(at + $0 * 2)) }, as: UTF16.self) }
+        XCTAssertEqual(word(0), info.count)
+        XCTAssertEqual(word(2), 52)
+        XCTAssertEqual(word(4), 0)
+        XCTAssertEqual(text(6, 15), "VS_VERSION_INFO")
+        // VS_FIXEDFILEINFO follows the 6-byte header and 32-byte UTF-16 key+NUL, padded from offset 38 to 40.
+        XCTAssertEqual(long(40), 0xFEEF04BD)
+        XCTAssertEqual(long(48), 1 << 16 | 2)
+        XCTAssertEqual(long(52), 3 << 16 | 45)
+        XCTAssertEqual(long(56), 1 << 16 | 2)
+        XCTAssertEqual(long(60), 3 << 16 | 45)
+        // StringFileInfo follows the 52-byte VS_FIXEDFILEINFO block at offset 92.
+        XCTAssertEqual(text(92 + 6, 14), "StringFileInfo")
+        let whole = String(decoding: stride(from: 0, to: info.count - 1, by: 2).map { UInt16(word($0)) }, as: UTF16.self)
+        for expected in ["040904B0", "ProductName", "OpenVRLink Companion", "FileVersion", "1.2.3.45", "ProductVersion", "1.2.3-45", "VarFileInfo", "Translation"] {
+            XCTAssertTrue(whole.contains(expected), expected)
+        }
+        XCTAssertEqual(Array(info.suffix(4)), [0x09, 0x04, 0xB0, 0x04])
+        // Versions with fewer than four numeric components pad remaining components with zeros.
+        XCTAssertEqual(WindowsResources.versionInfo(version: "2").count % 2, 0)
+    }
+
     func testNumericVersionComparison() {
         XCTAssertEqual(Release.numbers("v0.1.0-8"), [0, 1, 0, 8])
         XCTAssertTrue(Release.isNewer("v0.1.0-10", than: "0.1.0-9"))

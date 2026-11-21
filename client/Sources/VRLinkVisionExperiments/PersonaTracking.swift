@@ -22,6 +22,15 @@ public final class PersonaTracking {
 
     public let camera = FaceCamera()
     private let lock = NSLock()
+    private var sceneReady: TimeInterval = 0
+
+    /// Timestamp (`CACurrentMediaTime`) when the streaming scene containing the camera anchor
+    /// became ready, or 0 if it hasn't yet. Starting the Persona camera before the scene is
+    /// ready produces no frames.
+    public var sceneReadyTime: TimeInterval {
+        get { lock.lock(); defer { lock.unlock() }; return sceneReady }
+        set { lock.lock(); sceneReady = newValue; lock.unlock() }
+    }
     private var gazeMaker = GazeFromFeatures()
 
     /// Stops the Persona camera when leaving an immersive space.

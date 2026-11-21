@@ -58,6 +58,17 @@ public final class RealityKitDisplay {
     /// Estimates scene depth from stereo disparity when `Settings.depthFromPicture` is enabled.
     private let depth: DepthEstimator
     private var depthNoted: Double = 0
+    /// Temporally smoothed depth field (`depthSettles`) used to deform the display meshes.
+    ///
+    /// Unlike CompositorServices, RealityKit doesn't expose its exact per-eye rendering poses,
+    /// so the poses RealityKit draws from can differ by a few millimeters from the poses the
+    /// host rendered for. Because of that offset, frame-to-frame noise in the depth estimate
+    /// shifts the image by a fraction of a pixel even when the user's head is still. `BentPlane`
+    /// uses perspective-correct UVs to eliminate UV swimming across triangles, and smoothing
+    /// the depth field over time suppresses the remaining sub-pixel jitter.
+    private var steadyDepth: (field: DepthField, at: Double)?
+    /// Exponential smoothing time constant in seconds (`1 - 1/e` response time) for `steadyDepth`.
+    private static let depthSettles = 0.1
     /// Retained so the debug depth overlay setting can toggle diagnostic image dumps.
     private let shrink: StereoShrink?
     /// Tracks whether the current `PlaneSet` buffers were allocated with deformable `BentPlane` meshes.
@@ -66,6 +77,9 @@ public final class RealityKitDisplay {
     private static let bentCells = (across: 110, down: 100)
     private var sets: [PlaneSet] = []
     private var materials: [ShaderGraphMaterial] = []      // left eye, right eye
+    /// Left and right stereo materials that divide `uv0` by `uv1.x` per pixel for perspective-correct
+    /// `BentPlane` meshes. Empty if loading failed, in which case `materials` is used as a fallback.
+    private var projectedMaterials: [ShaderGraphMaterial] = []
     private let root = Entity()
     private var personaCamera: Entity?
     private var updates: EventSubscription?
@@ -149,6 +163,18 @@ public final class RealityKitDisplay {
             }
         } catch {
             Log.note("realitykit: the stereo material could not be loaded: \(error)")
+        }
+        do {
+            var loaded: [ShaderGraphMaterial] = []
+            for name in ["/Root/SBSMaterialBilinearProjected_L", "/Root/SBSMaterialBilinearProjected_R"] {
+                var material = try await ShaderGraphMaterial(named: name, from: "SBSMaterial.usda", in: .module)
+                material.readsDepth = false
+                material.writesDepth = false
+                loaded.append(material)
+            }
+            projectedMaterials = loaded
+        } catch {
+            Log.note("realitykit: failed to load projected stereo materials; falling back to affine UVs: \(error)")
         }
         vsync = VsyncPrediction()
         updates = content.subscribe(to: SceneEvents.Update.self) { [weak self] _ in
@@ -249,14 +275,15 @@ public final class RealityKitDisplay {
             // Build per-eye deformable meshes subdivided to align with the foveation zone grid;
             // each triple-buffered PlaneSet owns its own mesh instances so updates stay in sync with its texture.
             var sheets: [BentPlane] = []
+            let projected = projectedMaterials.count == 2
             if bent {
                 sheets = Eye.allCases.compactMap { eye -> BentPlane? in
                     guard let foveated else {
-                        return BentPlane(across: RealityKitDisplay.bentCells.across, down: RealityKitDisplay.bentCells.down) { x, y in
+                        return BentPlane(across: RealityKitDisplay.bentCells.across, down: RealityKitDisplay.bentCells.down, projected: projected) { x, y in
                             [x, 1 - y]
                         }
                     }
-                    return BentPlane(across: Foveation.zonesAcross * 2, down: Foveation.zonesDown * 2) { x, y in
+                    return BentPlane(across: Foveation.zonesAcross * 2, down: Foveation.zonesDown * 2, projected: projected) { x, y in
                         let (fromLeft, fromTop) = foveated.target.stored(eye, x: x, y: y)
                         // Pre-compensate for the stereo material's 0.5x scale and per-eye offset on V, matching FoveatedFlatten.
                         let fromBottom = 1 - fromTop
@@ -269,12 +296,13 @@ public final class RealityKitDisplay {
                 }
             }
             let planes = Eye.allCases.map { eye -> ModelEntity in
-                var material = materials[eye.rawValue]
+                var material = !sheets.isEmpty && projected ? projectedMaterials[eye.rawValue] : materials[eye.rawValue]
                 try? material.setParameter(name: "texture", value: .textureResource(resource))
                 material.faceCulling = .none
                 let plane = ModelEntity(mesh: sheets.isEmpty ? (foveated?.meshes[eye.rawValue] ?? sheet) : sheets[eye.rawValue].resource,
                                         materials: [material])
                 plane.isEnabled = false
+                plane.components.set(ModelSortGroupComponent(group: PersonaAttachments.drawOrder, order: 0))
                 root.addChild(plane)
                 return plane
             }
@@ -282,7 +310,7 @@ public final class RealityKitDisplay {
         }
         Log.note("realitykit: flattening each eye to \(size.width)x\(size.height)"
                  + (foveated == nil ? "" : ", foveated: both eyes stored in \(stored.width)x\(stored.height)")
-                 + (bent ? ", with depth-warped meshes" : ""))
+                 + (bent ? ", with depth-warped meshes" + (projectedMaterials.count == 2 ? "" : " (unprojected UVs)") : ""))
     }
     private var foveated: FoveatedFlatten?
     private var foveationFailed = false
@@ -407,6 +435,7 @@ public final class RealityKitDisplay {
     /// enabled, logs summary statistics every few seconds, and returns the latest depth field.
     private func followDepth(_ frame: DecodedFrame, at seconds: Double) -> DepthField? {
         guard settings.current.depthFromPicture else {
+            steadyDepth = nil
             if depthNoted != 0 {
                 depthNoted = 0
                 depth.forget()
@@ -429,7 +458,18 @@ public final class RealityKitDisplay {
             }
         }
         // Reproject once to this frame's rendering pose for both eyes and the debug overlay.
-        return depth.field?.fitted(to: frame.layout)
+        guard let fresh = depth.field?.fitted(to: frame.layout) else {
+            steadyDepth = nil
+            return nil
+        }
+        // Reproject the previous smoothed field to this frame's pose before blending so depth stays world-locked during head rotation.
+        var field = fresh
+        if let held = steadyDepth {
+            let weight = Float(1 - exp(-max(0, seconds - held.at) / RealityKitDisplay.depthSettles))
+            field = held.field.fitted(to: frame.layout).eased(toward: fresh, by: weight)
+        }
+        steadyDepth = (field, seconds)
+        return field
     }
 
     /// Updates the Persona camera anchor to stay one meter in front of the user's head.
@@ -463,7 +503,8 @@ public struct RealityKitStreamView: View {
             }
             Attachment(id: PersonaAttachments.cameraView) {
                 PersonaCameraView(persona: persona, wanted: settings.faceFromCamera, showPicture: settings.showFaceCameraPicture,
-                                  faceCalibration: settings.faceCalibration, mayStart: { [display] in !display.stopped })
+                                  faceCalibration: settings.faceCalibration, mayStart: { [display] in !display.stopped },
+                                  startsCamera: false)
             }
         }
         .gesture(SpatialEventGesture(coordinateSpace: .local).targetedToAnyEntity()

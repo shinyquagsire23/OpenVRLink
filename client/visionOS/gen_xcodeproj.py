@@ -18,6 +18,7 @@ the one on this Mac's Apple Development certificate) and the bundle id
 import shutil
 import getpass
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -32,8 +33,10 @@ DEPLOYMENT_TARGET = "26.0"
 # low-latency streaming entitlement (OpenVRLink.entitlements). Signing any
 # other id with that entitlement fails, so other ids are signed without it.
 OWN_BUNDLE_ID = "dev.maxthomas.rel.OpenVRLink"
-MARKETING_VERSION = "0.1.0"
-BUILD_NUMBER = "8"
+# Read the marketing version and build number from version.json at the repository root.
+_VERSION = json.loads((Path(__file__).resolve().parents[2] / "version.json").read_text())
+MARKETING_VERSION = str(_VERSION["version"])
+BUILD_NUMBER = str(_VERSION["build"])
 
 
 def object_id(tag):

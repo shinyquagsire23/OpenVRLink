@@ -15,10 +15,17 @@ import simd
 /// its rendering eye ray at the estimated scene depth every frame, allowing
 /// RealityKit's display-time rendering to shift nearby geometry more than distant geometry.
 ///
-/// Because RealityKit interpolates UVs linearly across each mesh triangle rather
-/// than projectively from the host's rendering eye, the mesh is subdivided finely
-/// (~1 degree per cell); combined with a spatially smoothed depth field, affine
-/// UV distortion stays sub-pixel.
+/// RealityKit interpolates vertex attributes linearly across each triangle in 3D space.
+/// When a triangle's vertices sit at different depths, standard UVs shift within the
+/// triangle relative to the rendering eye's projection (by up to a quarter of the depth
+/// step across the triangle). In headset testing (2026-11-20), this caused straight lines
+/// near depth discontinuities like the floor boundary to look jagged and shimmer with
+/// depth noise. When `projected` is enabled, each vertex stores `uv * depth` in `uv0` and
+/// `depth` in `uv1.x`, and `SBSMaterialBilinearProjected` divides `uv0` by `uv1.x` per
+/// pixel to recover perspective-correct UVs from the rendering eye. In an offscreen test
+/// on macOS (2026-11-20) across a quad spanning 1 m to 4 m in depth, 16 evenly spaced
+/// stripes rendered 16 to 186 pixels apart with standard UVs versus 55 to 56 pixels apart
+/// with projected UVs.
 @MainActor
 final class BentPlane {
     let resource: MeshResource
@@ -26,10 +33,14 @@ final class BentPlane {
     /// Vertex counts horizontally and vertically (`cells + 1`).
     private let across: Int, down: Int
     private let uvs: [SIMD2<Float>]
+    /// When true, stores `uv * depth` in `uv0` for perspective-correct division in the shader.
+    private let projected: Bool
 
     private struct Vertex {
         var position: SIMD3<Float> = .zero
         var uv: SIMD2<Float> = .zero
+        /// Stores vertex depth in `x` (`uv1.x`) for perspective-correct UV division; `y` is unused.
+        var depth: SIMD2<Float> = .zero
     }
 
     /// Large static bounding box so RealityKit frustum culling never drops the mesh when vertices move in world space.
@@ -39,13 +50,16 @@ final class BentPlane {
     ///   - across, down: Grid cell counts horizontally and vertically.
     ///   - uv: Maps normalized view coordinates (`0...1` from top-left) to the
     ///     atlas UV expected by the RealityKit stereo material.
-    init?(across cellsAcross: Int, down cellsDown: Int, uv: (Float, Float) -> SIMD2<Float>) {
+    ///   - projected: When true, pre-multiplies `uv0` by vertex depth so the material can divide `uv0` by `uv1.x` per pixel.
+    init?(across cellsAcross: Int, down cellsDown: Int, projected: Bool, uv: (Float, Float) -> SIMD2<Float>) {
+        self.projected = projected
         across = cellsAcross + 1
         down = cellsDown + 1
         var descriptor = LowLevelMesh.Descriptor()
         descriptor.vertexAttributes = [
             .init(semantic: .position, format: .float3, offset: MemoryLayout<Vertex>.offset(of: \.position)!),
             .init(semantic: .uv0, format: .float2, offset: MemoryLayout<Vertex>.offset(of: \.uv)!),
+            .init(semantic: .uv1, format: .float2, offset: MemoryLayout<Vertex>.offset(of: \.depth)!),
         ]
         descriptor.vertexLayouts = [.init(bufferIndex: 0, bufferStride: MemoryLayout<Vertex>.stride)]
         descriptor.indexType = .uint32
@@ -91,7 +105,7 @@ final class BentPlane {
         let right = SIMD3(eye.right.x, eye.right.y, eye.right.z), up = SIMD3(eye.up.x, eye.up.y, eye.up.z)
         let forward = SIMD3(eye.forward.x, eye.forward.y, eye.forward.z)
         let wide = frustum.right - frustum.left, tall = frustum.up - frustum.down
-        let across = across, down = down, uvs = uvs
+        let across = across, down = down, uvs = uvs, projected = projected
         mesh.withUnsafeMutableBytes(bufferIndex: 0) { bytes in
             let vertices = bytes.bindMemory(to: Vertex.self)
             for row in 0..<down {
@@ -103,7 +117,8 @@ final class BentPlane {
                         ahead = 1 / max(DepthField.range.lowerBound, min(DepthField.range.upperBound, depth.nearness(across: x, up: y)))
                     }
                     let index = row * across + column
-                    vertices[index] = Vertex(position: origin + (forward + right * x + up * y) * ahead, uv: uvs[index])
+                    vertices[index] = Vertex(position: origin + (forward + right * x + up * y) * ahead,
+                                             uv: projected ? uvs[index] * ahead : uvs[index], depth: [ahead, 0])
                 }
             }
         }

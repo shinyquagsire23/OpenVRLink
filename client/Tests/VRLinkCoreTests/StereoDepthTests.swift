@@ -479,4 +479,18 @@ final class StereoDepthTests: XCTestCase {
         field.nearness = [Float](repeating: 0, count: 80)
         XCTAssertEqual(field.nearness(seenBy: .left, across: 0, up: 0), DepthField.range.lowerBound)
     }
+
+    func testADepthFieldEasesTowardANewerOneCellByCell() {
+        let window = Frustum(left: -1, right: 1, down: -1, up: 1)
+        let held = DepthField(columns: 2, rows: 2, window: window, apart: 0.064, nearness: [1, 1, 1, 1])
+        let newer = DepthField(columns: 2, rows: 2, window: window, apart: 0.064, nearness: [2, 1, 0, 3])
+        XCTAssertEqual(held.eased(toward: newer, by: 0.25).nearness, [1.25, 1, 0.75, 1.5])
+        XCTAssertEqual(held.eased(toward: newer, by: 0).nearness, held.nearness)
+        XCTAssertEqual(held.eased(toward: newer, by: 7).nearness, newer.nearness)
+        // When grid dimensions or frusta differ, `eased(toward:by:)` returns `newer` unchanged.
+        let other = DepthField(columns: 1, rows: 2, window: window, apart: 0.064, nearness: [5, 6])
+        XCTAssertEqual(held.eased(toward: other, by: 0.25).nearness, [5, 6])
+        let wider = DepthField(columns: 2, rows: 2, window: Frustum(left: -2, right: 1, down: -1, up: 1), apart: 0.064, nearness: [2, 1, 0, 3])
+        XCTAssertEqual(held.eased(toward: wider, by: 0.25).nearness, wider.nearness)
+    }
 }

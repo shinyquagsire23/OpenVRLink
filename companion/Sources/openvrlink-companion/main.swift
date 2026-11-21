@@ -48,7 +48,7 @@ let usage = """
     """
 
 struct Options {
-    var steamVR: URL?, models: URL?, driver: URL?, version: String?, snapshot: URL?
+    var steamVR: URL?, models: URL?, driver: URL?, version: String?, snapshot: URL?, icon: URL?
     var ownTab: Bool?, checkOnly = false
     var rest: [String] = []
 
@@ -65,6 +65,7 @@ struct Options {
             case "--driver": driver = URL(fileURLWithPath: try value())
             case "--snapshot": snapshot = URL(fileURLWithPath: try value())
             case "--version": version = try value()
+            case "--icon": icon = URL(fileURLWithPath: try value())
             case "--own-tab": ownTab = true
             case "--vrlink-tab": ownTab = false
             case "--check": checkOnly = true
@@ -216,7 +217,7 @@ func run(_ arguments: [String]) throws {
     case ("window", 0), ("after-update", 0): try runWindow(snapshot: options.snapshot, afterUpdate: command == "after-update")
     case ("pack", 1):
         guard let driver = options.driver else { throw Failure("pack needs --driver FILE") }
-        try pack(to: URL(fileURLWithPath: options.rest[0]), driver: driver, version: options.version)
+        try pack(to: URL(fileURLWithPath: options.rest[0]), driver: driver, version: options.version, icon: options.icon)
     #else
     case ("after-update", 0): Updater.clearLeftovers(patiently: true)
     #endif

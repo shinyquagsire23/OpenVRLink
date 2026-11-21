@@ -21,6 +21,8 @@ import VRLinkCore
 ///   displays the annotated camera feed two meters in front of the initial origin.
 enum PersonaAttachments {
     static let anchor = "persona_camera", cameraView = "camera_view"
+    /// Sort group used to render the video stream planes (order 0) behind the camera debug preview (order 1).
+    @MainActor static let drawOrder = ModelSortGroup(depthPass: nil)
 
     /// Adds both attachment entities to `content` and returns the camera anchor entity for per-frame updates.
     @MainActor
@@ -36,6 +38,9 @@ enum PersonaAttachments {
             view.isEnabled = true
             view.name = "camera_view_ent"
             view.position = [0, 1, -2]
+            // Render after the stream planes. Because the stream planes disable depth testing, they
+            // would otherwise draw over the preview wherever chroma keying isn't active.
+            view.components.set(ModelSortGroupComponent(group: PersonaAttachments.drawOrder, order: 1))
             content.add(view)
         }
         return anchor
@@ -74,6 +79,11 @@ struct PersonaCameraView: View {
     /// Checked right before starting capture. SwiftUI can recreate this view
     /// while the immersive space is closing, and capture must not restart then.
     var mayStart: () -> Bool = { true }
+    /// Whether this view starts camera capture on appear. Calibration spaces leave this `true`,
+    /// while streaming sets it to `false` so `PersonaCameraView` only records
+    /// `PersonaTracking.sceneReadyTime` and `EntryView.stream` can close the window right before
+    /// starting the camera.
+    var startsCamera = true
     @StateObject private var picture = PersonaPicture()
 
     /// Preview update rate in Hz (the camera captures at 30 fps).
@@ -103,7 +113,7 @@ struct PersonaCameraView: View {
                     DispatchQueue.main.async { picture.image = marked }
                 }
             }
-            persona.camera.start()
+            if startsCamera { persona.camera.start() } else { persona.sceneReadyTime = CACurrentMediaTime() }
         }
         .onDisappear { persona.camera.onPicture = nil }
     }

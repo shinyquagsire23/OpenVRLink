@@ -1376,5 +1376,247 @@ def Xform "Root"
             int ui:nodegraph:node:stackingOrder = 634
         }
     }
+
+    # Variant of SBSMaterialBilinear_L for meshes that store uv * depth in uv0 and depth in uv1.x.
+    # Dividing uv0 by uv1.x per pixel recovers perspective-correct UVs for the rendering eye.
+    def Material "SBSMaterialBilinearProjected_L"
+    {
+        asset inputs:texture (
+            customData = {
+                dictionary realitykit = {
+                    float2 positionInSubgraph = (-714.7617, 37.04297)
+                    float2 sizeInSubgraph = (115.5, 53)
+                    int stackingOrderInSubgraph = 504
+                }
+            }
+        )
+        token outputs:mtlx:surface.connect = </Root/SBSMaterialBilinearProjected_L/UnlitSurface.outputs:out>
+        token outputs:realitykit:vertex
+        float2 ui:nodegraph:node:pos = (106.85324, 93.4328)
+        int ui:nodegraph:node:stackingOrder = 1
+        float2 ui:nodegraph:realitykit:subgraphOutputs:pos = (890.9682, 176.60297)
+        float2 ui:nodegraph:realitykit:subgraphOutputs:size = (181.5, 99)
+        int ui:nodegraph:realitykit:subgraphOutputs:stackingOrder = 598
+
+        def Shader "Separate4"
+        {
+            uniform token info:id = "ND_separate4_color4"
+            color4f inputs:in.connect = </Root/SBSMaterialBilinearProjected_L/GeometrySwitchCameraIndex.outputs:out>
+            float outputs:outa
+            float outputs:outb
+            float outputs:outg
+            float outputs:outr
+            float2 ui:nodegraph:node:pos = (164.8399, 145.45125)
+            float2 ui:nodegraph:node:size = (115.5, 163)
+            int ui:nodegraph:node:stackingOrder = 536
+        }
+
+        def Shader "Combine3"
+        {
+            uniform token info:id = "ND_combine3_color3"
+            float inputs:in1.connect = </Root/SBSMaterialBilinearProjected_L/Separate4.outputs:outr>
+            float inputs:in2.connect = </Root/SBSMaterialBilinearProjected_L/Separate4.outputs:outg>
+            float inputs:in3.connect = </Root/SBSMaterialBilinearProjected_L/Separate4.outputs:outb>
+            color3f outputs:out
+            float2 ui:nodegraph:node:pos = (323.72595, 12.485718)
+            float2 ui:nodegraph:node:size = (145, 54)
+            int ui:nodegraph:node:stackingOrder = 614
+        }
+
+        def Shader "GeometrySwitchCameraIndex"
+        {
+            uniform token info:id = "ND_realitykit_geometry_switch_cameraindex_color4"
+            color4f inputs:left.connect = </Root/SBSMaterialBilinearProjected_L/Left.outputs:out>
+            color4f inputs:mono.connect = </Root/SBSMaterialBilinearProjected_L/Left.outputs:out>
+            color4f inputs:right
+            color4f outputs:out
+            float2 ui:nodegraph:node:pos = (-73.09742, 83.86663)
+            float2 ui:nodegraph:node:size = (237, 145)
+            int ui:nodegraph:node:stackingOrder = 593
+        }
+
+        def Shader "Left"
+        {
+            uniform token info:id = "ND_tiledimage_color4"
+            color4f inputs:default
+            asset inputs:file.connect = </Root/SBSMaterialBilinearProjected_L.inputs:texture>
+            string inputs:filtertype
+            float2 inputs:realworldimagesize
+            float2 inputs:realworldtilesize
+            float2 inputs:texcoord.connect = </Root/SBSMaterialBilinearProjected_L/ProjectedDivide.outputs:out>
+            float2 inputs:uvoffset
+            float2 inputs:uvtiling = (1, 0.5)
+            color4f outputs:out
+            float2 ui:nodegraph:node:pos = (-441.85236, -42.11212)
+            float2 ui:nodegraph:node:size = (158.5, 235)
+            int ui:nodegraph:node:stackingOrder = 622
+        }
+
+        def Shader "UnlitSurface"
+        {
+            uniform token info:id = "ND_realitykit_unlit_surfaceshader"
+            bool inputs:applyPostProcessToneMap = 0
+            color3f inputs:color.connect = </Root/SBSMaterialBilinearProjected_L/Combine3.outputs:out>
+            bool inputs:hasPremultipliedAlpha = 0
+            float inputs:opacity.connect = </Root/SBSMaterialBilinearProjected_L/Separate4.outputs:outa>
+            float inputs:opacityThreshold
+            token outputs:out
+            float2 ui:nodegraph:node:pos = (601.2183, 63.652813)
+            float2 ui:nodegraph:node:size = (194.5, 181)
+            int ui:nodegraph:node:stackingOrder = 615
+            string[] ui:nodegraph:realitykit:node:attributesShowingChildren = ["inputs:opacity", "inputs:opacity"]
+        }
+
+        def Shader "ProjectedScaled"
+        {
+            uniform token info:id = "ND_texcoord_vector2"
+            int inputs:index = 0
+            float2 outputs:out
+        }
+
+        def Shader "ProjectedDepth"
+        {
+            uniform token info:id = "ND_texcoord_vector2"
+            int inputs:index = 1
+            float2 outputs:out
+        }
+
+        def Shader "ProjectedDepthParts"
+        {
+            uniform token info:id = "ND_separate2_vector2"
+            float2 inputs:in.connect = </Root/SBSMaterialBilinearProjected_L/ProjectedDepth.outputs:out>
+            float outputs:outx
+            float outputs:outy
+        }
+
+        def Shader "ProjectedDivide"
+        {
+            uniform token info:id = "ND_divide_vector2FA"
+            float2 inputs:in1.connect = </Root/SBSMaterialBilinearProjected_L/ProjectedScaled.outputs:out>
+            float inputs:in2.connect = </Root/SBSMaterialBilinearProjected_L/ProjectedDepthParts.outputs:outx>
+            float2 outputs:out
+        }
+    }
+
+    # Variant of SBSMaterialBilinear_R for meshes that store uv * depth in uv0 and depth in uv1.x.
+    # Dividing uv0 by uv1.x per pixel recovers perspective-correct UVs for the rendering eye.
+    def Material "SBSMaterialBilinearProjected_R"
+    {
+        asset inputs:texture (
+            customData = {
+                dictionary realitykit = {
+                    float2 positionInSubgraph = (-714.7617, 37.04297)
+                    float2 sizeInSubgraph = (115.5, 53)
+                    int stackingOrderInSubgraph = 504
+                }
+            }
+        )
+        token outputs:mtlx:surface.connect = </Root/SBSMaterialBilinearProjected_R/UnlitSurface.outputs:out>
+        token outputs:realitykit:vertex
+        float2 ui:nodegraph:node:pos = (106.85324, 93.4328)
+        int ui:nodegraph:node:stackingOrder = 1
+        float2 ui:nodegraph:realitykit:subgraphOutputs:pos = (890.9682, 176.60297)
+        float2 ui:nodegraph:realitykit:subgraphOutputs:size = (181.5, 99)
+        int ui:nodegraph:realitykit:subgraphOutputs:stackingOrder = 598
+
+        def Shader "Separate4"
+        {
+            uniform token info:id = "ND_separate4_color4"
+            color4f inputs:in.connect = </Root/SBSMaterialBilinearProjected_R/GeometrySwitchCameraIndex.outputs:out>
+            float outputs:outa
+            float outputs:outb
+            float outputs:outg
+            float outputs:outr
+            float2 ui:nodegraph:node:pos = (164.8399, 145.45125)
+            float2 ui:nodegraph:node:size = (115.5, 163)
+            int ui:nodegraph:node:stackingOrder = 536
+        }
+
+        def Shader "Combine3"
+        {
+            uniform token info:id = "ND_combine3_color3"
+            float inputs:in1.connect = </Root/SBSMaterialBilinearProjected_R/Separate4.outputs:outr>
+            float inputs:in2.connect = </Root/SBSMaterialBilinearProjected_R/Separate4.outputs:outg>
+            float inputs:in3.connect = </Root/SBSMaterialBilinearProjected_R/Separate4.outputs:outb>
+            color3f outputs:out
+            float2 ui:nodegraph:node:pos = (323.72595, 12.485718)
+            float2 ui:nodegraph:node:size = (145, 54)
+            int ui:nodegraph:node:stackingOrder = 614
+        }
+
+        def Shader "GeometrySwitchCameraIndex"
+        {
+            uniform token info:id = "ND_realitykit_geometry_switch_cameraindex_color4"
+            color4f inputs:left
+            color4f inputs:mono
+            color4f inputs:right.connect = </Root/SBSMaterialBilinearProjected_R/Right.outputs:out>
+            color4f outputs:out
+            float2 ui:nodegraph:node:pos = (-73.09742, 83.86663)
+            float2 ui:nodegraph:node:size = (237, 145)
+            int ui:nodegraph:node:stackingOrder = 593
+        }
+
+        def Shader "Right"
+        {
+            uniform token info:id = "ND_tiledimage_color4"
+            color4f inputs:default
+            asset inputs:file.connect = </Root/SBSMaterialBilinearProjected_R.inputs:texture>
+            string inputs:filtertype
+            float2 inputs:realworldimagesize
+            float2 inputs:realworldtilesize
+            float2 inputs:texcoord.connect = </Root/SBSMaterialBilinearProjected_R/ProjectedDivide.outputs:out>
+            float2 inputs:uvoffset = (0, 0.5)
+            float2 inputs:uvtiling = (1, 0.5)
+            color4f outputs:out
+            float2 ui:nodegraph:node:pos = (-450.0672, 220.97772)
+            float2 ui:nodegraph:node:size = (158.5, 235)
+            int ui:nodegraph:node:stackingOrder = 621
+        }
+
+        def Shader "UnlitSurface"
+        {
+            uniform token info:id = "ND_realitykit_unlit_surfaceshader"
+            bool inputs:applyPostProcessToneMap = 0
+            color3f inputs:color.connect = </Root/SBSMaterialBilinearProjected_R/Combine3.outputs:out>
+            bool inputs:hasPremultipliedAlpha = 0
+            float inputs:opacity.connect = </Root/SBSMaterialBilinearProjected_R/Separate4.outputs:outa>
+            float inputs:opacityThreshold
+            token outputs:out
+            float2 ui:nodegraph:node:pos = (601.2183, 63.652813)
+            float2 ui:nodegraph:node:size = (194.5, 181)
+            int ui:nodegraph:node:stackingOrder = 615
+            string[] ui:nodegraph:realitykit:node:attributesShowingChildren = ["inputs:opacity", "inputs:opacity"]
+        }
+
+        def Shader "ProjectedScaled"
+        {
+            uniform token info:id = "ND_texcoord_vector2"
+            int inputs:index = 0
+            float2 outputs:out
+        }
+
+        def Shader "ProjectedDepth"
+        {
+            uniform token info:id = "ND_texcoord_vector2"
+            int inputs:index = 1
+            float2 outputs:out
+        }
+
+        def Shader "ProjectedDepthParts"
+        {
+            uniform token info:id = "ND_separate2_vector2"
+            float2 inputs:in.connect = </Root/SBSMaterialBilinearProjected_R/ProjectedDepth.outputs:out>
+            float outputs:outx
+            float outputs:outy
+        }
+
+        def Shader "ProjectedDivide"
+        {
+            uniform token info:id = "ND_divide_vector2FA"
+            float2 inputs:in1.connect = </Root/SBSMaterialBilinearProjected_R/ProjectedScaled.outputs:out>
+            float inputs:in2.connect = </Root/SBSMaterialBilinearProjected_R/ProjectedDepthParts.outputs:outx>
+            float2 outputs:out
+        }
+    }
 }
 

@@ -318,6 +318,9 @@ struct EntryView: View {
     @State private var askingForAddress = false
     @State private var typedPin = ""
 
+    /// Maximum time in seconds to wait for the RealityKit scene to become ready before starting the Persona camera anyway.
+    static let longestWaitForScene = 8.0
+
     /// Connects to `address` and waits for the first decoded video frame before
     /// opening the immersive space so the user isn't placed in a blank scene.
     private func stream(from address: String, kind: HostKind) {
@@ -380,8 +383,50 @@ struct EntryView: View {
                 return
             }
             connection.immersed = true
-            // Opening the app again brings the window back.
+            let spaceOpened = CACurrentMediaTime()
+            func sinceOpening() -> Int { Int((CACurrentMediaTime() - spaceOpened) * 1000) }
+            guard realityKit, store.settings.faceFromCamera else {
+                // Opening the app again brings the window back.
+                if store.settings.closeWindowOnEntry { dismissWindow(id: "entry") }
+                return
+            }
+            // visionOS has undocumented timing requirements between the RealityKit scene, the app
+            // window, and the Spatial Persona camera. Headset testing (2026-11-20) showed the
+            // following behavior across different startup orders:
+            //  - Dismissing the window when the space opened and starting the camera once the scene
+            //    was ready worked when scene setup was quick (apart from occasional silent starts),
+            //    but produced no frames when scene setup was slow because the window closed before
+            //    session startup finished (~9 s), and visionOS requires an open window to start the
+            //    Persona camera.
+            //  - Starting the camera 200 ms after the space opened, before the scene and camera
+            //    anchor were ready, produced no frames.
+            //  - Keeping the window open until the first camera frame arrived produced frames, but
+            //    left the camera anchored to the window's position instead of following the head.
+            //  - Waiting until the scene was ready, then dismissing the window and starting the
+            //    camera immediately afterward produced head-tracked frames almost every time.
+            //
+            // Accordingly, we wait for the scene to report ready, then dismiss the window and start
+            // the camera back-to-back, which matches ALVR's visionOS client. Startup timings are
+            // logged below to help diagnose any future regressions.
+            var waited = 0.0
+            while persona.sceneReadyTime < spaceOpened, waited < EntryView.longestWaitForScene, connection.immersed, connection.active {
+                try? await Task.sleep(for: .milliseconds(10))
+                waited += 0.01
+            }
+            guard connection.immersed, connection.active else { return }
+            let ready = sinceOpening()
+            // Dismiss the window and start the camera synchronously on the main actor with no await
+            // in between so the window is already closing before the camera session binds to an anchor.
             if store.settings.closeWindowOnEntry { dismissWindow(id: "entry") }
+            let started = sinceOpening()
+            persona.camera.start()
+            for _ in 0..<100 where persona.camera.lastPictureTime < spaceOpened && connection.immersed {
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            let pictured = persona.camera.lastPictureTime >= spaceOpened ? "\(sinceOpening()) ms" : "timed out after 5 s"
+            print("EntryView: Persona camera: scene ready at \(ready) ms"
+                  + (persona.sceneReadyTime < spaceOpened ? " (timed out waiting)" : "")
+                  + ", window \(store.settings.closeWindowOnEntry ? "dismissed" : "kept open"), camera started at \(started) ms, first frame: \(pictured)")
         }
     }
 

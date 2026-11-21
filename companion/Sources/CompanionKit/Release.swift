@@ -14,7 +14,9 @@ import Foundation
 /// for a platform-matching asset: `openvrlink-companion-windows-x86_64.exe` on Windows or
 /// `openvrlink-companion-linux-<arch>.tar.gz` on Linux.
 public enum Release {
-    /// Default version string when no `VERSION` resource is stamped by `pack --version`.
+    /// Fallback version string (`<version>-<build>`) used when no `VERSION` resource is stamped
+    /// by `pack --version`. Keep this in sync with `version.json` at the repository root
+    /// (verified by `ReleaseTests`).
     public static let sourceVersion = "0.1.0-8"
     public static let repository = "shinyquagsire23/OpenVRLink"
     public static var listURL: String { "https://api.github.com/repos/\(repository)/releases?per_page=20" }

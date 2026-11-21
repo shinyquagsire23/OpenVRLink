@@ -140,8 +140,13 @@ current platform:
 | Windows | `openvrlink-companion-windows-x86_64.exe` | single-file executable with embedded `driver_openvrlink.dll` |
 | Linux | `openvrlink-companion-linux-<arch>.tar.gz` | `openvrlink-companion` and `driver_openvrlink.so` |
 
-Builds default to `Release.sourceVersion`, which `package-windows.cmd VERSION`
-can override by stamping a `VERSION` resource into the Windows executable.
+Repository-wide versioning is configured in `version.json` at the repository
+root (`version` and `build`, formatted as `0.1.0-8`). The visionOS Xcode project
+reads `version.json` directly when generated, while `openvrlink-companion` keeps
+a matching fallback in `Release.sourceVersion` (verified by a unit test so both
+stay in sync when bumping versions). On Windows, `package-windows.cmd` stamps
+the version from `version.json` into the executable as a `VERSION` resource, or
+uses an explicit override when passed as `package-windows.cmd VERSION`.
 
 During an update, the new binary is staged next to `openvrlink-companion` and
 invoked with `version` to verify that it runs and reports the expected version.
@@ -281,8 +286,13 @@ package-windows.cmd [VERSION]                    # build single-file Windows rel
 `openvrlink-companion pack`, which copies `openvrlink-companion.exe`, embeds
 `driver_openvrlink.dll` into its Win32 resources via `UpdateResource` (without
 requiring a separate resource compiler), and verifies that the packed binary
-starts. Unpacked development builds load `driver_openvrlink.dll` from the same
-directory instead. `package-linux.sh` builds `driver_openvrlink.so` natively on
+starts. `pack` also embeds a `VS_VERSIONINFO` resource for Windows File Explorer
+and, when given `--icon FILE.ico`, embeds the application icon used by both File
+Explorer and the GUI window (`WindowsResources`). The checked-in icon at
+`Resources/openvrlink-companion.ico` is generated from the visionOS app icon
+layers by `python3 make-icon.py`. Unpacked development builds load
+`driver_openvrlink.dll` from the same directory instead and use the default
+system window icon. `package-linux.sh` builds `driver_openvrlink.so` natively on
 x86-64 hosts or via `cross-build-linux-x86_64.sh` on arm64 hosts (the arm64
 cross-build path has been tested; native x86-64 packaging has not).
 

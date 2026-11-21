@@ -20,6 +20,9 @@ cd visionOS && ./run.sh          # generate the project, build, install, launch
 cd visionOS && ./run.sh --build  # build only
 ```
 
+The app's version and build number come from `version.json` at the root of the
+repository.
+
 The signing team is read from this Mac's Apple Development certificate, and the bundle id is made from that team (`dev.openvrlink.<team>.OpenVRLink`), so your build has its own non-conflicting bundle ID. `OPENVRLINK_TEAM` and 
 `OPENVRLINK_BUNDLE_ID` can override the team and bundle ID if needed.
 

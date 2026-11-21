@@ -374,6 +374,20 @@ extension DepthField {
         return out
     }
 
+    /// Linearly interpolates each cell's inverse depth toward `newer` by `weight`
+    /// (clamped to `0...1`). Both fields should already be reprojected to the same pose.
+    /// If the grid dimensions, frustum, or eye separation differ, returns `newer` directly.
+    public func eased(toward newer: DepthField, by weight: Float) -> DepthField {
+        guard columns == newer.columns, rows == newer.rows, nearness.count == newer.nearness.count,
+              window.left == newer.window.left, window.right == newer.window.right,
+              window.down == newer.window.down, window.up == newer.window.up, apart == newer.apart
+        else { return newer }
+        let weight = max(0, min(1, weight))
+        var out = newer
+        for index in out.nearness.indices { out.nearness[index] = nearness[index] + (newer.nearness[index] - nearness[index]) * weight }
+        return out
+    }
+
     /// Reprojects this depth field to `layout`'s cyclopean rendering pose.
     public func fitted(to layout: FrameLayout) -> DepthField {
         guard let middle = layout.middle else { return self }

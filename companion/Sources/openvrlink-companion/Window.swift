@@ -350,7 +350,9 @@ func runWindow(snapshot file: URL?, afterUpdate: Bool = false) throws {
         windowClass.lpfnWndProc = windowProcedure
         windowClass.hInstance = instance
         windowClass.hCursor = LoadCursorW(nil, UnsafePointer<WCHAR>(bitPattern: 32512 /* IDC_ARROW */))
-        windowClass.hIcon = LoadIconW(nil, UnsafePointer<WCHAR>(bitPattern: 32512 /* IDI_APPLICATION */))
+        // Use the embedded icon resource if present, falling back to the default system icon for unpacked builds.
+        windowClass.hIcon = LoadIconW(GetModuleHandleW(nil), UnsafePointer<WCHAR>(bitPattern: UInt(WindowsResources.iconGroupID)))
+            ?? LoadIconW(nil, UnsafePointer<WCHAR>(bitPattern: 32512 /* IDI_APPLICATION */))
         windowClass.hbrBackground = GetSysColorBrush(COLOR_WINDOW)
         windowClass.lpszClassName = className.baseAddress
         guard RegisterClassExW(&windowClass) != 0 else { throw Failure("could not register Win32 window class (error \(GetLastError()))") }
@@ -382,8 +384,9 @@ func runWindow(snapshot file: URL?, afterUpdate: Bool = false) throws {
 }
 
 /// Copies the running executable to `output` and embeds `driver` (plus an optional
-/// `version` string) as Win32 `RT_RCDATA` resources read by `Machine.resource`.
-func pack(to output: URL, driver: URL, version: String?) throws {
+/// `version` string) as Win32 `RT_RCDATA` resources read by `Machine.resource`. Also embeds
+/// a `VS_VERSIONINFO` resource and, when `icon` is provided, the `.ico` icon group (`WindowsResources`).
+func pack(to output: URL, driver: URL, version: String?, icon: URL? = nil) throws {
     let library: Data
     do { library = try Data(contentsOf: driver) } catch { throw Failure("\(driver.path): \(OS.describe(error))") }
     let files = FileManager.default
@@ -395,7 +398,21 @@ func pack(to output: URL, driver: URL, version: String?) throws {
         var bytes = [UInt8](data)
         return UpdateResourceW(update, UnsafePointer<WCHAR>(bitPattern: 10 /* RT_RCDATA */), name.wide, 0x0409 /* English (US) */, &bytes, DWORD(bytes.count))
     }
-    guard add("DRIVER", library), version.map({ add("VERSION", Data($0.utf8)) }) ?? true else {
+    func add(type: Int, id: Int, _ data: [UInt8]) -> Bool {
+        var bytes = data
+        return UpdateResourceW(update, UnsafePointer<WCHAR>(bitPattern: type), UnsafePointer<WCHAR>(bitPattern: id), 0x0409, &bytes, DWORD(bytes.count))
+    }
+    var added = add("DRIVER", library) && (version.map { add("VERSION", Data($0.utf8)) } ?? true)
+        && add(type: WindowsResources.versionType, id: WindowsResources.versionID, WindowsResources.versionInfo(version: version ?? Machine.version))
+    if added, let icon {
+        guard let file = try? Data(contentsOf: icon), let parts = WindowsResources.icon(fromICO: [UInt8](file)) else {
+            EndUpdateResourceW(update, true)
+            throw Failure("\(icon.path) is not an icon file")
+        }
+        added = add(type: WindowsResources.iconGroupType, id: WindowsResources.iconGroupID, parts.group)
+            && parts.images.allSatisfy { add(type: WindowsResources.iconType, id: $0.id, $0.data) }
+    }
+    guard added else {
         EndUpdateResourceW(update, true)
         throw failed("UpdateResourceW")
     }

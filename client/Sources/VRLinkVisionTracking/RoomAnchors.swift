@@ -39,6 +39,10 @@ public final class RoomAnchors {
     private var marker: (id: UUID, truth: simd_float4x4)?
     /// Marker UUIDs currently active, being added, or being removed so orphan cleanup ignores them.
     private var markers: Set<UUID> = []
+    /// Removed marker UUIDs and their removal timestamps. ARKit can continue reporting a removed
+    /// marker briefly, so we keep it in `markers` until it disappears from `allAnchors` or `stall`
+    /// seconds have elapsed so orphan cleanup doesn't try to remove it again.
+    private var leaving: [UUID: TimeInterval] = [:]
     /// Transform from ARKit's reported anchor space into head-tracking space; `nil` while awaiting a new marker.
     private var correction: simd_float4x4?
     /// Timestamp (`CACurrentMediaTime`) when `correction` was first established after an origin change.
@@ -225,6 +229,12 @@ public final class RoomAnchors {
             let listed = Set(all.map(\.id))
             for id in known.keys where !listed.contains(id) && !arriving.contains(id) { known[id] = nil }
         }
+        // Stop tracking removed markers once ARKit drops them from `allAnchors` or `stall` seconds pass.
+        let stillListed = Set(all.map(\.id))
+        for (id, since) in leaving where !stillListed.contains(id) || now - since > RoomAnchors.stall {
+            leaving[id] = nil
+            markers.remove(id)
+        }
         // Remove anchors belonging to deleted rooms or stale markers from previous runs.
         if store.readable {
             let rooms = Set(store.rooms.map(\.id))
@@ -279,7 +289,7 @@ public final class RoomAnchors {
         if let gone {
             try? await worldTracking.removeAnchor(forID: gone)
             lock.lock()
-            markers.remove(gone)
+            leaving[gone] = CACurrentMediaTime()
             lock.unlock()
         }
     }

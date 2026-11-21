@@ -32,6 +32,17 @@ public final class FaceCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDel
 
     private var running = false
     private var lastPicture: TimeInterval = 0
+    /// Last startup stage reached by the most recent `start()` call, logged if no frames arrive.
+    private var stage = "not started"
+    private var starts = 0
+    private var sessionStarting: TimeInterval = 0
+
+    /// Timestamp (`CACurrentMediaTime`) right before `startRunning()` was last called, or 0 if never started.
+    public var sessionStartTime: TimeInterval {
+        lock.lock()
+        defer { lock.unlock() }
+        return sessionStarting
+    }
     private var observers: [NSObjectProtocol] = []
 
     // For the once-in-a-while log lines
@@ -68,10 +79,27 @@ public final class FaceCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDel
     /// an `AVCaptureSession` across spaces fails to rebind to the new anchor,
     /// so we recreate it each time (matching the ALVR visionOS client).
     public func start() {
+        let began = CACurrentMediaTime()
         lock.lock()
         running = true
+        starts += 1
+        let attempt = starts
+        stage = "requesting permission"
         lock.unlock()
+        // AVCaptureSession fails silently if no frames arrive, so log which startup step we reached after 3 seconds.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 3) { [self] in
+            lock.lock()
+            let silent = running && starts == attempt && lastPicture < began, stage = stage
+            lock.unlock()
+            if silent { Log.note("FaceCamera: no frames 3 s after start; last stage: \(stage)") }
+        }
+        func reached(_ what: String) {
+            lock.lock()
+            if starts == attempt { stage = what }
+            lock.unlock()
+        }
         AVCaptureDevice.requestAccess(for: .video) { [self] allowed in
+            reached(allowed ? "waiting for previous start or stop to finish" : "permission denied")
             guard allowed else {
                 Log.note("FaceCamera: the camera is not permitted")
                 lock.lock()
@@ -80,7 +108,9 @@ public final class FaceCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDel
                 return
             }
             setup.async { [self] in
+                reached("stopping previous session")
                 tearDown()
+                reached("configuring session")
                 lock.lock()
                 let wanted = running
                 lock.unlock()
@@ -148,7 +178,12 @@ public final class FaceCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDel
                     },
                 ]
                 self.session = session
+                reached("starting session (waiting for startRunning)")
+                lock.lock()
+                sessionStarting = CACurrentMediaTime()
+                lock.unlock()
                 session.startRunning()
+                reached("started (isRunning: \(session.isRunning))")
                 Log.note("FaceCamera: started, using \(camera.localizedName)")
             }
         }
