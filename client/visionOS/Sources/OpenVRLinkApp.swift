@@ -246,11 +246,13 @@ enum AppVersion {
     static let changes = """
     What's changed?
 
-    • (Hotfix) Fixed compatibility with SteamVR 2.19.4
-    • Added a new stereo-disparity depth prediction Experiment, default On. If Wi-Fi or game timing is unstable, the view should be more stable. If you find an area or game that predicts particularly terribly, or if performance is significantly worse (especially on M2), please file feedback so I can tune it better.
-    • Added support for WiVRn hosts. Discovery may be a bit buggy, so use direct IP connection if needed.
-    • Fixed microphone session getting interrupted by calls; the app will now attempt to recover from microphone interruptions.
-    • Fixed the audio session not allowing mixing with other applications (Mac Virtual Display)
+    • Fixed boiling effect when using RealityKit with depth correction
+    • Fixed Persona face/eye tracking sometimes not working
+    • Fixed WiVRn sometimes crashing on entry 
+    • Added companion app+driver to GitHub for extending features to Steam VR Link
+    • (Extension) Added encoding gamma for preserving dark detail
+    • (Extension) Added aspect-correct resolution for Vision Pro
+    • (Extension) Added helper for high-res encoding configuration
 
     ___________________________
 
@@ -258,7 +260,7 @@ enum AppVersion {
 
     • With the RealityKit renderer, taking the headset off and putting it back on does not resume the stream.
     • Framerate selection does not work correctly on M5 Vision Pros
-    • Streaming from ARM64 Linux machines (eg, DGX Spark) for SteamVR Link is currently not working.
+    • Streaming from ARM64 Linux machines (DGX Spark et al) for SteamVR Link is not currently working.
     • PSVR2 models require installing some assets on your PC using scripts from the repo (companion app ETA son)
     """
 }
