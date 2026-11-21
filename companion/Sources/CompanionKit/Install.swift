@@ -29,7 +29,7 @@ public enum Install {
     public static let gammaAvailableKey = "gammaAvailable"
     /// Written by the driver: one line on what it managed to patch.
     public static let statusKey = "status"
-    public static let defaultGamma = 1.2
+    public static let defaultGamma = 1.6
     /// Marks a library that was in use when a newer one took its name.
     static let replacedMark = ".replaced-"
 
@@ -56,7 +56,9 @@ public enum Install {
             .object([
                 "name": .string(setting(gammaValueKey)), "control": .string("slider"), "label": .string("OpenVRLink: encoding gamma"),
                 "min": .number("1"), "max": .number("2.5"), "step": .number("0.05"), "decimals": .number("2"),
-                "requires": .object([setting(gammaAvailableKey): .bool(true), setting(gammaOnKey): .bool(true)]),
+                // Only gate visibility on `gammaAvailable`. Adding `encodingGamma: true` to `requires`
+                // hid the slider completely in SteamVR 2.19.4 even when the toggle was enabled.
+                "requires": .object([setting(gammaAvailableKey): .bool(true)]),
             ]),
             .object([
                 "name": .string(setting(statusKey)), "control": .string("label"), "label": .string("OpenVRLink patches"),
@@ -123,7 +125,9 @@ public enum Install {
         try defaults.text.write(to: settings.appendingPathComponent("default.vrsettings"), atomically: true, encoding: .utf8)
         let schema = ownTabSchema(inDriver: driver)
         if ownTab {
-            let tab = JSON.array([.object(["title": .string("OpenVRLink"), "values": .array(menuEntries)])])
+            // Set `show_without_hmd` so SteamVR displays this tab even though the active headset
+            // belongs to `driver_vrlink` rather than `driver_openvrlink`.
+            let tab = JSON.array([.object(["title": .string("OpenVRLink"), "show_without_hmd": .bool(true), "values": .array(menuEntries)])])
             try tab.text.write(to: schema, atomically: true, encoding: .utf8)
         } else if files.fileExists(atPath: schema.path) {
             try files.removeItem(at: schema)

@@ -87,6 +87,37 @@ public enum Scan {
 
     public static let targets = [parseRecords, populateRecords, updateConstants, updateConstantsWide, loadSPIRV, updateConstantsD3D]
 
+    /// An in-memory byte patch in `driver_vrlink` located by a surrounding byte signature.
+    public struct Edit {
+        public let name: StaticString
+        /// Byte pattern in the Windows driver (`??` for wildcard bytes). Must match uniquely.
+        public let peSignature: StaticString
+        /// Byte offset within `peSignature` where `replacement` is written.
+        public let offset: Int
+        public let replacement: [UInt8]
+    }
+
+    /// Patches out the final call in `SVLHMDDriver::Activate` on Windows (`0x1809e9940` in
+    /// the 2026-11-13 build). That call invokes `IVRServerInternal` vtable slot 69 to set a
+    /// flag in `vrserver` that makes `vrcompositor` force
+    /// `collisionBounds/CollisionBoundsGroundPerimeterOn` off, since VR Link assumes the
+    /// headset draws its own boundary. Replacing the 6-byte call with a NOP lets the SteamVR
+    /// setting take effect again. The signature matches the tail of `Activate` starting where
+    /// it sets bool property 0x844. Not yet located in the Linux driver, which uses a
+    /// different vtable layout.
+    public static let keepFloorPerimeter = Edit(
+        name: "floor-perimeter",
+        peSignature: "41 B1 01 41 B8 44 08 00 00 E8 ?? ?? ?? ?? 48 8B CE E8 ?? ?? ?? ?? E8 ?? ?? ?? ?? 48 8B C8 48 8B 10 FF 92 28 02 00 00",
+        offset: 33, replacement: [0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00])
+
+    /// Returns the target patch address if `edit.peSignature` matches exactly once in `regions`.
+    public static func resolve(edit: Edit, in regions: [Region]) -> UInt64? {
+        let signature = parseSignature(edit.peSignature)
+        var places: [UInt64] = []
+        for region in regions { places += findSignature(in: region, signature) }
+        return places.count == 1 ? places[0] + UInt64(edit.offset) : nil
+    }
+
     /// The import through which the Windows driver reads every one of its Direct3D
     /// shaders from disk (`D3DReadFileToBlob(path, &blob)`).
     public static let shaderReadImport: (library: StaticString, function: StaticString) = ("D3DCOMPILER_47.dll", "D3DReadFileToBlob")

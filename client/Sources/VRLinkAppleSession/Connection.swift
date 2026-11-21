@@ -66,6 +66,31 @@ public final class Connection: ObservableObject {
     private var audio: AudioOutput?
     private let decoder = VideoDecoder()
 
+    private var space = PlaySpace.trackingSpace
+
+    /// Coordinate space and boundary used when communicating with the host (either the
+    /// active room or raw tracking space). Outgoing tracker poses are converted into this
+    /// space before transmission, and incoming rendered eye poses are converted back so
+    /// trackers and renderers remain in tracking space. Thread-safe.
+    public var playSpace: PlaySpace {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return space
+        }
+        set {
+            lock.lock()
+            let boundaryChanged = space.boundary != newValue.boundary
+            space = newValue
+            let session = current
+            lock.unlock()
+            if boundaryChanged { session?.setBoundary(newValue.boundary) }
+        }
+    }
+
+    /// Called on the session thread when the host requests a recenter.
+    public var onRecenterRequested: (() -> Void)?
+
     /// The running session, nil if not started. Thread-safe.
     public var session: (any StreamingSession)? {
         lock.lock()
@@ -217,9 +242,18 @@ public final class Connection: ObservableObject {
                     self.stop()
                     self.show("The stream ended: \(reason)")
                 }
-                session.headProvider = headProvider
+                session.headProvider = { [weak self] in
+                    guard let head = headProvider(), let self else { return nil }
+                    return self.playSpace.entering(head)
+                }
                 session.headsetPowerProvider = { [battery] in battery.state }
-                session.handsProvider = handsProvider
+                session.handsProvider = { [weak self] in
+                    let hands = handsProvider()
+                    guard let space = self?.playSpace else { return hands }
+                    return hands.map { $0.map { space.entering($0) } }
+                }
+                session.onRecenterRequested = { [weak self] in self?.onRecenterRequested?() }
+                session.setBoundary(playSpace.boundary)
                 session.gazeProvider = gazeProvider
                 session.faceProvider = faceProvider
                 session.onHaptic = onHaptic
@@ -229,7 +263,11 @@ public final class Connection: ObservableObject {
                 #endif
                 // Reset decoder state before starting a new stream.
                 decoder.reset()
-                session.onFrame = { [decoder] frame in decoder.decode(frame) }
+                session.onFrame = { [decoder, weak self] frame in
+                    guard let space = self?.playSpace else { return }
+                    decoder.decode(EncodedFrame(frameID: frame.frameID, picture: frame.picture, data: frame.data,
+                                                layout: space.leaving(frame.layout)))
+                }
                 session.start()
                 lock.lock()
                 let stillWanted = wanted

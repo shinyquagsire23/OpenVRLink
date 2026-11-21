@@ -90,7 +90,7 @@ client:  v  = v' ^ gamma                          applied before converting sRGB
 ```
 
 `gamma` comes from the SteamVR setting `driver_openvrlink/encodingGammaValue`
-(default 1.2), clamped to `[1, 3]` on both the host and client.
+(default 1.6), clamped to `[1, 3]` on both the host and client.
 
 ### Host (Linux)
 

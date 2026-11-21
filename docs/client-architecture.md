@@ -64,6 +64,7 @@ a separate mDNS/Bonjour discovery path alongside UDP subnet probing).
 | decoder | access units in, decoded frames out | VideoToolbox *or* a platform decoder | `VRLinkVideoToolbox` |
 | audio | PCM out, microphone in | CoreAudio *or* a platform API | `VRLinkAppleAudio` |
 | session glue | host discovery, pairing, starting and stopping a session with its decoder and audio, live settings updates | platform-specific backends | `VRLinkAppleSession` |
+| rooms | room selection for streaming sessions and the Room Setup immersive space | ARKit + RealityKit | `VRLinkVisionRooms` |
 | experiments | experimental features isolated so core targets do not depend on them | platform frameworks as needed | `VRLinkVisionExperiments`, `VRLinkAppleFace` |
 | app shells | wiring, window or immersive space, settings UI | the platform's app framework | `OpenVRLink` (macOS viewer), `client/visionOS` |
 
@@ -233,6 +234,167 @@ shows the waiting backdrop rather than a stale frame from the prior session.
 Two lifecycle cases remain unimplemented: keeping a stream alive across brief
 interruptions within the host's 30 s grace window, and displaying connection
 status inside the immersive space while resuming.
+
+## Rooms
+
+A room defines a saved play area with a center point, forward direction, floor
+height, and floor boundary polygon. On visionOS, users create and edit rooms in
+the Room Setup immersive space, and room definitions are persisted to
+`rooms.json` in the data directory.
+
+| component | file |
+|---|---|
+| Room model, `PlaySpace` transforms, and SteamVR chaperone JSON | `VRLinkCore/Rooms.swift` |
+| Floor polygon math (stroke loops, expansion, self-intersection cleanup, inscribed play-area rectangle) | `VRLinkCore/FloorShape.swift` |
+| Applying `PlaySpace` to outgoing poses and incoming frames | `VRLinkAppleSession/Connection.swift` (`playSpace`) |
+| ARKit world anchors and floor plane detection | `VRLinkVisionTracking/RoomAnchors.swift` |
+| Active room selection and recentering during a session | `VRLinkVisionRooms/RoomTracker.swift` |
+| Room Setup immersive space and controls | `VRLinkVisionRooms/RoomSetupSpace.swift` |
+
+### World anchors
+
+Each room is stored relative to a platform world anchor (an ARKit `WorldAnchor`
+on visionOS), and the room uses the anchor's UUID as its identifier. Because
+world anchors stay fixed in physical space across tracking-origin resets, app
+relaunches, and headset reboots, saved rooms stay aligned with the physical
+room. Only the anchor's position and horizontal yaw are used so the room's axes
+remain level. Because ARKit only runs world tracking inside an immersive space,
+anchors can only be added, removed, or located while an immersive space is open.
+Whenever ARKit reports an anchor that does not match any saved room in
+`rooms.json`, `RoomAnchors` deletes it; this also cleans up anchors left behind
+when the user presses "Delete All Rooms" from the 2D settings window.
+
+### Play-space transforms
+
+During streaming, `Connection` transforms every outgoing pose (head,
+controllers, hand joints, and pinch rays) into the active room's coordinate
+space, where `y = 0` is the room's floor. When decoded frames arrive from the
+host, `Connection` transforms their rendered eye poses back into tracking space.
+Handling both conversions in `Connection` keeps trackers, renderers, and stereo
+depth estimation in raw tracking space, so neither streaming protocol
+implementation needs room-specific logic.
+
+### Room selection and boundaries
+
+`RoomTracker` picks a room once per session after the streaming immersive space
+opens and ARKit reports a valid head pose (the network connection starts before
+the space opens, while tracking is still inactive). A room matches if the user
+is standing inside its boundary or within 2.5 m of its center; if multiple rooms
+match, the one with the closest center is selected. Rooms whose anchors ARKit
+has not located are ignored, though `RoomTracker` waits up to 4 s for ARKit to
+report on all saved rooms before deciding. If no room matches, `Connection`
+falls back to the raw tracking origin with no boundary. Because poses are sent
+in tracking space until room selection finishes, the view can shift once during
+the first few moments of a session.
+
+For Steam hosts, the room boundary is sent in the `VTE_CLIENT_CHAPERONE` value
+(`docs/svl-values/vte-id-table.md`), with one chaperone wall per polygon edge
+and a fresh `universeID` on every update so SteamVR reloads it mid-session.
+WiVRn has no boundary message, so WiVRn hosts receive room-relative poses
+without a boundary.
+
+### Recentering
+
+Recentering can be triggered either by the Steam host sending VTE event 0x16
+(SteamVR's local zero-pose reset, such as `vrcmd --recenter`, is handled
+entirely on the host) or by the user holding the Digital Crown on visionOS,
+which resets the system tracking origin and fires `onWorldRecenter`. In either
+case, `RoomTracker` moves the play space's origin beneath the user's head and
+rotates it to match their current heading for the remainder of the session. The
+physical boundary does not move: its corners are recomputed in the recentered
+play space and re-sent to the host, so the play-space origin may no longer sit
+at the center of the boundary. The saved room in `rooms.json` is left untouched
+for future sessions.
+
+After a Digital Crown recenter, `RoomTracker` waits until the room's anchor has
+been re-measured against the new tracking origin before updating the play space.
+When playing without a room, a Digital Crown recenter requires no extra work
+because visionOS shifts the tracking origin directly, whereas a host recenter
+places a temporary play-space frame beneath the user in tracking space. Inside
+Room Setup, holding the Digital Crown has no effect on room positions because
+rooms are attached to world anchors rather than the tracking origin.
+
+### Room Setup
+
+Room Setup opens an immersive space paired with a compact floating toolbar
+(`Basic/Advanced`, `Add Room`, `Remove Room` when standing in a room, and
+`Done`). Each room renders a center post two-thirds of the headset's height, a
+forward-pointing flag at the top of the post, a floor grid of three concentric
+rings spaced 1 m apart with six radial spokes, and its boundary polygon. Users
+interact using either hand pinches (gaze-targeted from a distance or direct
+touch) or VR controllers (aimed with the trigger or held directly against an
+object):
+
+- Dragging the post or flag moves the room center or rotates its forward
+  direction. When grabbed from beyond 35 cm, movement scales proportionally with
+  distance up to 8x so you can adjust a room from across the space.
+- Holding a hand or controller below the active room's floor for 0.15 s pushes
+  the floor down to that height. Pressing "Reset Floor Height" next to the post
+  raises the floor halfway to the headset so you can push it back down. New
+  rooms initialize their floor height from ARKit horizontal plane detection
+  beneath the headset.
+- In Basic mode, painting a stroke on the floor creates a boundary once the
+  stroke closes a loop (crossing itself or coming within one brush width of
+  itself while enclosing at least 0.2 m²). Once a boundary exists, painting a
+  stroke that exits and re-enters the boundary expands the polygon to include
+  the newly enclosed area; stroke endpoints within 10 cm outside the boundary
+  snap across it automatically. Resulting polygons are simplified with a 2 cm
+  tolerance and trimmed of self-intersections.
+- In Advanced mode, pinching the floor places polygon corners one by one until
+  you select the first corner again to close the loop. Existing corners can be
+  dragged at any time, and holding a pinch on an edge for 0.3 s inserts a new
+  corner. Basic and Advanced modes edit the same underlying polygon.
+
+Controllers aim along their aim pose. For hand pinches, visionOS only provides
+an eye-gaze ray at the start of an indirect pinch, so floor strokes begin where
+you are looking and then move horizontally at 4x your hand displacement. Hand
+rotation is ignored because steering with wrist angle or fingertip direction
+proved too jittery.
+
+The active room (the room you are standing in, or otherwise the closest room) is
+highlighted with a yellow flag and green boundary, while inactive rooms are
+drawn in gray.
+
+### ARKit anchor coordinate drift
+
+In headset testing (2026-11-20), ARKit's reported `WorldAnchor` transforms did
+not stay aligned with the tracking origin used for `queryDeviceAnchor` head
+poses: rooms shifted whenever an immersive space opened or the Digital Crown
+recentered, and newly created rooms sometimes appeared below the floor behind
+the user until a crown recenter. To compensate, `RoomAnchors` places a temporary
+marker `WorldAnchor` at the current head position, where its true tracking-space
+transform is known. When polling `allAnchors`, `RoomAnchors` computes the
+correction transform from the marker's reported pose to its true pose and
+applies that correction to every room anchor in the same snapshot.
+
+`RoomAnchors` places a fresh marker whenever the tracking origin may have
+changed (when tracking starts in an immersive space, when the head position
+jumps by more than 0.5 m between samples, or on a recenter). Until the new
+marker is reported back, rooms are hidden briefly in Room Setup and active
+streaming sessions hold their previous play space. Because some origin shifts
+happen without an obvious jump (for example, the floor height was offset on the
+first stream after launch until a crown recenter), `RoomAnchors` also refreshes
+the marker every 5 s while keeping the previous correction active until the new
+marker resolves. If the origin moves while a marker is still being added, that
+marker is discarded. Significant corrections are logged
+(`rooms: anchor transforms offset from tracking origin by ...`).
+
+All ARKit calls in `RoomAnchors` (anchor queries, marker placement, and anchor
+deletion) run in independent tasks with a 3 s timeout so a hung ARKit call
+cannot stall tracking. During headset testing (2026-11-20), a room disappeared
+from both the stream and Room Setup after a mid-stream crown recenter until the
+app was restarted, even though it remained in `rooms.json`—consistent with an
+ARKit call hanging when operations ran sequentially. Diagnostic logs report
+anchor state transitions
+(`rooms: room <id> anchor is tracked / reported but not tracked / not reported`),
+stalled marker measurements (`rooms: waiting N s for anchor marker ...`), and
+timed-out ARKit calls.
+
+Headset testing on 2026-11-20 verified Room Setup, hand-drawn boundaries,
+automatic room selection, and room-relative streaming with marker correction.
+Timeout recovery and host-initiated recentering (0x16, not yet seen on the wire)
+have not been tested on device yet, and SteamVR currently renders the boundary
+only while its Chaperone settings page is open.
 
 ## Networking quirks and minutiae
 

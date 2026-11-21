@@ -18,7 +18,8 @@ public final class HeadTracking {
     public init() {}
 
     private let session = ARKitSession()
-    private let worldTracking = WorldTrackingProvider()
+    /// Shared with `RoomAnchors` so room world anchors use the same ARKit provider.
+    let worldTracking = WorldTrackingProvider()
 
     private let lock = NSLock()
     private var previous: (pose: Pose, time: TimeInterval)?

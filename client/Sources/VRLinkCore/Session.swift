@@ -211,6 +211,34 @@ public final class StreamSession: StreamingSession {
     /// Which hands the host has been given a controller identity for.
     private var controllersPublished: Set<Side> = []
 
+    /// Called on the session thread when SteamVR requests a recenter.
+    public var onRecenterRequested: (() -> Void)?
+
+    /// Pending boundary queued for publication on the session thread, which owns the value transport.
+    private var boundaryToSend: [Point2]?
+    private var universe: UInt32 = 0
+
+    /// Updates the room boundary sent to SteamVR, specified as floor corners in play-space coordinates.
+    public func setBoundary(_ boundary: [Point2]) {
+        lock.lock()
+        boundaryToSend = boundary
+        lock.unlock()
+    }
+
+    /// Publishes a pending boundary update with a fresh `universeID`. Matching `vrlink`,
+    /// we use a new Unix-timestamp-based universe ID so SteamVR reloads the boundary mid-session.
+    private func publishBoundary() {
+        lock.lock()
+        let boundary = boundaryToSend
+        boundaryToSend = nil
+        lock.unlock()
+        guard let boundary else { return }
+        universe = max(universe &+ 1, UInt32(truncatingIfNeeded: Int(Date().timeIntervalSince1970)) & 0x7FFF_FFFF)
+        let space = PlaySpace(origin: PlaySpace.trackingSpace.origin, boundary: boundary)
+        values.publish(DeviceProfile.ValueID.chaperone, Bytes(space.chaperone(universe: universe).utf8), force: true)
+        onLog?(boundary.isEmpty ? "sent empty boundary to host" : "sent \(boundary.count)-corner boundary to host")
+    }
+
     /// The viewer's head, in world space. Safe to call from any thread.
     public func setHead(_ pose: TrackedPose) {
         lock.lock()
@@ -487,6 +515,9 @@ public final class StreamSession: StreamingSession {
                 publishFrameTime(rate.hz, again: false)
             case DeviceProfile.ValueID.propRefresh:
                 values.republishAll()
+            case DeviceProfile.ValueID.recenter:
+                onLog?("host requested recenter")
+                onRecenterRequested?()
             case DeviceProfile.ValueID.sceneApplicationRunning:
                 let running = data.contains { $0 != 0 }
                 lock.lock()
@@ -657,6 +688,7 @@ public final class StreamSession: StreamingSession {
                     while target &- now() <= 0 { target &+= step }
                     frameDisplayTime = target
                 }
+                publishBoundary()
                 let head = headProvider?() ?? lastHead
                 // Only send tracked hands once the host reports a protocol version that supports them.
                 let resolved = handResolver.resolve(handsProvider?() ?? [], head: head.pose, seconds: Double(now()) / 1_000_000,

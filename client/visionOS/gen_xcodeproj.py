@@ -149,6 +149,8 @@ def main():
             "OpenVRLink sends the position of your controllers to SteamVR.",
         "INFOPLIST_KEY_NSHandsTrackingUsageDescription":
             "OpenVRLink sends the position of your hands to SteamVR.",
+        "INFOPLIST_KEY_NSWorldSensingUsageDescription":
+            "OpenVRLink finds your floor when you add a room in Room Setup.",
         "INFOPLIST_KEY_GCSupportsControllerUserInteraction": "YES",
     }
     if bundle_id == OWN_BUNDLE_ID:

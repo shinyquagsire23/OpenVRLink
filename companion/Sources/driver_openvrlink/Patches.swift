@@ -11,6 +11,8 @@ enum Patches {
     struct Attached {
         var handshake = false
         var gamma = false
+        /// Whether the floor-perimeter NOP patch (`Scan.keepFloorPerimeter`) was applied.
+        var floorPerimeter = false
     }
 
     /// Places written over so far, with what each held, for undoing.
@@ -117,6 +119,13 @@ enum Patches {
             }
         }
         if !attached.gamma { Server.say("the encode hooks were not applied; handshake only") }
+        // Windows only for now. Apply immediately because `SVLHMDDriver::Activate` runs as soon as a headset connects.
+        if file == nil {
+            if let place = Scan.resolve(edit: Scan.keepFloorPerimeter, in: module.code) {
+                attached.floorPerimeter = write(Scan.keepFloorPerimeter.replacement, at: UInt(place))
+            }
+            if !attached.floorPerimeter { Server.say("floor-perimeter: not found in this VR Link build; SteamVR will not draw the floor boundary") }
+        }
         return attached
     }
 }

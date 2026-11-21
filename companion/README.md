@@ -60,8 +60,11 @@ openvrlink-companion update [--check]        # update openvrlink-companion to th
 `install` accepts `--steamvr DIR` if SteamVR is not detected automatically,
 `--models DIR` to copy Sense models from a specific directory, `--driver FILE`
 to install an external `driver_openvrlink` binary instead of the bundled one,
-and `--own-tab` to place the settings controls in a dedicated OpenVRLink tab
-without modifying `driver_vrlink`'s schema file.
+and `--vrlink-tab` to place the settings controls in SteamVR's VR Link tab
+(by editing `driver_vrlink`'s schema file) instead of a dedicated OpenVRLink
+tab. `--vrlink-tab` only works on older SteamVR builds that render the VR Link
+tab from its schema. Starting around SteamVR 2.19.4, SteamVR uses a built-in
+UI page for VR Link that ignores custom schema entries.
 
 On Linux, `openvrlink-companion` looks for `driver_openvrlink.so` next to the
 executable (matching the release archive layout, e.g. in `~/.local/bin`) or at
@@ -72,9 +75,10 @@ executable (matching the release archive layout, e.g. in `~/.local/bin`) or at
 
 Both drivers are installed under `%LOCALAPPDATA%\OpenVRLink` on Windows or
 `~/.local/share/openvrlink` on Linux, and registered in `openvrpaths.vrpath`
-(the same file `vrpathreg adddriver` edits). The only file modified inside the
-SteamVR directory is `driver_vrlink`'s `settingsschema.vrsettings`, and passing
-`--own-tab` avoids touching that file as well.
+(the same file `vrpathreg adddriver` edits). Nothing inside the SteamVR
+directory is modified unless you pass `--vrlink-tab`, which edits
+`driver_vrlink`'s `settingsschema.vrsettings`. Running `install` without
+`--vrlink-tab` removes any entries added to that file by an earlier install.
 
 `openvrlink-companion` checks known Steam installation locations directly:
 
@@ -151,6 +155,16 @@ Protocol details for the extensions are documented in
 - **Handshake gating.** Patches remain inactive until a connected client sends
   an advancing `oxClient` heartbeat, so other headsets using the same PC receive
   an unmodified VR Link stream.
+- **Floor perimeter patch.** On Windows, `driver_openvrlink` replaces the call
+  at the end of `SVLHMDDriver::Activate` that forces SteamVR to ignore
+  `collisionBounds/CollisionBoundsGroundPerimeterOn` with a 6-byte NOP
+  (`Scan.keepFloorPerimeter`). Because `Activate` runs as soon as a headset
+  connects—before the extension handshake—this patch applies to all VR Link
+  headsets. The ground perimeter setting defaults to off, so behavior only
+  changes when you enable it in SteamVR, and the original bytes are restored in
+  `Cleanup`. SteamVR still hides vertical chaperone walls for VR Link headsets
+  inside `vrcompositor` (see [docs/svl-values/vte-id-table.md](../docs/svl-values/vte-id-table.md)).
+  The equivalent patch has not been located in the Linux driver yet.
 - **No background threads.** Periodic checks run inside `vrserver`'s `RunFrame`
   callback.
 - **Module pinning.** Steam's watchdog loads every registered driver into

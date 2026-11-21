@@ -29,12 +29,19 @@ final class WindowDisplay: NSObject, MTKViewDelegate {
 
     private let settings: Settings
 
+    /// Optional directory where rendered frames are saved as PNGs every 2 seconds for debugging.
+    var picturesFolder: URL?
+    private var lastPicture = Date.distantPast
+    private var picturesSaved = 0
+
     /// Creates a window renderer using `settings` to configure chroma-key passthrough.
     init?(view: MTKView, profile: DeviceProfile, settings: Settings) {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else { return nil }
         view.device = device
         view.colorPixelFormat = .bgra8Unorm
         view.clearColor = MTLClearColor(red: 0.02, green: 0.02, blue: 0.03, alpha: 1)
+        // Allow reading back rendered textures when saving screenshots (`picturesFolder`).
+        view.framebufferOnly = false
         guard let renderer = QuadRenderer(device: device, colorFormat: view.colorPixelFormat) else { return nil }
         self.settings = settings
         self.queue = queue
@@ -79,7 +86,29 @@ final class WindowDisplay: NSObject, MTKViewDelegate {
                           of: frame, from: window, with: encoder, commands: commands)
         }
         encoder.endEncoding()
+        if let picturesFolder, picked != nil, Date().timeIntervalSince(lastPicture) >= 2 {
+            lastPicture = Date()
+            picturesSaved += 1
+            let file = picturesFolder.appendingPathComponent(String(format: "picture-%03d.png", picturesSaved))
+            let texture = drawable.texture
+            commands.addCompletedHandler { _ in WindowDisplay.save(texture, to: file) }
+        }
         commands.present(drawable)
         commands.commit()
+    }
+
+    /// Saves a BGRA texture to disk as a PNG.
+    private static func save(_ texture: MTLTexture, to file: URL) {
+        let width = texture.width, height = texture.height
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        texture.getBytes(&pixels, bytesPerRow: width * 4, from: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0)
+        let info = CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.noneSkipFirst.rawValue
+        guard let provider = CGDataProvider(data: Data(pixels) as CFData),
+              let image = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
+                                  space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: info),
+                                  provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent),
+              let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])
+        else { return }
+        try? png.write(to: file)
     }
 }

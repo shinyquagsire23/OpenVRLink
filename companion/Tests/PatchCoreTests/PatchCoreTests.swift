@@ -69,6 +69,15 @@ final class ScanTests: XCTestCase {
                     XCTAssertNotNil(Scan.peImportSlot(view, mapped: false, library: "d3dcompiler_47.DLL", function: "D3DReadFileToBlob"))
                     XCTAssertNil(Scan.peImportSlot(view, mapped: false, library: "D3DCOMPILER_47.dll", function: "D3DCompile"))
                     XCTAssertNil(Scan.peImportSlot(view, mapped: false, library: "nothing.dll", function: "D3DReadFileToBlob"))
+                    let regions = Scan.peRegions(view, mapped: false)
+                    let place = Scan.resolve(edit: Scan.keepFloorPerimeter, in: regions)
+                    XCTAssertNotNil(place)
+                    // Verify the patch targets the 6-byte call through vtable slot 69.
+                    if let place, let region = regions.first(where: { $0.address <= place && place < $0.address + UInt64($0.bytes.count) }) {
+                        let at = Int(place - region.address)
+                        XCTAssertEqual(Array(region.bytes[at..<at + 6]), [0xFF, 0x92, 0x28, 0x02, 0x00, 0x00])
+                        XCTAssertEqual(Scan.keepFloorPerimeter.replacement.count, 6)
+                    }
                 }
             }
             checked += 1

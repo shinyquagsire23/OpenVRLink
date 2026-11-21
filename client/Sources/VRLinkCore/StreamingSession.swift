@@ -31,6 +31,9 @@ public protocol StreamingSession: AnyObject {
     /// rate in Hz. The platform switches its display rate if supported, while
     /// always reporting the actual display rate back to the host.
     var onRefreshRateRequested: ((Float) -> Void)? { get set }
+    /// Called on the session thread when the host requests a recenter so the play space
+    /// aligns with the user's current position and heading.
+    var onRecenterRequested: (() -> Void)? { get set }
     /// Sink that accepts captured microphone audio for uplink to the host.
     var microphoneSink: any MicrophoneSink { get }
     /// Called on the session's thread with a reason string if the stream
@@ -56,6 +59,14 @@ public protocol StreamingSession: AnyObject {
     func frameShown(_ frameID: UInt16, at uptimeNanoseconds: UInt64)
     /// Reports the next expected display vsync timestamp and refresh interval in seconds.
     func displayRefreshes(at uptimeNanoseconds: UInt64, period: Double)
+    /// Sends a room boundary to the host as floor corners in `PlaySpace` coordinates,
+    /// or clears the boundary when empty. Safe to call from any thread before or after `start`.
+    func setBoundary(_ boundary: [Point2])
+}
+
+extension StreamingSession {
+    /// Default no-op for protocols that do not support sending a room boundary.
+    public func setBoundary(_ boundary: [Point2]) {}
 }
 
 /// Tracks the display's refresh rate across protocols. Display APIs only report next-vsync

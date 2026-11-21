@@ -77,7 +77,8 @@ private enum Provider {
             attached = Patches.attach()
             if let attached {
                 Server.say(Message("driver_vrlink found; handshake ").adding(attached.handshake ? "applied" : "not applied")
-                    .adding(attached.gamma ? ", encode hooks applied" : ", encode hooks not applied"))
+                    .adding(attached.gamma ? ", encode hooks applied" : ", encode hooks not applied")
+                    .adding(attached.floorPerimeter ? ", floor perimeter patch applied" : ""))
             }
         }
         Platform.lock()

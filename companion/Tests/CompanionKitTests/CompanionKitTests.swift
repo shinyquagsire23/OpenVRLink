@@ -171,7 +171,8 @@ final class InstallTests: XCTestCase {
     func testTheGammaControlsNeedThePatchToHaveApplied() {
         let entries = Install.menuEntries
         XCTAssertEqual(entries[0]["requires"]?["/settings/driver_openvrlink/gammaAvailable"], .bool(true))
-        XCTAssertNotNil(entries[1]["requires"]?["/settings/driver_openvrlink/encodingGamma"])
+        XCTAssertEqual(entries[1]["requires"]?["/settings/driver_openvrlink/gammaAvailable"], .bool(true))
+        XCTAssertNil(entries[1]["requires"]?["/settings/driver_openvrlink/encodingGamma"])
     }
 
     func testTheDriverFolderIsLaidOutForSteamVR() throws {
@@ -186,7 +187,7 @@ final class InstallTests: XCTestCase {
         XCTAssertEqual(manifest["name"]?.string, "openvrlink")
         let defaults = try JSON(parsing: String(contentsOf: driver.appendingPathComponent("resources/settings/default.vrsettings"), encoding: .utf8))
         XCTAssertEqual(defaults[Install.section]?[Install.gammaAvailableKey], .bool(false))
-        XCTAssertEqual(defaults[Install.section]?[Install.gammaValueKey], .number("1.2"))
+        XCTAssertEqual(defaults[Install.section]?[Install.gammaValueKey], .number("1.6"))
         XCTAssertTrue(Steam.isFile(driver.appendingPathComponent("resources/settings/settingsschema.vrsettings")))
         try Install.writeDriver(to: driver, library: Data("library".utf8), windows: true, ownTab: false)
         XCTAssertTrue(Steam.isFile(driver.appendingPathComponent("bin/win64/driver_openvrlink.dll")))
@@ -278,8 +279,18 @@ final class ComponentTests: XCTestCase {
         XCTAssertEqual(Component.allCases.map { setup.state(of: $0).kind }, [.notInstalled, .notInstalled])
         XCTAssertEqual(setup.state(of: .driver).action, "Install")
 
+        // By default, settings go in a dedicated OpenVRLink tab without modifying VR Link's schema.
+        _ = try setup.install(.driver)
+        XCTAssertEqual(again(setup).state(of: .driver).kind, .installed)
+        XCTAssertFalse(Install.vrlinkMenuPresent(inVRLink: try XCTUnwrap(setup.found.vrlink)))
+        let tab = try JSON(parsing: String(contentsOf: Install.ownTabSchema(inDriver: setup.folder(of: .driver)), encoding: .utf8))
+        XCTAssertEqual(tab.array?.first?["show_without_hmd"], .bool(true))
+
+        // Test the remaining cases with settings placed in VR Link's tab.
+        setup.ownTab = false
         _ = try setup.install(.driver)
         setup = again(setup)
+        setup.ownTab = false
         XCTAssertEqual(setup.state(of: .driver).kind, .installed)
         XCTAssertNil(setup.state(of: .driver).action)
         XCTAssertEqual(setup.state(of: .models).kind, .notInstalled)

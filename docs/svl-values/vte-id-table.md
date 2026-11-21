@@ -56,7 +56,7 @@ and the capture shows the client never sends them.
 | 0x06 | unknown | 32 | never read by the client | — | first sent once video has started (1.051 s), in bookend trailers. In `vr3` a single version: a 64-bit little-endian value with six non-zero bytes at +0, zeros in the other 24 bytes. In `vr1` later versions also filled +16 with a nearly equal value (pattern `xx xx xx xx xx xx 00 00 | 00×8 | xx xx xx xx xx xx 00 00 | 00×8`). **inferred** two 64-bit timestamps: read as 100 ns ticks the `vr3` value is about 55 days, a plausible host uptime — captured |
 | 0x13 | *(dashboard event)* | 52 | byte 0 == 2 → `[SVLClientXR] Remote dashboard requested` (opens the client's dashboard UI) | static: lambda +0xfbb9c | not seen |
 | 0x14 | *(debug: dump byte log)* | any | any update calls `ByteLogger::DumpLogToDisk()` | static: lambda +0x16c558 | not seen |
-| 0x16 | *(chaperone request)* | any | any update makes the client re-locate its stage space and, if valid, re-publish VTE 0x05 | static: lambda +0xfbce0 | not seen |
+| 0x16 | *(recenter / chaperone request)* | any | any update makes the client re-locate its stage space and, if valid, re-publish VTE 0x05. Sent by `driver_vrlink.dll` from the `svl/driver` mailbox's `handle_recenter` handler (`0x180a0c6f0`, log scope `SVLServer mailbox handle_recenter`) | static: lambda +0xfbce0; host side static | not seen |
 | 0x17 | `VTE_PROP_COLOR_CONTROL` | 104 | `u32 version` first; `version >= 1` → copy the 104 bytes into the renderer's color parameters; `version >= 2` → also update swapchain sampler state. Field layout beyond the version: docs/svl-video/ (shader uniforms) | static: lambda +0x10c474 | in bookend trailers: 104 bytes = `03 00 00 00` + 100 zero bytes (version 3, everything else zero); client logged `VTE_PROP_COLOR_CONTROL updated` — captured |
 | 0x19 | *(host audio FEC capabilities)* | 4 | `u32` bit 0 / bit 1, docs/svl-audio/ | static | `03 00 00 00` — captured |
 | 0x1a | *(unguided retransmit enable)* | 4 | `i32`; 0 disables the client's unguided video re-request sweep (`SVLFEC::Tick` +0x160a18), default 1 | static (docs/svl-video/) | `01 00 00 00`, first datagram — captured |
@@ -182,6 +182,76 @@ two corners at height 2.43 m (**inferred** from the geometry; SteamVR's
 `chaperone_info.vrchap` uses the same layout). `play_area` is `[width, depth]`
 in meters. Key strings come from `ChaperoneXR::Generate` (+0x12ec58,
 **static**).
+
+`ChaperoneXR::Generate` (**static**) builds four walls from OpenXR's play-area
+rectangle using corners `(-w/2, -d/2)`, `(w/2, -d/2)`, `(w/2, d/2)`, and
+`(-w/2, d/2)` on the `(x, z)` plane, transformed by the stage space's pose.
+Each wall `i` is `[corner i at y=0, corner i at y=2.43, corner i+1 at y=2.43,
+corner i+1 at y=0]`. Whenever the rectangle changes from the previous one,
+`vrlink` logs `Play area changed since last chaperone` and sets `universeID` to
+the current Unix timestamp so each update arrives as a new universe.
+
+On the host (**static**, `driver_vrlink.dll` `0x1809f20f0`), `driver_vrlink`
+parses only `universes[0].universeID` from the JSON and passes the entire
+string to SteamVR as the HMD's `Prop_DriverProvidedChaperoneJson_String`
+(0x82f) along with `Prop_CurrentUniverseId_Uint64` (0x7d4). The host does not
+limit the number of walls.
+
+OpenVRLink sends one wall per edge of the room's boundary in the same corner
+order, setting `play_area` to the largest origin-centered axis-aligned
+rectangle that fits inside (`PlaySpace.chaperone`). In a **live** test
+(2026-11-20, macOS viewer with `--boundary` against SteamVR 2.19.4 on Windows),
+publishing a six-wall boundary mid-session with a new `universeID`—followed by
+a four-wall boundary eight seconds later with another `universeID`—updated
+SteamVR immediately both times. `vrserver.txt` logged `UpdateChaperone got new
+universe (len 792)`, `Configuring VRLINK Chaperone Prop container`, `Found
+universe 1795199424 in chaperone file`, and broadcast
+`ChaperoneUniverseHasChanged` to other drivers on each update.
+
+By default, SteamVR hides this boundary during normal VR gameplay; in headset
+testing (2026-11-20), it only appeared while SteamVR's Chaperone settings menu
+was open. Static analysis of `vrcompositor.exe` (SteamVR 2.19.4, sha256
+`1f23a1da...`, **static**) shows two hardcoded overrides with no settings keys
+to disable them:
+
+- At startup, `vrcompositor` checks whether the HMD imports bounds from its
+  driver (`collisionBounds/enableDriverBoundsImport`, true by default, with
+  Prop 0x800 or 0x82f non-empty) and sets `[this+0x1559] = 1` (`0x1400f5670`:
+  `test al, al; je; mov byte [rdi+0x1559], 1`). While that flag is set, every
+  frame forces the bounds style to 4 regardless of `CollisionBoundsStyle`
+  (`0x1400f11e8`), which disables vertical chaperone walls.
+- During HMD activation (`0x1809e9940`), `driver_vrlink.dll` sets a flag in
+  `vrserver` that makes `vrcompositor` treat `CollisionBoundsGroundPerimeterOn`
+  as false without reading the setting (`0x1400fdaeb`: `call; test al, al; je
+  <read setting>; xor eax, eax`).
+
+That `vrserver` call is the final instruction in `SVLHMDDriver::Activate`,
+invoking vtable slot 69 (`+0x228`) of `IVRServerInternal_XXX`. On Windows,
+`driver_openvrlink` patches this call to a 6-byte NOP
+(`Scan.keepFloorPerimeter`) so `CollisionBoundsGroundPerimeterOn` is respected
+(not yet tested live).
+
+`CollisionBoundsCenterMarkerOn` and `CollisionBoundsPlaySpaceOn` are not
+overridden. Patching the `je` instructions in `vrcompositor.exe` at
+`0x1400f5672` (file offset `0xF4A72`) and `0x1400fdaf2` (`0xFCEF2`) from `74`
+to `EB` would leave both walls and floor perimeter controlled by user settings
+(not tested).
+
+### Recentering (0x16)
+
+SteamVR has two separate recenter paths:
+
+- SteamVR's standard zero-pose reset (such as `vrcmd --recenter`) is handled
+  entirely on the host. `vrserver.txt` logs `Update ZeroPose for the chaperone
+  universe <id>` and sends nothing to the client (**live**, 2026-11-20: no 0x16
+  packet arrived).
+- Sending `handle_recenter` to the `svl/driver` mailbox causes `driver_vrlink`
+  to send VTE event 0x16 to the client (**static**). The sender of that mailbox
+  message has not been traced (**inferred**: the recenter button in the Steam
+  Link dashboard), so 0x16 has not been observed on the wire yet. `vrlink`
+  responds by republishing its chaperone JSON, whereas OpenVRLink recenters the
+  active play space to the user's current position and heading (see "Rooms" in
+  [docs/client-architecture.md](../client-architecture.md)).
 
 ## Open questions
 

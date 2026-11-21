@@ -27,8 +27,8 @@ let usage = """
             --steamvr DIR    Path to SteamVR if not detected automatically
             --models DIR     Copy Sense controller models from DIR
             --driver FILE    Path to driver_openvrlink binary (defaults to bundled copy)
-            --own-tab        Place settings in a separate OpenVRLink tab instead of
-                             modifying the VR Link settings tab
+            --vrlink-tab     Place settings in SteamVR's VR Link tab instead of a
+                             separate OpenVRLink tab (SteamVR before 2.19 only)
 
       openvrlink-companion uninstall [models] [driver]
           Uninstall the specified components (defaults to both) and clean up settings.
@@ -64,6 +64,7 @@ struct Options {
             case "--snapshot": snapshot = URL(fileURLWithPath: try value())
             case "--version": version = try value()
             case "--own-tab": ownTab = true
+            case "--vrlink-tab": ownTab = false
             case "--check": checkOnly = true
             case _ where argument.hasPrefix("--"): throw Failure("unknown option \(argument)")
             default: rest.append(argument)
@@ -120,6 +121,8 @@ func check(_ file: URL) throws {
         if Scan.isPE(view) {
             let slot = Scan.peImportSlot(view, mapped: false, library: Scan.shaderReadImport.library, function: Scan.shaderReadImport.function)
             print("  \("shader-read import".padded(to: 22))\(slot == nil ? "not found" : "found")")
+            let perimeter = Scan.resolve(edit: Scan.keepFloorPerimeter, in: Scan.peRegions(view, mapped: false))
+            print("  \("\(Scan.keepFloorPerimeter.name)".padded(to: 22))\(perimeter == nil ? "not found" : "found")")
         }
     }
 }

@@ -149,6 +149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         else { fatalError("Metal is not available") }
         self.renderer = renderer
         renderer.refreshPeriod = 1 / Double(refreshHz)
+        renderer.picturesFolder = picturesFolder.map { URL(fileURLWithPath: $0, isDirectory: true) }
         view.delegate = renderer
 
         window = NSWindow(contentRect: view.frame, styleMask: [.titled, .closable, .resizable, .miniaturizable],
@@ -266,6 +267,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             session.onFrame = { [decoder] frame in decoder.decode(frame) }
             session.start()
+            if testBoundary {
+                // Send an L-shaped boundary around the origin, followed by a square boundary, to test initial boundary setup and live updates.
+                // The front wall is 0.4 m ahead of the starting position so it is close enough for SteamVR to display.
+                let ell = [Point2(-1.5, -0.4), Point2(1.5, -0.4), Point2(1.5, 0.2), Point2(0.5, 0.2), Point2(0.5, 1), Point2(-1.5, 1)]
+                let plain = [Point2(-1, -1), Point2(1, -1), Point2(1, 1), Point2(-1, 1)]
+                DispatchQueue.global().asyncAfter(deadline: .now() + 6) { session.setBoundary(ell) }
+                DispatchQueue.global().asyncAfter(deadline: .now() + 14) { session.setBoundary(plain) }
+            }
             DispatchQueue.main.async {
                 self.session = session
                 self.renderer.session = session
@@ -306,12 +315,16 @@ let quitSignals = [SIGTERM, SIGINT].map { number -> DispatchSourceSignal in
 //   --wivrn           Connect to a WiVRn host instead of Steam
 //   --sway            Continuously yaw the head left and right for testing
 //   --pin <digits>    WiVRn pairing PIN (prompts on stdin if omitted)
+//   --boundary        Send test room boundaries to the host after connecting
+//   --pictures <dir>  Save a PNG screenshot of the window every 2 seconds
 var hostAddress: String?
 var simulatedLoss = 0.0
 var useMicrophone = false
 var wivrn = false
 var sway = false
 var wivrnPin: String?
+var testBoundary = false
+var picturesFolder: String?
 var arguments = CommandLine.arguments.dropFirst()
 while let argument = arguments.popFirst() {
     if argument == "--loss", let percent = arguments.popFirst().flatMap(Double.init) {
@@ -322,12 +335,16 @@ while let argument = arguments.popFirst() {
         wivrn = true
     } else if argument == "--sway" {
         sway = true
+    } else if argument == "--boundary" {
+        testBoundary = true
+    } else if argument == "--pictures", let folder = arguments.popFirst() {
+        picturesFolder = folder
     } else if argument == "--pin", let digits = arguments.popFirst() {
         wivrnPin = digits
     } else if hostAddress == nil, !argument.hasPrefix("-") {
         hostAddress = argument
     } else {
-        print("usage: OpenVRLink [host address] [--mic] [--loss <percent>] [--wivrn] [--sway] [--pin <digits>]")
+        print("usage: OpenVRLink [host address] [--mic] [--loss <percent>] [--wivrn] [--sway] [--boundary] [--pictures <folder>] [--pin <digits>]")
         exit(2)
     }
 }

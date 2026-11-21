@@ -9,6 +9,7 @@ import VRLinkCore
 import VRLinkVisionExperiments
 import VRLinkVisionCompositor
 import VRLinkAppleSession
+import VRLinkVisionRooms
 import VRLinkVisionTracking
 
 /// visionOS app entry point, providing a compact host-picker window and
@@ -57,6 +58,13 @@ struct OpenVRLinkApp: App {
                          settings: store, measured: measured)
         }
     }
+    /// Tracks saved rooms for streaming sessions and Room Setup.
+    private let keptRooms = Kept<RoomTracker>()
+    private var rooms: RoomTracker {
+        keptRooms.value { RoomTracker(connection: connection, head: head) }
+    }
+    @StateObject private var roomSetup = RoomSetupControls()
+    @StateObject private var keptRoomSetup = Kept<RoomSetupSpace>()
     /// Tracks the last launched app version so we can show release notes after an update.
     @AppStorage("lastUsedAppVersion") private var lastUsedAppVersion = "never launched"
     @State private var showChanges = false
@@ -69,13 +77,14 @@ struct OpenVRLinkApp: App {
 
     var body: some Scene {
         let inputs = streamInputs
+        let rooms = self.rooms
         WindowGroup(id: "entry") {
             // visionOS renders the TabView bar as a floating ornament beside the window.
             TabView {
                 EntryView(connection: connection, homeButton: controllers.homeButton, store: store, inputs: inputs,
-                          persona: persona)
+                          persona: persona, rooms: rooms, roomSetup: roomSetup)
                     .tabItem { Label("Stream", systemImage: "play.tv") }
-                SettingsView(store: store)
+                SettingsView(store: store, connection: connection, rooms: rooms, roomSetup: roomSetup)
                     .tabItem { Label("Settings", systemImage: "gearshape") }
                 ExperimentsView(store: store, connection: connection, calibration: calibration,
                                 faceCalibration: faceCalibration, vergence: vergence, persona: persona)
@@ -106,6 +115,10 @@ struct OpenVRLinkApp: App {
             CompositorLayer(configuration: StreamLayerConfiguration()) { layerRenderer in
                 CompositorDisplay(layerRenderer, inputs: inputs)?.start()
             }
+            // Holding the Digital Crown recenters the active play space.
+            .onWorldRecenter { phase in
+                if phase == .ended { rooms.worldRecentered() }
+            }
         }
         // Use `.mixed` immersion so visionOS doesn't enforce the tight movement
         // boundary of `.full`, even though our video quad still fills the view.
@@ -122,11 +135,35 @@ struct OpenVRLinkApp: App {
                 RealityKitDisplay(inputs: inputs, persona: persona)
             }) {
                 RealityKitStreamView(display: display, persona: persona, settings: store.settings)
+                    .onWorldRecenter { phase in
+                        if phase == .ended { rooms.worldRecentered() }
+                    }
             }
         }
         .immersionStyle(selection: .constant(.mixed), in: .mixed)
         .upperLimbVisibility(store.settings.showHandsOverlaid ? .visible : .hidden)
         .persistentSystemOverlays(store.settings.hideSystemOverlays ? .hidden : .automatic)
+
+        // Immersive space for creating, positioning, and drawing boundaries for rooms.
+        ImmersiveSpace(id: RoomSetupControls.spaceID) {
+            if let space = keptRoomSetup.value(unless: \.stopped, make: {
+                RoomSetupSpace(rooms: rooms, head: head, controllers: controllers, hands: hands, controls: roomSetup)
+            }) {
+                RoomSetupView(space: space)
+            }
+        }
+        .immersionStyle(selection: .constant(.mixed), in: .mixed)
+        .upperLimbVisibility(.visible)
+
+        // Floating borderless toolbar for Room Setup controls.
+        WindowGroup(id: RoomSetupControls.windowID) {
+            RoomSetupControlsView(controls: roomSetup)
+        }
+        .windowStyle(.plain)
+        .windowResizability(.contentSize)
+        // Only opened from Room Setup; never restored or shown at app launch.
+        .restorationBehavior(.disabled)
+        .defaultLaunchBehavior(.suppressed)
 
         // Temporary compositor space opened briefly before the first connection
         // to query display FOV, resolution, and refresh rates (`MeasuredDisplay`).
@@ -268,6 +305,8 @@ struct EntryView: View {
     @ObservedObject var store: SettingsStore
     let inputs: StreamInputs
     let persona: PersonaTracking
+    let rooms: RoomTracker
+    let roomSetup: RoomSetupControls
     @Environment(\.dismissWindow) private var dismissWindow
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
     @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
@@ -287,6 +326,13 @@ struct EntryView: View {
             connection.hostKind = kind
             connection.waitingForPicture = true
             defer { connection.waitingForPicture = false }
+            // Close Room Setup first because visionOS allows only one open immersive space at a time.
+            if roomSetup.open {
+                await dismissImmersiveSpace()
+                try? await Task.sleep(for: .milliseconds(300))
+            }
+            // Reset room selection and any temporary recenter offset from the previous session.
+            rooms.sessionBegins()
             // Display metrics are only exposed through a CompositorLayer, so we
             // briefly open a measurement space once before the first connection.
             let measured = inputs.measured
@@ -467,6 +513,14 @@ struct EntryView: View {
 /// User preferences form; changes are persisted immediately.
 struct SettingsView: View {
     @ObservedObject var store: SettingsStore
+    @ObservedObject var connection: Connection
+    let rooms: RoomTracker
+    @ObservedObject var roomSetup: RoomSetupControls
+    @Environment(\.openImmersiveSpace) private var openImmersiveSpace
+    @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
+    @Environment(\.openWindow) private var openWindow
+    @State private var askingToDeleteRooms = false
+    @State private var roomSetupNote = ""
 
     /// Bridges the stored sRGB float array to a SwiftUI `Color` binding for `ColorPicker`.
     private var keyColor: Binding<Color> {
@@ -492,6 +546,32 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            Section {
+                if roomSetup.open {
+                    Button("Leave Room Setup") {
+                        Task { await dismissImmersiveSpace() }
+                    }
+                } else {
+                    Button("Room Setup") {
+                        Task {
+                            roomSetupNote = ""
+                            // Mark Room Setup open before opening its toolbar window, since the window dismisses itself when `open` is false.
+                            roomSetup.open = true
+                            if case .opened = await openImmersiveSpace(id: RoomSetupControls.spaceID) {
+                                openWindow(id: RoomSetupControls.windowID)
+                            } else {
+                                roomSetup.open = false
+                                roomSetupNote = "Could not open Room Setup"
+                            }
+                        }
+                    }
+                    .disabled(connection.immersed || connection.waitingForPicture)
+                    if !roomSetupNote.isEmpty { Text(roomSetupNote).foregroundStyle(.secondary) }
+                }
+            } header: {
+                Text("Rooms")
+            }
+
             Section("Audio") {
                 Toggle("Send my microphone", isOn: $store.settings.microphone)
             }
@@ -526,8 +606,21 @@ struct SettingsView: View {
             Section("Other") {
                 Toggle("Close this window when streaming starts", isOn: $store.settings.closeWindowOnEntry)
             }
+
+            Section {
+                Button("Delete All Rooms") { askingToDeleteRooms = true }
+                    .foregroundStyle(.red)
+                    .disabled(connection.immersed || connection.waitingForPicture)
+            } footer: {
+                Text("Removes every room and the world anchors that hold them in place.")
+            }
         }
         .contentMargins(.top, 30, for: .scrollContent)
+        .confirmationDialog("Delete all rooms?", isPresented: $askingToDeleteRooms, titleVisibility: .visible) {
+            Button("Delete All Rooms", role: .destructive) {
+                Task { await rooms.anchors.removeEverything() }
+            }
+        }
     }
 }
 

@@ -69,7 +69,9 @@ public struct Setup {
     public var besideDriver: [URL] = []
     /// Explicit directory to load Sense controller models from instead of auto-discovering them.
     public var modelsFolder: URL?
-    /// Whether to place settings in a separate OpenVRLink tab; `nil` preserves the current installation's choice.
+    /// Whether to place settings in a dedicated OpenVRLink tab (`true` or `nil`, the default)
+    /// or in SteamVR's VR Link tab (`false`). SteamVR 2.19.4+ uses a built-in settings page for
+    /// `driver_vrlink` that ignores custom schema entries, so only older builds display them there.
     public var ownTab: Bool?
 
     public init(places: Steam.Places, found: Steam.Found, windows: Bool, driverLibrary: Data? = nil) {
@@ -199,7 +201,7 @@ public struct Setup {
             throw Failure("\(Install.libraryPlace(windows: windows).name) was not found alongside openvrlink-companion (pass --driver FILE)")
         }
         let driver = folder(of: .driver)
-        let ownTab = self.ownTab ?? installedOwnTab
+        let ownTab = self.ownTab ?? true
         try Install.writeDriver(to: driver, library: driverLibrary, beside: besideDriver, windows: windows, ownTab: ownTab)
         try Steam.setExternalDriver(driver, present: true, in: places)
         var lines = ["VR Link extensions driver installed to \(Steam.nativePath(driver))"]
@@ -208,7 +210,7 @@ public struct Setup {
                 try Install.setVRLinkMenu(present: !ownTab, inVRLink: vrlink)
                 lines.append(ownTab ? "Options are in SteamVR's settings under OpenVRLink." : "Options added to SteamVR's VR Link settings tab.")
             } catch {
-                lines.append("Could not update the VR Link settings schema (\(error)); pass --own-tab to use a separate OpenVRLink settings tab.")
+                lines.append("Could not update the VR Link settings schema (\(error)); leaving the VR Link settings tab unchanged.")
             }
         }
         if let summary = patchSummary() { lines.append(summary) }

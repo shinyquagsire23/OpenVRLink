@@ -50,6 +50,8 @@ public struct DeviceProfile {
         static let focusEvent: UInt8 = 0x13, hostDefaults: UInt8 = 0x15, audioCapabilities: UInt8 = 0x18
         static let availableRates: UInt8 = 0x20, displayRateRequest: UInt8 = 0x21
         static let versionString: UInt8 = 0x22, propRefresh: UInt8 = 0x2B
+        /// Sent by the host when SteamVR requests a recenter (docs/svl-values/vte-id-table.md).
+        static let recenter: UInt8 = 0x16
         /// Sent by the host: non-zero while a scene application is running, and zero
         /// when idle in the SteamVR grid (docs/svl-values/vte-id-table.md; inferred).
         static let sceneApplicationRunning: UInt8 = 0x35
@@ -201,16 +203,9 @@ public struct DeviceProfile {
         return out
     }
 
+    /// Initial empty chaperone payload; `StreamSession.setBoundary` publishes updates once a room is active.
     private func chaperone(universe: UInt32) -> Bytes {
-        // Report an empty play area with four degenerate walls, matching vrlink when no boundary is configured.
-        let wall = "[[0,0,0],[0,2.43,0],[0,2.43,0],[0,0,0]]"
-        let pose = #"{"translation":[0,0,0],"yaw":0}"#
-        let json = #"{"jsonid":"chaperone_info","universes":[{"collision_bounds":["#
-            + [wall, wall, wall, wall].joined(separator: ",")
-            + #"],"play_area":[0,0],"seated":"# + pose + #","setup_standing2":"# + pose
-            + #","standing":"# + pose + #","time":"Thu Jan  1 00:00:00 1970","universeID":"#
-            + String(universe) + #"}],"version":5}"#
-        return Bytes(json.utf8)
+        Bytes(PlaySpace.trackingSpace.chaperone(universe: universe).utf8)
     }
 
     /// `VTE_CAPABILITIES` 32-byte feature bitfield. `vrlink` sets only bit 0 (meaning unknown).

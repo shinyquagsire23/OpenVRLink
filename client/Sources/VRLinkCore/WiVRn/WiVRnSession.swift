@@ -54,6 +54,8 @@ public final class WiVRnSession: StreamingSession {
     private var awaitingKeyframe = [false, false, false]
     public var onRefreshRateRequested: ((Float) -> Void)?
     public var onEnded: ((String) -> Void)?
+    /// Unused for WiVRn because WiVRn hosts do not send recenter requests to the client.
+    public var onRecenterRequested: (() -> Void)?
     /// Most recent fatal error text from the host, reported if the connection closes.
     private var hostComplaint: String?
     public let audio = PlaybackBuffer()

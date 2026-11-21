@@ -14,7 +14,8 @@ let package = Package(
     products: [
         .library(name: "VRLinkCore", targets: ["VRLinkCore"]),
         .library(name: "VRLinkApple", targets: ["VRLinkVideoToolbox", "VRLinkMetal", "VRLinkAppleAudio", "VRLinkAppleNetwork", "VRLinkAppleFace",
-                                                "VRLinkVisionTracking", "VRLinkAppleSession", "VRLinkVisionCompositor"]),
+                                                "VRLinkVisionTracking", "VRLinkAppleSession", "VRLinkVisionCompositor",
+                                                "VRLinkVisionRooms"]),
         // Separate library product since nothing else depends on it.
         .library(name: "VRLinkExperiments", targets: ["VRLinkVisionExperiments"]),
     ],
@@ -45,6 +46,8 @@ let package = Package(
         .target(name: "VRLinkAppleSession", dependencies: [
             "VRLinkCore", "VRLinkVideoToolbox", "VRLinkAppleAudio", "VRLinkAppleNetwork",
         ]),
+        // Room selection and the Room Setup immersive space for visionOS (empty on other platforms).
+        .target(name: "VRLinkVisionRooms", dependencies: ["VRLinkCore", "VRLinkVisionTracking", "VRLinkAppleSession"]),
         // CompositorServices renderer for visionOS (empty on other platforms).
         .target(name: "VRLinkVisionCompositor", dependencies: [
             "VRLinkCore", "VRLinkVideoToolbox", "VRLinkMetal", "VRLinkVisionTracking", "VRLinkAppleSession",
