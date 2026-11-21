@@ -28,7 +28,9 @@ let package = Package(
         .target(name: "PatchCore"),
         .testTarget(name: "PatchCoreTests", dependencies: ["PatchCore"]),
         // Steam discovery, Sense controller model setup, and driver installation.
-        .target(name: "CompanionKit", dependencies: ["PatchCore"]),
+        // version.json from the repository root, compiled in as text.
+        .target(name: "RepoVersion"),
+        .target(name: "CompanionKit", dependencies: ["PatchCore", "RepoVersion"]),
         .testTarget(name: "CompanionKitTests", dependencies: ["CompanionKit"]),
         // C target exposing Win32 GUI, WinHTTP, and resource APIs on Windows (empty on other platforms).
         .target(name: "WinAPI"),

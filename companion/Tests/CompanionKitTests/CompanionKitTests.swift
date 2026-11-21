@@ -410,7 +410,7 @@ final class ReleaseTests: XCTestCase {
         let json = try JSON(parsing: text)
         let version = try XCTUnwrap(json["version"]?.string), build = try XCTUnwrap(json["build"]?.number)
         XCTAssertEqual(Release.sourceVersion, "\(version)-\(build)",
-                       "version.json is \(version)-\(build); update Release.sourceVersion in Sources/CompanionKit/Release.swift to match")
+                       "the version compiled in is not version.json's")
     }
 
     func testIconResourceExtraction() throws {

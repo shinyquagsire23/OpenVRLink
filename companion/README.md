@@ -142,9 +142,10 @@ current platform:
 
 Repository-wide versioning is configured in `version.json` at the repository
 root (`version` and `build`, formatted as `0.1.0-8`). The visionOS Xcode project
-reads `version.json` directly when generated, while `openvrlink-companion` keeps
-a matching fallback in `Release.sourceVersion` (verified by a unit test so both
-stay in sync when bumping versions). On Windows, `package-windows.cmd` stamps
+reads `version.json` directly when generated, and `openvrlink-companion` compiles
+it in (`Sources/RepoVersion`, C23 `#embed`), so a version bump is one edit. The
+package therefore has to be built inside the repository, with `version.json` one
+folder above it. On Windows, `package-windows.cmd` stamps
 the version from `version.json` into the executable as a `VERSION` resource, or
 uses an explicit override when passed as `package-windows.cmd VERSION`.
 
