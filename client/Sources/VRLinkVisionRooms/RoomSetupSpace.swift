@@ -41,7 +41,10 @@ public final class RoomSetupControls: ObservableObject {
 ///   that form a closed loop or expand an existing boundary; Advanced mode places and drags
 ///   individual polygon vertices and splits held edges. Both modes edit the same polygon.
 ///
-/// Controllers aim along their aim pose. Indirect hand pinches start on the floor at the initial
+/// Controllers aim along their aim pose. visionOS turns a controller's trigger into a
+/// look-and-pinch of its own unless the app claims the controller, and Room Setup does not claim
+/// it (so the trigger keeps working on the toolbar window); such a pinch counts as that
+/// controller's trigger, aimed by the controller rather than by the eyes. Indirect hand pinches start on the floor at the initial
 /// eye-gaze hit point and translate horizontally at `handTravelGain` times hand movement, ignoring
 /// wrist rotation.
 ///
@@ -114,6 +117,11 @@ public final class RoomSetupSpace {
     private static let directLift: Float = 0.05, directReach: Float = 0.2
     /// Controller sides currently tracked.
     private var controllersHeld: Set<Side> = []
+    /// Where each tracked controller's grip is, to tell which one a pinch came from.
+    private var grips: [Side: SIMD3<Float>] = [:]
+    /// The pinch visionOS is making of each controller's trigger, while it lasts.
+    private var triggerPinch: [Side: SpatialEventCollection.Event.ID] = [:]
+    private var triggerPinchNoted = false
 
     private enum Pointer: Hashable {
         case controller(Side)
@@ -395,15 +403,19 @@ public final class RoomSetupSpace {
             guard let state = held[side.rawValue] else {
                 if triggerHeld[side] == true { end(pointer) }
                 triggerHeld[side] = false
+                triggerPinch[side] = nil
+                grips[side] = nil
                 pointers[pointer]?.hide()
                 continue
             }
             let aim = state.aim ?? state.grip.pose
             let ray = Ray(origin: aim.position.simd, direction: simd_normalize(aim.forward.simd))
             let sample = Sample(ray: ray, device: state.grip.pose.position.simd)
-            // Accept either trigger or grip squeeze, with hysteresis on release.
+            grips[side] = sample.device
+            // Accept the trigger (read directly, or as the pinch visionOS makes of it) or the
+            // grip squeeze, with hysteresis on release.
             let was = triggerHeld[side] ?? false
-            let down = state.squeeze > 0.5 || state.trigger > (was ? 0.3 : 0.6)
+            let down = state.squeeze > 0.5 || state.trigger > (was ? 0.3 : 0.6) || triggerPinch[side] != nil
             triggerHeld[side] = down
             if down, !was { begin(pointer, sample, now: now) } else if down { drag(pointer, sample, now: now) } else if was { end(pointer) }
             // Extend the laser to the active floor hit point, or 2 m forward if not aiming at the floor.
@@ -419,16 +431,24 @@ public final class RoomSetupSpace {
     func pinched(_ events: SpatialEventCollection, toWorld: (Point3D) -> SIMD3<Float>) {
         guard !stopped else { return }
         let now = CACurrentMediaTime()
-        for event in events where event.kind == .indirectPinch || event.kind == .directPinch {
+        for event in events {
             let pointer = Pointer.hand(event.id)
-            // Ignore hand pinch events on any hand currently holding a tracked controller.
-            let holding: Bool
-            switch event.chirality {
-            case .left: holding = controllersHeld.contains(.left)
-            case .right: holding = controllersHeld.contains(.right)
-            default: holding = !controllersHeld.isEmpty
+            // A pinch from a hand holding a tracked controller is that controller's trigger
+            // (`followControllers` acts on it); one right at the hand is the grip being mistaken
+            // for a pinch, and is ignored.
+            if presses[pointer] == nil, let side = controller(making: event, toWorld: toWorld) {
+                if event.phase == .active, event.kind != .directPinch {
+                    if !triggerPinchNoted {
+                        triggerPinchNoted = true
+                        Log.note("room setup: taking a \(event.kind) from the \(side) controller as its trigger")
+                    }
+                    triggerPinch[side] = event.id
+                } else if triggerPinch[side] == event.id {
+                    triggerPinch[side] = nil
+                }
+                continue
             }
-            if holding, presses[pointer] == nil { continue }
+            guard event.kind == .indirectPinch || event.kind == .directPinch else { continue }
             guard event.phase == .active else {
                 if presses[pointer] != nil { end(pointer) }
                 continue
@@ -452,6 +472,21 @@ public final class RoomSetupSpace {
                 begin(pointer, sample, now: now)
             }
         }
+    }
+
+    /// The tracked controller an event came from, if it came from a hand holding one. An event
+    /// that does not say which hand goes to the controller nearest its input device, or to the
+    /// only one held.
+    private func controller(making event: SpatialEventCollection.Event, toWorld: (Point3D) -> SIMD3<Float>) -> Side? {
+        if let made = triggerPinch.first(where: { $0.value == event.id }) { return made.key }
+        switch event.chirality {
+        case .left: return controllersHeld.contains(.left) ? .left : nil
+        case .right: return controllersHeld.contains(.right) ? .right : nil
+        default: break
+        }
+        guard controllersHeld.count > 1 else { return controllersHeld.first }
+        guard let device = event.inputDevicePose.map({ toWorld($0.pose3D.position) }) else { return .right }
+        return controllersHeld.min { length((grips[$0] ?? .zero) - device) < length((grips[$1] ?? .zero) - device) }
     }
 
     /// Computes the current pointer ray: controller rays come directly from `sample`, direct

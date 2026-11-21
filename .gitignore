@@ -14,5 +14,10 @@ design/
 CLAUDE.md
 .claude/
 .pi/
-.codex/# copied from the app icon by gen_xcodeproj.py
+.codex/
+
+# copied from the app icon by gen_xcodeproj.py
 client/visionOS/Resources/Icon*.png
+
+# local release helper
+package_all.sh
