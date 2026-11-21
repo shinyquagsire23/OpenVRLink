@@ -157,6 +157,7 @@ public struct StereoPlan {
         let across = window.right - window.left, tall = window.up - window.down
         guard across > 0.1, tall > 0.1 else { return nil }
         self.width = width
+        guard across.isFinite, tall.isFinite, tall / across < 100 else { return nil }
         height = max(32, Int((Float(width) * tall / across / 4).rounded()) * 4)
         apart = offset.x
         pose = leftEye.shifted(right: offset.x / 2)
@@ -165,12 +166,13 @@ public struct StereoPlan {
         for view in views {
             // Compute pixel bounds that fall completely inside this eye's rendered frustum.
             let shown = box(view.tiles)
-            let columns = max(0, Int(((shown.left - window.left) * perTangent).rounded(.up)))
-                ..< max(0, min(width, Int(((shown.right - window.left) * perTangent).rounded(.down))))
-            let rows = max(0, Int(((window.up - shown.up) * perTangentDown).rounded(.up)))
-                ..< max(0, min(height, Int(((window.up - shown.down) * perTangentDown).rounded(.down))))
-            guard !columns.isEmpty, !rows.isEmpty else { return nil }
-            covered.append((columns, rows))
+            let edges = [(shown.left - window.left) * perTangent, (shown.right - window.left) * perTangent,
+                         (window.up - shown.up) * perTangentDown, (window.up - shown.down) * perTangentDown]
+            guard edges.allSatisfy({ $0.isFinite && abs($0) < 1e6 }) else { return nil }
+            let firstColumn = max(0, Int(edges[0].rounded(.up))), endColumn = min(width, Int(edges[1].rounded(.down)))
+            let firstRow = max(0, Int(edges[2].rounded(.up))), endRow = min(height, Int(edges[3].rounded(.down)))
+            guard firstColumn < endColumn, firstRow < endRow else { return nil }
+            covered.append((firstColumn..<endColumn, firstRow..<endRow))
         }
     }
 

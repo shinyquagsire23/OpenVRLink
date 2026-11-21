@@ -181,6 +181,22 @@ final class WiVRnTests: XCTestCase {
         XCTAssertEqual(WiVRnFoveation.bands([], encodedSize: 80).count, 1)
     }
 
+    /// An eye with no frustum to speak of once took the app down as a WiVRn stream began.
+    func testAStereoPlanIsNotMadeFromAnEyeWithoutAFrustum() {
+        let left = Pose(position: Vec3(0, 0, 0), quaternion: [1, 0, 0, 0])
+        let good = Frustum(left: -1, right: 0.8, down: -0.8, up: 1)
+        let squeeze = WiVRnFoveation(across: [10, 60, 10], down: [80])
+        func plan(_ other: Frustum) -> StereoPlan? {
+            let views = [WiVRnView(pose: left, frustum: good), WiVRnView(pose: left.shifted(right: 0.064), frustum: other)]
+            return StereoPlan(layout: WiVRnSession.layout(views: views, foveation: [squeeze, squeeze], encoded: (80, 80)), width: 96)
+        }
+        XCTAssertNotNil(plan(Frustum(left: -0.8, right: 1, down: -0.8, up: 1)))
+        XCTAssertNil(plan(Frustum(left: 0.0301, right: 0.0301, down: 0.0301, up: 0.0301)))
+        XCTAssertNil(plan(Frustum(left: 0.31, right: 0.3, down: -0.8, up: 1)))
+        XCTAssertNil(plan(Frustum(left: .nan, right: .nan, down: .nan, up: .nan)))
+        XCTAssertNil(plan(Frustum(left: -.infinity, right: .infinity, down: -0.8, up: 1)))
+    }
+
     func testTilesFillTheFrustumEdgeToEdge() {
         let view = WiVRnView(pose: Pose(position: Vec3(0, 0, 0), quaternion: [1, 0, 0, 0]),
                              frustum: Frustum(left: -1, right: 0.5, down: -0.8, up: 1))
