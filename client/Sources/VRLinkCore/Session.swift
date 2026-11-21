@@ -73,6 +73,13 @@ public final class StreamSession: StreamingSession {
     /// OpenVRLink extension handshake state; guarded by `lock`.
     private var extensions = HostExtensions()
     private var extensionsReported: UInt32?
+    /// Called on the session thread when the host reports its available `HostExtensions`
+    /// features (and whenever that set changes), or with `nil` if the host streams for
+    /// `extensionsWait` seconds without sending extension records.
+    public var onHostFeatures: ((HostExtensions.Features?) -> Void)?
+    private var featuresTold: HostExtensions.Features??
+    private var streamingSince: Date?
+    static let extensionsWait: TimeInterval = 15
     private var gammaReported: Float = 1
     private let started = Uptime.nanoseconds
     private var sequence: UInt16 = 0
@@ -539,7 +546,10 @@ public final class StreamSession: StreamingSession {
         let report = version != nil && version != extensionsReported
         if report { extensionsReported = version }
         let available = extensions.available
+        let tell = version != nil && extensions.availableHeard && featuresTold != .some(.some(available))
+        if tell { featuresTold = .some(.some(available)) }
         lock.unlock()
+        if tell { onHostFeatures?(available) }
         if report, let version {
             onLog?("the host has the OpenVRLink extensions (version \(version)); encoding gamma "
                    + (available.contains(.encodingGamma) ? "available" : "not available"))
@@ -664,6 +674,17 @@ public final class StreamSession: StreamingSession {
             let captured = microphone.takePackets()
             if hostVersion != 0 { for packet in captured { send([packet]) } }
             let time = Date()
+            // Treat the host as unpatched if it streams for extensionsWait seconds without sending extension records.
+            if hostVersion != 0, featuresTold == nil {
+                if let since = streamingSince {
+                    if time.timeIntervalSince(since) > StreamSession.extensionsWait {
+                        featuresTold = .some(nil)
+                        onHostFeatures?(nil)
+                    }
+                } else {
+                    streamingSince = time
+                }
+            }
             if time >= nextTick {
                 if subIndex == 0 {
                     frameCounter &+= 1

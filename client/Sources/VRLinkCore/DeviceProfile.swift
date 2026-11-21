@@ -99,22 +99,43 @@ public struct DeviceProfile {
     ///   eye tracking, but expects the headset to render its own dashboard, leaving the
     ///   system button non-functional.
     ///
-    /// Accordingly, we report `"OpenVRLink Headset"` when `tracksEyesOrFace` is false, and
-    /// `"Vive Focus Vision"` when true. Controller profiles are reported independently via
-    /// `handValues`, and Quest Touch controllers work alongside either HMD profile.
-    ///
-    /// SteamVR also supports custom `vrlink_<model>` sections in `steamvr.vrsettings`
-    /// (`enable`, `serialNumber`, `supports10bit`, `supportsEyeTracking`,
-    /// `recommendedRenderWidth`, and `recommendedRenderHeight`), which enabled 10-bit video
-    /// and custom render target sizes for an unknown model in testing (2026-11-13), though
-    /// nothing writes those settings automatically yet.
+    /// When the host has `driver_openvrlink` installed, its default settings define custom
+    /// `vrlink_<model>` sections (`enable`, `supports10bit`, `supportsEyeTracking`, and `-1`
+    /// for `recommendedRenderWidth`/`Height`) for our native model names (`hostKnowsHeadset`),
+    /// enabling 10-bit video, eye tracking, and the requested `eyePixels` render target
+    /// together. On other hosts, we report `"OpenVRLink Headset"` when `tracksEyesOrFace` is
+    /// false and `"Vive Focus Vision"` when true. Controller profiles are reported
+    /// independently via `handValues`, and Quest Touch controllers work alongside any of these
+    /// HMD profiles.
     public var tracksEyesOrFace = false
     /// Whether the platform provides eye gaze tracking (even approximate). Reported to WiVRn
     /// hosts directly; SteamVR hosts instead check `tracksEyesOrFace`, which also switches
     /// the reported HMD model.
     public var tracksGaze = false
 
+    /// True when the host previously advertised `vrlink_<model>` settings for `ownModel`
+    /// (`HostExtensions.Features.headsetSettings`), which `driver_openvrlink` provides in its
+    /// `default.vrsettings`. Because the host only sends extension records after streaming
+    /// starts, after the client has already sent its static HMD properties, this flag comes
+    /// from the previous session with that host (`KnownHosts`).
+    public var hostKnowsHeadset = false
+
+    /// Returns the native `(model, manufacturer)` pair for this device. Windows builds of
+    /// `driver_vrlink` (2026-11) recognize `"Apple Vision Pro M2"` and `"Apple Vision Pro M5"`
+    /// with a fixed 1800 x 1920 render target and no eye tracking, while `"Apple Vision Pro"`
+    /// is treated as an unknown model today. We report `"Apple Vision Pro (OpenVRLink)"`, which uses the
+    /// `vrlink_Apple Vision Pro (OpenVRLink)` settings section, so a later driver that learns the plain
+    /// name still does not recognize ours.
+    var ownModel: (model: String, manufacturer: String) {
+        systemName == "visionOS" ? ("Apple Vision Pro (OpenVRLink)", "Apple") : (DeviceProfile.headsetModel, "OpenVRLink")
+    }
+
     private func staticHMDProps() -> Bytes {
+        if hostKnowsHeadset {
+            let serial = DeviceProfile.headsetSerial, own = ownModel
+            return DeviceProfile.staticProps(["oculus", serial, own.manufacturer, own.model, "generic_hmd", "vrlink",
+                                              "{oculus}/input/rift_profile.json", "rift", "oculus/\(serial)"])
+        }
         if tracksEyesOrFace {
             // Static HMD properties sent by vrlink on a Vive Focus Vision.
             return DeviceProfile.staticProps(["htc", "VRLINKHMDVIVEFOCUSVISION", "HTC", "Vive Focus Vision", "generic_hmd", "vrlink",

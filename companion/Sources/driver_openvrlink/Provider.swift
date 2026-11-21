@@ -96,9 +96,10 @@ private enum Provider {
         default: status = "handshake only (see vrserver.txt)"
         }
         let gammaOn = Server.bool(Server.gammaOnKey, default: true)
+        let headsets = Server.headsetsKnown()
         let gamma = Server.float(Server.gammaValueKey, default: Server.defaultGamma)
         Platform.lock()
-        Shared.host?.available = gammaAvailable ? Handshake.gammaFeature : 0
+        Shared.host?.available = (gammaAvailable ? Handshake.gammaFeature : 0) | (headsets ? Handshake.headsetFeature : 0)
         Shared.host?.enabled = gammaOn ? Handshake.gammaFeature : 0
         Shared.host?.gamma = gamma
         Platform.unlock()

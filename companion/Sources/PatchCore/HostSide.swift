@@ -27,6 +27,11 @@ public enum Handshake {
 
     /// The host raises encoded brightness with `v' = v^(1/gamma)`; the client undoes it.
     public static let gammaFeature: UInt32 = 1 << 0
+    /// Advertised in `oxAvail` when the host has `vrlink_<model>` settings enabled for
+    /// OpenVRLink's native headset names. No per-frame processing is involved (`oxOn` never
+    /// sets this bit); because the client sends its HMD model before receiving `oxAvail`,
+    /// it saves this flag for the next session.
+    public static let headsetFeature: UInt32 = 1 << 1
 
     /// Milliseconds between changes of a heartbeat value.
     public static let beat: UInt64 = 250

@@ -37,7 +37,7 @@ packet captures or static analysis of `vrlink` and `driver_vrlink`.
 | `oxClient` | client | heartbeat: `version * 65536 + tick`, `tick` = milliseconds / 250, low 16 bits |
 | `oxWant` | client | bitmask of features supported by the client |
 | `oxHost` | host | heartbeat, using the same encoding |
-| `oxAvail` | host | bitmask of features patched into `driver_vrlink` on this host |
+| `oxAvail` | host | bitmask of available host features: bit 0 = encoding gamma (section 2), bit 1 = native OpenVRLink headset settings (section 3) |
 | `oxOn` | host | bitmask of features applied to outgoing frames |
 | `oxGamma` | host | active encoding gamma (`1` when gamma is inactive) |
 
@@ -201,7 +201,51 @@ linear-light texture, it converts to sRGB before applying `pow(v, gamma)` and
 converts back to linear light afterward. All three client render paths draw
 video through `QuadRenderer`.
 
-## 3. Settings
+## 3. Native headset profile settings (feature bit 1)
+
+`driver_vrlink` gates headset capabilities by HMD model name
+(see [svl-values/static-and-power-props.md](svl-values/static-and-power-props.md#unknown-hmd-models-and-vrlink_model-settings)).
+No built-in profile enables eye tracking, 10-bit video, and the client's
+requested render resolution at the same time, so against a stock host OpenVRLink
+reports `"Vive Focus Vision"` when eye or face tracking is enabled, which locks
+the render target to 2480 x 2480.
+
+When `driver_vrlink` encounters an unrecognized HMD model name, it looks up a
+`vrlink_<model>` section via `IVRSettings`. Because SteamVR merges
+`default.vrsettings` across all active drivers, `driver_openvrlink` ships
+default sections for OpenVRLink's two native model names:
+`vrlink_Apple Vision Pro (OpenVRLink)` (used on visionOS) and `vrlink_OpenVRLink Headset`
+(used on other platforms). Each section enables `enable`, `supports10bit`, and
+`supportsEyeTracking`, repeats the six static HMD string properties that
+`driver_vrlink` reads from settings when `enable` is true, and sets
+`recommendedRenderWidth` and `recommendedRenderHeight` to `-1` so
+`driver_vrlink` honors the client's requested resolution. Any user overrides in
+`steamvr.vrsettings` under the same section names take precedence over these
+defaults. In **live** testing (2026-11-20, macOS viewer reporting
+`Apple Vision Pro` against SteamVR 2.19.4 on Windows) with only
+`driver_openvrlink`'s defaults installed, `vrserver.txt` logged
+`Found settings for unknown hmd`, `Found properties for unknown hmd`,
+`Using 10bit mode: 1`, and `Render Target: 3008 2404` for a requested 3000 x 2400
+eye resolution. End-to-end eye tracking delivery under this profile has not been
+verified yet. That test predates the `(OpenVRLink)` suffix, which keeps the
+name ours should `driver_vrlink` ever recognize plain `Apple Vision Pro`; the
+suffixed name has not been run against a host.
+
+`driver_openvrlink` sets bit 1 of `oxAvail` whenever both `vrlink_<model>`
+sections are present with `enable` set to `true`. However, the client must send
+its static HMD properties before the host starts sending `ox` records: when we
+delayed sending static HMD properties by 6 s in a **live** test (2026-11-20),
+the host still did not send its first `ox` record until 2.8 s after those
+properties arrived. To work around that ordering, the client caches whether each
+host supports bit 1 in `hosts.json` (`KnownHosts`, keyed by discovery `clientID`)
+and reports its native model name starting on the next session with that host
+(`DeviceProfile.hostKnowsHeadset`). If a host streams for 15 s without sending
+extension records, or sends `oxAvail` without bit 1, the cached flag is cleared.
+In **live** testing with the macOS viewer, the first session recorded support for
+the host and the second session connected under its native model name; this has
+not been tested on a physical Vision Pro yet.
+
+## 4. Settings
 
 Extension settings use a dedicated `driver_openvrlink` section in
 `steamvr.vrsettings` so `driver_vrlink` never sees unrecognized keys:
@@ -221,7 +265,7 @@ separate schema file instead). The gamma controls specify
 support for `requires` and `label` controls in the SteamVR dashboard is
 **inferred** from existing entries in `driver_vrlink`'s schema.
 
-## 4. Adding a feature
+## 5. Adding a feature
 
 To add a new extension feature, assign the next bit in the feature bitmask. The
 client sets the bit in `oxWant` when it supports the feature, and

@@ -15,18 +15,28 @@ public enum Component: String, CaseIterable {
     case models
     /// SteamVR driver that applies OpenVRLink extensions to `driver_vrlink` (`driver_openvrlink`).
     case driver
+    /// Sets `driver_vrlink/streamFormatWidth` to `Setup.highStreamWidth` in `steamvr.vrsettings`.
+    /// Because this modifies user settings rather than installing a driver, it only runs when
+    /// explicitly requested by name.
+    case encodingSize = "encoding-size"
+
+    /// Components targeted by `install` and `uninstall` when no component names are passed.
+    public static let installedByDefault: [Component] = [.models, .driver]
 
     public var title: String {
         switch self {
         case .models: return "Sense controller models"
         case .driver: return "VR Link extensions driver"
+        case .encodingSize: return "High-PPD encoding size"
         }
     }
 
-    var driverName: String {
+    /// Driver directory name for components installed as SteamVR drivers, or `nil` for settings-only items.
+    var driverName: String? {
         switch self {
         case .models: return SenseModel.driverName
         case .driver: return Install.driverName
+        case .encodingSize: return nil
         }
     }
 }
@@ -45,11 +55,14 @@ public struct ComponentState: Equatable {
     /// Human-readable status summary shown in the CLI and GUI.
     public var detail: String
 
+    /// Custom action label (for example, `"Apply"`) used instead of `"Install"` when `kind` is `.notInstalled`.
+    public var verb: String?
+
     public var isInstalled: Bool { kind == .installed || kind == .updateAvailable }
     /// Button/action label (`"Install"` or `"Update"`), or `nil` when no action is available.
     public var action: String? {
         switch kind {
-        case .notInstalled: return "Install"
+        case .notInstalled: return verb ?? "Install"
         case .updateAvailable: return "Update"
         case .installed, .unavailable: return nil
         }
@@ -83,7 +96,7 @@ public struct Setup {
 
     public static let notFoundSteamVR = "SteamVR was not found on this PC."
 
-    public func folder(of component: Component) -> URL { places.drivers.appendingPathComponent(component.driverName) }
+    public func folder(of component: Component) -> URL { places.drivers.appendingPathComponent(component.driverName ?? component.rawValue) }
 
     private func isRegistered(_ component: Component) -> Bool {
         let folder = folder(of: component)
@@ -217,12 +230,71 @@ public struct Setup {
         return lines
     }
 
+    // Encoding size
+
+    /// Per-eye encoded stream width in pixels (`driver_vrlink/streamFormatWidth`) applied by
+    /// the High-PPD option. SteamVR's UI slider stops well below this value; 3200 is the
+    /// maximum width observed working on a Windows host streaming to an Apple Vision Pro (2026-11-20).
+    public static let highStreamWidth = 3200
+    static let vrlinkSection = "driver_vrlink", widthKey = "streamFormatWidth", automaticWidthKey = "automaticStreamFormatWidth"
+
+    /// Path to `config/steamvr.vrsettings` in the detected Steam installation.
+    public var settingsFile: URL? {
+        let files = places.steamRoots.map { $0.appendingPathComponent("config/steamvr.vrsettings") }
+        return files.first { Steam.isFile($0) } ?? (found.steamVR != nil ? files.first : nil)
+    }
+
+    /// Checks whether SteamVR (`vrserver`) is currently running. SteamVR caches settings in
+    /// memory and overwrites `steamvr.vrsettings` on exit. Injectable for tests.
+    public var steamVRRunning: () -> Bool = { OS.isRunning("vrserver") }
+
+    private func settings() throws -> (file: URL, json: JSON)? {
+        guard let file = settingsFile else { return nil }
+        guard let text = try? String(contentsOf: file, encoding: .utf8) else { return (file, .object([])) }
+        let json = try JSON(parsing: text)
+        guard case .object = json else { throw JSON.ParseError(description: "\(file.path) is not a JSON object") }
+        return (file, json)
+    }
+
+    private func encodingSizeState() -> ComponentState {
+        guard found.steamVR != nil, let settings = try? settings() else {
+            return ComponentState(kind: .unavailable, detail: found.steamVR == nil ? Setup.notFoundSteamVR : "Could not read steamvr.vrsettings.")
+        }
+        let section = settings.json[Setup.vrlinkSection]
+        let width = section?[Setup.widthKey]?.number.flatMap { Double($0) }.map { Int($0) }
+        let automatic = section?[Setup.automaticWidthKey] != .bool(false)
+        if !automatic, let width, width >= Setup.highStreamWidth {
+            return ComponentState(kind: .installed, detail: "Fixed at \(width) px per eye.")
+        }
+        let current = automatic ? "Automatic" : "Fixed at \(width.map { "\($0) px" } ?? "default width")"
+        return ComponentState(kind: .notInstalled, detail: "\(current). Sets per-eye encoding width to \(Setup.highStreamWidth) px "
+                              + "(requires a fast GPU and network; close SteamVR before applying).", verb: "Apply")
+    }
+
+    /// Sets or removes the custom VR Link encoding width keys in `steamvr.vrsettings`.
+    private func setEncodingSize(high: Bool) throws -> [String] {
+        guard var (file, json) = try settings() else { throw Failure("Could not locate steamvr.vrsettings") }
+        guard !steamVRRunning() else { throw Failure("SteamVR is currently running and would overwrite changes to steamvr.vrsettings. Close SteamVR and try again.") }
+        var members: [(key: String, value: JSON)] = []
+        if case .object(let before)? = json[Setup.vrlinkSection] { members = before.filter { $0.key != Setup.widthKey && $0.key != Setup.automaticWidthKey } }
+        if high {
+            members.append((Setup.automaticWidthKey, .bool(false)))
+            members.append((Setup.widthKey, .number("\(Setup.highStreamWidth)")))
+        }
+        json[Setup.vrlinkSection] = .object(members)
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try json.text.write(to: file, atomically: true, encoding: .utf8)
+        return [high ? "Set VR Link encoding width to \(Setup.highStreamWidth) px in \(Steam.nativePath(file))"
+                     : "Reset VR Link encoding width to SteamVR defaults in \(Steam.nativePath(file))"]
+    }
+
     // Shared component operations
 
     public func state(of component: Component) -> ComponentState {
         switch component {
         case .models: return modelsState()
         case .driver: return driverState()
+        case .encodingSize: return encodingSizeState()
         }
     }
 
@@ -232,11 +304,13 @@ public struct Setup {
         switch component {
         case .models: return try installModels()
         case .driver: return try installDriver()
+        case .encodingSize: return try setEncodingSize(high: true)
         }
     }
 
     /// Uninstalls `component` and cleans up its driver registration and settings schema entries.
     public func uninstall(_ component: Component) throws -> [String] {
+        if component == .encodingSize { return try setEncodingSize(high: false) }
         var lines: [String] = []
         let driver = folder(of: component)
         try Steam.setExternalDriver(driver, present: false, in: places)

@@ -16,6 +16,53 @@ final class HostExtensionsTests: XCTestCase {
         }
     }
 
+    func testAvailableFeaturesWaitForOxAvailRecord() {
+        var extensions = HostExtensions()
+        extensions.receive(key: "oxHost", value: 65536 + 1, atMilliseconds: 0)
+        extensions.receive(key: "oxHost", value: 65536 + 2, atMilliseconds: 250)
+        XCTAssertTrue(extensions.hostPresent(atMilliseconds: 250))
+        XCTAssertFalse(extensions.availableHeard)
+        extensions.receive(key: "oxAvail", value: 3, atMilliseconds: 300)
+        XCTAssertTrue(extensions.availableHeard)
+        XCTAssertEqual(extensions.available, [.encodingGamma, .headsetSettings])
+    }
+
+    /// Reads manufacturer (string 2) and model (string 3) from the nine 128-byte strings following the 4-byte mask.
+    private func names(_ profile: DeviceProfile) -> (manufacturer: String, model: String) {
+        let props = profile.startupValues()[DeviceProfile.ValueID.staticHMD] ?? []
+        func text(_ index: Int) -> String {
+            String(decoding: props[(4 + index * 128)..<(4 + (index + 1) * 128)].prefix { $0 != 0 }, as: UTF8.self)
+        }
+        return (text(2), text(3))
+    }
+
+    func testReportsNativeHeadsetModelWhenHostSupportsIt() {
+        var profile = DeviceProfile()
+        profile.systemName = "visionOS"
+        XCTAssertEqual(names(profile).model, "OpenVRLink Headset")
+        profile.tracksEyesOrFace = true
+        XCTAssertEqual(names(profile).model, "Vive Focus Vision")
+        profile.hostKnowsHeadset = true
+        XCTAssertEqual(names(profile).model, "Apple Vision Pro (OpenVRLink)")
+        XCTAssertEqual(names(profile).manufacturer, "Apple")
+        profile.tracksEyesOrFace = false
+        XCTAssertEqual(names(profile).model, "Apple Vision Pro (OpenVRLink)")
+        profile.systemName = "macOS"
+        XCTAssertEqual(names(profile).model, "OpenVRLink Headset")
+    }
+
+    func testKnownHostsPersistsPerHost() {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("ovl-hosts-\(UUID().uuidString)/hosts.json")
+        defer { try? FileManager.default.removeItem(at: file.deletingLastPathComponent()) }
+        XCTAssertFalse(KnownHosts(file: file).knowsHeadset(7))
+        KnownHosts(file: file).set(7, knowsHeadset: true)
+        KnownHosts(file: file).set(UInt64.max, knowsHeadset: false)
+        XCTAssertTrue(KnownHosts(file: file).knowsHeadset(7))
+        XCTAssertFalse(KnownHosts(file: file).knowsHeadset(UInt64.max))
+        KnownHosts(file: file).set(7, knowsHeadset: false)
+        XCTAssertFalse(KnownHosts(file: file).knowsHeadset(7))
+    }
+
     func testTheClientAnnouncesItselfWithAnAdvancingHeartbeat() {
         let extensions = HostExtensions()
         let first = extensions.records(atMilliseconds: 1000), later = extensions.records(atMilliseconds: 1250)

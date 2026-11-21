@@ -20,6 +20,10 @@ public struct HostExtensions {
         public init(rawValue: UInt32) { self.rawValue = rawValue }
         /// Host encodes sRGB values as `v^(1/gamma)` and the client restores them using `FrameLayout.encodingGamma`.
         public static let encodingGamma = Features(rawValue: 1 << 0)
+        /// Host has `vrlink_<model>` settings enabled for OpenVRLink's native headset names
+        /// (advertised in `oxAvail` only). Because the client sends its static HMD properties
+        /// before receiving `oxAvail`, this flag is saved in `KnownHosts` for the next session.
+        public static let headsetSettings = Features(rawValue: 1 << 1)
     }
 
     enum Key {
@@ -39,6 +43,8 @@ public struct HostExtensions {
     public private(set) var hostVersion: UInt32?
     /// Features available on the host's patched `driver_vrlink`.
     public private(set) var available: Features = []
+    /// True once at least one `oxAvail` record has been received (which arrives shortly after the first `oxHost` heartbeats).
+    public private(set) var availableHeard = false
     private var active: Features = []
     private var gamma: Float = 1
     private var lastBeat: Double?
@@ -69,7 +75,9 @@ public struct HostExtensions {
                 hostVersion = UInt32(value / 65536)
             }
             lastBeat = value
-        case Key.available: available = Features(rawValue: UInt32(value))
+        case Key.available:
+            available = Features(rawValue: UInt32(value))
+            availableHeard = true
         case Key.active: active = Features(rawValue: UInt32(value))
         case Key.gamma: gamma = Float(value)
         default: break

@@ -121,6 +121,16 @@ public enum OS {
     }
     #endif
 
+    /// Returns true if a process with the given executable name (without `.exe`) is running.
+    public static func isRunning(_ name: String) -> Bool {
+        #if os(Windows)
+        let listed = run("tasklist", ["/FI", "IMAGENAME eq \(name).exe", "/NH", "/FO", "CSV"], searching: true)
+        return listed?.output.lowercased().contains("\"\(name.lowercased()).exe\"") ?? false
+        #else
+        return run("pgrep", ["-x", name], searching: true)?.status == 0
+        #endif
+    }
+
     public struct Ran {
         /// Process exit code.
         public var status: Int32

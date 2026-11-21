@@ -55,10 +55,22 @@ private enum MainThread {
 }
 
 private enum Control: Int {
-    case modelsAction = 100, modelsRemove, driverAction, driverRemove, update
+    case modelsAction = 100, modelsRemove, driverAction, driverRemove, update, encodingAction, encodingRemove
 
-    static func action(_ component: Component) -> Control { component == .models ? .modelsAction : .driverAction }
-    static func remove(_ component: Component) -> Control { component == .models ? .modelsRemove : .driverRemove }
+    static func action(_ component: Component) -> Control {
+        switch component {
+        case .models: return .modelsAction
+        case .driver: return .driverAction
+        case .encodingSize: return .encodingAction
+        }
+    }
+    static func remove(_ component: Component) -> Control {
+        switch component {
+        case .models: return .modelsRemove
+        case .driver: return .driverRemove
+        case .encodingSize: return .encodingRemove
+        }
+    }
 }
 
 private enum UpdateState {
@@ -143,7 +155,7 @@ private final class CompanionWindow {
                 guard let row = rows[component] else { continue }
                 let state = setup.state(of: component)
                 set(row.detail, state.detail)
-                set(row.action, state.action ?? (state.kind == .installed ? "Installed" : "Install"))
+                set(row.action, state.action ?? (state.kind == .installed ? (component == .encodingSize ? "Applied" : "Installed") : "Install"))
                 EnableWindow(row.action, state.action != nil)
                 EnableWindow(row.remove, state.isInstalled)
             }
@@ -181,7 +193,8 @@ private final class CompanionWindow {
         do {
             let setup = try makeSetup()
             if removing {
-                guard tell("Uninstall \(component.title)?", asking: true) else { return }
+                let question = component == .encodingSize ? "Reset VR Link's encoding size to SteamVR defaults?" : "Uninstall \(component.title)?"
+                guard tell(question, asking: true) else { return }
                 _ = try setup.uninstall(component)
             } else {
                 _ = try setup.install(component)
@@ -259,6 +272,8 @@ private final class CompanionWindow {
         case .modelsRemove: act(on: .models, removing: true)
         case .driverAction: act(on: .driver, removing: false)
         case .driverRemove: act(on: .driver, removing: true)
+        case .encodingAction: act(on: .encodingSize, removing: false)
+        case .encodingRemove: act(on: .encodingSize, removing: true)
         case .update:
             if case .available(let offer) = update { fetch(offer) } else { checkForUpdates(quietly: false) }
         case nil: break

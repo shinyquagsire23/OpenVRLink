@@ -17,6 +17,19 @@ enum Server {
     static let gammaAvailableKey: StaticString = "gammaAvailable"
     static let statusKey: StaticString = "status"
     static let defaultGamma: Float = 1.6
+    /// Settings sections installed by `openvrlink-companion` for OpenVRLink's native HMD models (`Install.headsets`).
+    static let headsetSections: [StaticString] = ["vrlink_Apple Vision Pro (OpenVRLink)", "vrlink_OpenVRLink Headset"]
+
+    /// Returns true when every section in `headsetSections` is present with `enable` set to `true`.
+    static func headsetsKnown() -> Bool {
+        guard let settings else { return false }
+        for name in headsetSections {
+            var error: Int32 = 0
+            let enabled = settings.pointee.vtable.pointee.get_bool(settings, cString(name), cString("enable"), &error)
+            guard error == 0, enabled else { return false }
+        }
+        return true
+    }
 
     static func cString(_ text: StaticString) -> UnsafePointer<CChar> {
         UnsafeRawPointer(text.utf8Start).assumingMemoryBound(to: CChar.self)

@@ -19,10 +19,12 @@ let usage = """
       openvrlink-companion status
           Show detected SteamVR paths and the status of each component.
 
-      openvrlink-companion install [models] [driver] [options]
-          Install or update the specified components (defaults to both):
-            models   PlayStation VR2 Sense controller models for OpenVRLink
-            driver   SteamVR driver that adds OpenVRLink extensions to VR Link
+      openvrlink-companion install [models] [driver] [encoding-size] [options]
+          Install or update the specified components (defaults to models and driver):
+            models         PlayStation VR2 Sense controller models for OpenVRLink
+            driver         SteamVR driver that adds OpenVRLink extensions to VR Link
+            encoding-size  Set VR Link's per-eye encoding width to 3200 px in
+                           steamvr.vrsettings (only applied when specified by name)
           Options:
             --steamvr DIR    Path to SteamVR if not detected automatically
             --models DIR     Copy Sense controller models from DIR
@@ -30,8 +32,8 @@ let usage = """
             --vrlink-tab     Place settings in SteamVR's VR Link tab instead of a
                              separate OpenVRLink tab (SteamVR before 2.19 only)
 
-      openvrlink-companion uninstall [models] [driver]
-          Uninstall the specified components (defaults to both) and clean up settings.
+      openvrlink-companion uninstall [models] [driver] [encoding-size]
+          Uninstall the specified components (defaults to models and driver) and clean up settings.
 
       openvrlink-companion update [--check]
           Update openvrlink-companion from GitHub releases, or pass --check to only
@@ -140,9 +142,9 @@ func status(_ setup: Setup) {
 }
 
 func components(_ names: [String]) throws -> [Component] {
-    if names.isEmpty { return Component.allCases }
+    if names.isEmpty { return Component.installedByDefault }
     return try names.map { name in
-        guard let component = Component(rawValue: name) else { throw Failure("\(name) is not a component (models, driver)") }
+        guard let component = Component(rawValue: name) else { throw Failure("\(name) is not a component (models, driver, encoding-size)") }
         return component
     }
 }

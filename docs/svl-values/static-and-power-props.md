@@ -233,3 +233,44 @@ registered with `sControllerType = "oculus_touch"` exposes Touch input paths
 (`/input/trigger`, `/input/a/click`, `/input/joystick`, `/input/grip`), leaving
 the model's component bindings unmatched. Input delivery itself works normally
 through the Touch profile.
+
+## Unknown HMD models and `vrlink_<model>` settings
+
+Unless noted otherwise, the findings below come from **static** analysis of
+`driver_vrlink.dll` (SteamVR 2.19.4; addresses refer to the build in the Ghidra
+project, which differs from the build installed on the test host, though both
+contain the same strings).
+
+`GetHmdModel` (`0x1809e8d50`) maps the model string from the HMD's static
+properties to its built-in HMD profiles, logging
+`[GetHmdModel] Unknown HMD Model number: <model>` for unrecognized strings.
+`Apple Vision Pro M2` and `Apple Vision Pro M5` are recognized in the Windows
+build (10-bit video, fixed 1800 x 1920 render target, no eye tracking), while
+plain `Apple Vision Pro` is unrecognized, and the Linux build has no Apple
+model strings at all.
+
+For an unrecognized model, `driver_vrlink` reads the `vrlink_<model>` settings
+section (using the exact model string sent by the headset) via `IVRSettings`.
+Because it queries `IVRSettings`, default sections shipped in another driver's
+`default.vrsettings` apply just like entries in `steamvr.vrsettings` (**live**,
+2026-11-20: verified with a section in an external driver's
+`default.vrsettings`).
+
+| key | type | default | behavior |
+|---|---|---|---|
+| `enable` | bool | `false` | required for all keys below except `supports10bit` |
+| `serialNumber` | string | `""` | overrides the HMD serial number |
+| `supports10bit` | bool | `driver_vrlink/supports10bit`, else `false` | enables 10-bit video (even when `enable` is `false`) |
+| `supportsEyeTracking` | bool | `false` | sets OpenVR property `6009`, creates the `/eyetracking` input component, and sets `/driver_vrlink/supports_eye_and_face_tracking` |
+| `recommendedRenderWidth`, `recommendedRenderHeight` | int32 | `0` (falls back to 2064 x 2208) | per-eye render target resolution, overriding the client's request; negative values keep the client's requested size (**live**: `-1` with a 3000 x 2400 request produced `Render Target: 3008 2404`) |
+| `modelNumber`, `manufacturerName`, `trackingSystemName`, `resourceRoot`, `inputProfilePath`, `controllerType` | string | `""` (overwrites the client's values) | overrides OpenVR properties `1001`, `1005`, `1000`, `1035`, `1037`, and `7000` |
+| `minStreamFormatWidth`, `maxStreamFormatWidth`, `minNonFoveatedStreamFormatWidth`, `maxNonFoveatedStreamFormatWidth` | int32 | `512`, `1344`, `768`, `1920` | min/max encoded stream width when automatic stream width is enabled |
+
+Eye gaze data is only forwarded to the `/eyetracking` input and OSC when
+`driver_vrlink/shareEyeTrackingData` is enabled. Facial expressions are not
+gated by HMD model and are always sent via OSC when `useOSC` and `useOSCFace`
+are enabled. Unknown HMD models never set
+`/driver_vrlink/supports_hand_tracking`, even with a custom settings section.
+Controllers for an unknown model are queried the same way under
+`vrlink_<model>_controller_right` and `vrlink_<model>_controller_left`, logging
+a not-found message when absent.

@@ -52,8 +52,8 @@ for output synchronously.
 
 ```
 openvrlink-companion status                  # show detected paths and component status
-openvrlink-companion install [models] [driver]
-openvrlink-companion uninstall [models] [driver]
+openvrlink-companion install [models] [driver] [encoding-size]
+openvrlink-companion uninstall [models] [driver] [encoding-size]
 openvrlink-companion update [--check]        # update openvrlink-companion to the latest release
 ```
 
@@ -70,6 +70,33 @@ On Linux, `openvrlink-companion` looks for `driver_openvrlink.so` next to the
 executable (matching the release archive layout, e.g. in `~/.local/bin`) or at
 `../lib/openvrlink/driver_openvrlink.so` and
 `../share/openvrlink/driver_openvrlink.so` for system packages.
+
+### Headset profile settings
+
+Along with its runtime patches, `driver_openvrlink` includes `default.vrsettings`
+sections for OpenVRLink's native headset names (`vrlink_Apple Vision Pro (OpenVRLink)` and
+`vrlink_OpenVRLink Headset`). When `driver_vrlink` sees an unrecognized HMD
+model name, it reads the matching `vrlink_<model>` section from SteamVR's
+settings; these defaults enable eye tracking, 10-bit video, and the headset's
+requested render resolution all at once. Once an OpenVRLink client sees that the
+host has these settings installed, it reports its native model name on
+subsequent connections instead of spoofing a Vive Focus Vision
+(see [docs/openvrlink-extensions.md](../docs/openvrlink-extensions.md), section 3).
+Eye tracking data is still only forwarded to SteamVR apps when
+`shareEyeTrackingData` is enabled in SteamVR's Steam Link settings;
+`openvrlink-companion` does not modify that setting.
+
+### High-PPD encoding size
+
+Running `openvrlink-companion install encoding-size` (or clicking **Apply** in
+the GUI) sets `driver_vrlink/streamFormatWidth` to `3200` and
+`automaticStreamFormatWidth` to `false` in `steamvr.vrsettings`, exceeding the
+maximum value exposed by SteamVR's UI slider. Running
+`openvrlink-companion uninstall encoding-size` (or clicking **✕**) removes both
+keys so SteamVR manages the encoding width again. Because this edits user
+settings rather than installing a driver, `install` and `uninstall` only touch
+it when `encoding-size` is specified explicitly. SteamVR must be closed first
+so it does not overwrite `steamvr.vrsettings` on exit.
 
 ### Installation paths and Steam discovery
 

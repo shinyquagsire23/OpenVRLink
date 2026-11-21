@@ -91,6 +91,13 @@ public struct HostConnector {
             args = try Broadcast.requestSession(socket, host: host, identity: identity, deviceVersion: deviceVersion)
         }
         if cancelled() { return nil }
+        // Report our native HMD model if this host advertised headset settings in the previous session.
+        var profile = profile
+        let hosts = KnownHosts()
+        profile.hostKnowsHeadset = hosts.knowsHeadset(host.clientID)
+        if profile.hostKnowsHeadset {
+            log("reporting HMD model \(profile.ownModel.model) (supported by \(host.hostname) in previous session)")
+        }
         guard let session = StreamSession(args, profile: profile, interface: interface) else {
             // Report whether session creation failed due to an unsupported transport token or a socket error.
             guard SVLLink(token: args.token) != nil else {
@@ -99,6 +106,14 @@ public struct HostConnector {
             throw BroadcastError.badResponse("could not open a socket to \(args.host) port \(args.port)" + (interface.map { " on \($0)" } ?? ""))
         }
         log("transport: \(session.transportName)")
+        let clientID = host.clientID, known = profile.hostKnowsHeadset, model = profile.ownModel.model, log = log
+        session.onHostFeatures = { features in
+            let knows = features?.contains(.headsetSettings) ?? false
+            guard knows != known else { return }
+            hosts.set(clientID, knowsHeadset: knows)
+            log(knows ? "host supports OpenVRLink headset settings; will report \(model) starting next session"
+                      : "host no longer advertises OpenVRLink headset settings; reverting to fallback HMD model next session")
+        }
         return (session, host.hostname)
     }
 

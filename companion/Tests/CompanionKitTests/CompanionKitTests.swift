@@ -188,6 +188,18 @@ final class InstallTests: XCTestCase {
         let defaults = try JSON(parsing: String(contentsOf: driver.appendingPathComponent("resources/settings/default.vrsettings"), encoding: .utf8))
         XCTAssertEqual(defaults[Install.section]?[Install.gammaAvailableKey], .bool(false))
         XCTAssertEqual(defaults[Install.section]?[Install.gammaValueKey], .number("1.6"))
+        // Default vrlink_<model> sections are enabled and preserve the client's requested render size (-1).
+        for name in ["vrlink_Apple Vision Pro (OpenVRLink)", "vrlink_OpenVRLink Headset"] {
+            XCTAssertEqual(defaults[name]?["enable"], .bool(true), name)
+            XCTAssertEqual(defaults[name]?["supportsEyeTracking"], .bool(true), name)
+            XCTAssertEqual(defaults[name]?["supports10bit"], .bool(true), name)
+            XCTAssertEqual(defaults[name]?["recommendedRenderWidth"], .number("-1"), name)
+            XCTAssertEqual(defaults[name]?["recommendedRenderHeight"], .number("-1"), name)
+            for key in ["modelNumber", "manufacturerName", "trackingSystemName", "resourceRoot", "inputProfilePath", "controllerType", "serialNumber"] {
+                XCTAssertFalse(defaults[name]?[key]?.string?.isEmpty ?? true, "\(name) \(key)")
+            }
+        }
+        XCTAssertEqual(defaults["vrlink_Apple Vision Pro (OpenVRLink)"]?["modelNumber"], .string("Apple Vision Pro (OpenVRLink)"))
         XCTAssertTrue(Steam.isFile(driver.appendingPathComponent("resources/settings/settingsschema.vrsettings")))
         try Install.writeDriver(to: driver, library: Data("library".utf8), windows: true, ownTab: false)
         XCTAssertTrue(Steam.isFile(driver.appendingPathComponent("bin/win64/driver_openvrlink.dll")))
@@ -274,9 +286,41 @@ final class ComponentTests: XCTestCase {
         return next
     }
 
+    func testEncodingSizeWritesAndRemovesSteamVRSettings() throws {
+        var (root, setup) = try machine()
+        setup.steamVRRunning = { false }
+        let file = root.appendingPathComponent("Steam/config/steamvr.vrsettings")
+        XCTAssertEqual(setup.settingsFile?.path, file.path)
+        XCTAssertEqual(setup.state(of: .encodingSize).kind, .notInstalled)
+        XCTAssertEqual(setup.state(of: .encodingSize).action, "Apply")
+        XCTAssertFalse(Component.installedByDefault.contains(.encodingSize))
+
+        try write(#"{"steamvr":{"ipd":0.063},"driver_vrlink":{"targetBandwidth":240,"automaticStreamFormatWidth":true,"streamFormatWidth":1024}}"#, to: file)
+        _ = try setup.install(.encodingSize)
+        var settings = try JSON(parsing: String(contentsOf: file, encoding: .utf8))
+        XCTAssertEqual(settings["driver_vrlink"]?["streamFormatWidth"], .number("3200"))
+        XCTAssertEqual(settings["driver_vrlink"]?["automaticStreamFormatWidth"], .bool(false))
+        XCTAssertEqual(settings["driver_vrlink"]?["targetBandwidth"], .number("240"))
+        XCTAssertEqual(settings["steamvr"]?["ipd"], .number("0.063"))
+        XCTAssertEqual(setup.state(of: .encodingSize).kind, .installed)
+        XCTAssertNil(setup.state(of: .encodingSize).action)
+
+        // Refuse to modify steamvr.vrsettings while SteamVR is running, since it overwrites the file on exit.
+        setup.steamVRRunning = { true }
+        XCTAssertThrowsError(try setup.uninstall(.encodingSize))
+        XCTAssertEqual(setup.state(of: .encodingSize).kind, .installed)
+        setup.steamVRRunning = { false }
+        _ = try setup.uninstall(.encodingSize)
+        settings = try JSON(parsing: String(contentsOf: file, encoding: .utf8))
+        XCTAssertNil(settings["driver_vrlink"]?["streamFormatWidth"])
+        XCTAssertNil(settings["driver_vrlink"]?["automaticStreamFormatWidth"])
+        XCTAssertEqual(settings["driver_vrlink"]?["targetBandwidth"], .number("240"))
+        XCTAssertEqual(setup.state(of: .encodingSize).kind, .notInstalled)
+    }
+
     func testComponentsInstallUpdateAndUninstallIndependently() throws {
         var (_, setup) = try machine()
-        XCTAssertEqual(Component.allCases.map { setup.state(of: $0).kind }, [.notInstalled, .notInstalled])
+        XCTAssertEqual(Component.installedByDefault.map { setup.state(of: $0).kind }, [.notInstalled, .notInstalled])
         XCTAssertEqual(setup.state(of: .driver).action, "Install")
 
         // By default, settings go in a dedicated OpenVRLink tab without modifying VR Link's schema.

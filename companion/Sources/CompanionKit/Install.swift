@@ -30,6 +30,27 @@ public enum Install {
     /// Written by the driver: one line on what it managed to patch.
     public static let statusKey = "status"
     public static let defaultGamma = 1.6
+
+    /// Native `(model, manufacturer)` pairs used by OpenVRLink clients when `driver_openvrlink` is installed.
+    /// Must match `Server.headsetSections` in `driver_openvrlink`.
+    public static let headsets = [("Apple Vision Pro (OpenVRLink)", "Apple"), ("OpenVRLink Headset", "OpenVRLink")]
+
+    /// Builds a `vrlink_<model>` default settings section for an unrecognized HMD model
+    /// (`docs/svl-values/static-and-power-props.md`). Setting `enable` enables 10-bit video
+    /// and eye tracking, but also causes `driver_vrlink` to override six static HMD string
+    /// properties and the render resolution from settings; we repeat the strings OpenVRLink
+    /// sends and set `recommendedRenderWidth`/`Height` to `-1` so `driver_vrlink` keeps the
+    /// client's requested resolution (omitting them or passing `0` falls back to 2064 x 2208).
+    static func headsetSection(model: String, manufacturer: String) -> JSON {
+        .object([
+            "enable": .bool(true), "serialNumber": .string("OpenVRLink-HMD"),
+            "supports10bit": .bool(true), "supportsEyeTracking": .bool(true),
+            "recommendedRenderWidth": .number("-1"), "recommendedRenderHeight": .number("-1"),
+            "modelNumber": .string(model), "manufacturerName": .string(manufacturer),
+            "trackingSystemName": .string("oculus"), "resourceRoot": .string("vrlink"),
+            "inputProfilePath": .string("{oculus}/input/rift_profile.json"), "controllerType": .string("rift"),
+        ])
+    }
     /// Marks a library that was in use when a newer one took its name.
     static let replacedMark = ".replaced-"
 
@@ -118,10 +139,12 @@ public enum Install {
             "hmd_presence": .array([]),
         ])
         try manifest.text.write(to: driver.appendingPathComponent("driver.vrdrivermanifest"), atomically: true, encoding: .utf8)
-        let defaults = JSON.object([section: .object([
+        var defaults = JSON.object([section: .object([
             "enable": .bool(true), gammaOnKey: .bool(true), gammaValueKey: .of(defaultGamma), gammaAvailableKey: .bool(false),
             statusKey: .string("not loaded"),
         ])])
+        // SteamVR merges default.vrsettings across all active drivers, so driver_vrlink reads these vrlink_<model> sections too.
+        for (model, manufacturer) in headsets { defaults["vrlink_\(model)"] = headsetSection(model: model, manufacturer: manufacturer) }
         try defaults.text.write(to: settings.appendingPathComponent("default.vrsettings"), atomically: true, encoding: .utf8)
         let schema = ownTabSchema(inDriver: driver)
         if ownTab {
