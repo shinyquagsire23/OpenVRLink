@@ -47,15 +47,15 @@ class ValueTransport:
 
     def publish(self, value_id, data, force=False):
         """Set a local value. Unchanged values are not re-sent unless forced
-        (the reference client calls a forced update an event)."""
+        (vrlink calls a forced update an event)."""
         current = self._local.get(value_id)
         if not force and value_id not in self._staged and current and current.data == data:
             return
         self._staged[value_id] = bytes(data)
 
     def republish_all(self):
-        """What the reference client does when the host's instance id (value 2)
-        changes: send every value again under a new version."""
+        """Re-send every local value under a new version when the host's
+        instance id (value 2) changes, matching vrlink."""
         for value_id, outgoing in self._local.items():
             self._staged.setdefault(value_id, outgoing.data)
 

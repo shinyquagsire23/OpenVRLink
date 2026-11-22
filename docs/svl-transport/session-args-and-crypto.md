@@ -131,7 +131,7 @@ Static inspection showed the IV written once at key setup with nothing in
 wire tests below confirmed that every datagram decrypts independently from that
 fixed session IV.
 
-### Mode 2 on the wire (probe and client results, 2026-11-10)
+### Mode 2 on the wire (probe and client results)
 
 Probe and client tests against a SteamVR host with Steam's streaming encryption
 enabled (**captured** by probe; with encryption disabled, the host issues `MID0`

@@ -248,12 +248,12 @@ external dependencies minimal avoids library conflicts. With Swift 6.4.2:
 | Extension handshake | verified on host | verified on host |
 | Encoding gamma | verified on host | verified on host |
 
-Windows and Linux builds have both been tested end-to-end with the macOS viewer:
-Windows 11 running SteamVR 2.19.4 (2026-11-19), and arm64 Ubuntu 24.04 running
-the October 2026 x86-64 Linux SteamVR build under FEX inside the Steam snap. In
-both cases, `driver_openvrlink` loaded into `vrserver`, patched the encode
-shaders on connection, and negotiated encoding gamma with the client. Visual
-quality on an OLED headset still needs evaluation.
+Windows and Linux builds have both been verified end-to-end with the macOS
+viewer: Windows 11 running SteamVR 2.19.4, and arm64 Ubuntu 24.04 running the
+October 2026 x86-64 Linux SteamVR build under FEX inside the Steam snap. In both
+cases, `driver_openvrlink` loaded into `vrserver`, patched the encode shaders on
+connection, and negotiated encoding gamma with the client. Visual quality on an
+OLED headset still needs evaluation.
 
 Because Linux SteamVR is an x86-64 binary even on arm64 hosts,
 `driver_openvrlink.so` must always be built for x86-64. On an arm64 Linux host,

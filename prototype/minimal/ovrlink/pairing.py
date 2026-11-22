@@ -27,7 +27,7 @@ _stream_result = proto.enum("ERemoteDeviceStreamingResult").values_by_number
 AUTH_SUCCESS, AUTH_IN_PROGRESS = 0, 5
 STREAM_SUCCESS, STREAM_UNAUTHORIZED, STREAM_IN_PROGRESS = 0, 1, 5
 
-# How often the reference client repeats a request until it is answered.
+# Request retry intervals used by the Steam Link shell.
 AUTHORIZATION_RESEND_SECONDS = 3
 STREAMING_RESEND_SECONDS = 1
 

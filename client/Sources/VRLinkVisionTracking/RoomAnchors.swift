@@ -13,15 +13,15 @@ import simd
 /// Each room uses its `WorldAnchor` UUID as `Room.id`. World anchors persist across
 /// tracking-origin resets, app launches, and headset reboots.
 ///
-/// In headset testing (2026-11-20), ARKit's reported `WorldAnchor` transforms did not stay
-/// aligned with the coordinate origin returned by `queryDeviceAnchor` for head tracking:
-/// rooms shifted when opening immersive spaces or recentering with the Digital Crown. To
-/// compensate, `RoomAnchors` places a reference marker `WorldAnchor` at the current head
-/// position, where its true tracking-space transform is known. When polling `allAnchors`,
-/// `RoomAnchors` computes the transform from the marker's reported pose to its true pose
-/// and applies that correction to every anchor in the same snapshot. Whenever the tracking
-/// origin may have moved (tracking startup, a >0.5 m head-pose jump, or a recenter), a new
-/// marker is placed and anchor frames return `nil` until the marker resolves.
+/// ARKit's reported `WorldAnchor` transforms do not stay aligned with the coordinate
+/// origin returned by `queryDeviceAnchor` for head tracking: rooms can shift when opening
+/// immersive spaces or recentering with the Digital Crown. To compensate, `RoomAnchors`
+/// places a reference marker `WorldAnchor` at the current head position, where its true
+/// tracking-space transform is known. When polling `allAnchors`, `RoomAnchors` computes
+/// the transform from the marker's reported pose to its true pose and applies that
+/// correction to every anchor in the same snapshot. Whenever the tracking origin may have
+/// moved (tracking startup, a >0.5 m head-pose jump, or a recenter), a new marker is
+/// placed and anchor frames return `nil` until the marker resolves.
 ///
 /// Because ARKit world tracking only runs while an immersive space is open, anchors can
 /// only be queried, added, or removed inside one. Any reported anchor whose UUID is not in

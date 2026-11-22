@@ -78,7 +78,7 @@ public struct ControllerState {
     /// The host extrapolates poses across the full motion-to-photon latency
     /// (`docs/svl-tracking-input/poses.md`). Full linear velocity feels accurate,
     /// whereas full angular velocity overshoots during wrist turns and zero angular
-    /// velocity makes the pointer lag. 0.5 was tuned empirically on headset (2026-11-11).
+    /// velocity makes the pointer lag; 0.5 was tuned empirically on Vision Pro.
     static let spinSent: Float = 0.5
 
     /// Grip pose with scaled angular velocity for host transmission.

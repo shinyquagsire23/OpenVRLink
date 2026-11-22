@@ -193,11 +193,10 @@ timestamps (giving only lower-bound counts), every count here is complete.
   the channel count at `+0x08` to 1). If nothing writes `+0x0c`, `vrlink`'s mic
   packets carry `aux == 0x0000`.
 
-## Client playback test (2026-11-10)
+## Client playback verification
 
-The Swift client (`client`) plays downlink audio as interleaved signed 16-bit
-little-endian stereo PCM at 48 kHz with live audio playing on the host.
-Listening tests confirmed clean output, verifying sample format, byte order,
-channel count, and sample rate beyond static analysis. Under 3% simulated
-packet loss, packets reconstructed from XOR parity (55 packets in 16 s)
-produced no audible glitches.
+OpenVRLink plays downlink audio as interleaved signed 16-bit little-endian
+stereo PCM at 48 kHz with live audio playing on the host. Listening checks
+confirmed clean output, verifying sample format, byte order, channel count, and
+sample rate beyond static analysis. Under 3% simulated packet loss, packets
+reconstructed from XOR parity (55 packets in 16 s) produced no audible glitches.

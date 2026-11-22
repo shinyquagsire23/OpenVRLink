@@ -77,8 +77,8 @@ public enum Scan {
         name: "load-spirv", elfSymbol: "_ZL13LoadSpirvFilePKc",
         elfSignatures: ["55 48 89 F2 31 C0 48 89 E5 41 56 49 89 F6 41 55 48 8D 35 ?? ?? ?? ?? 49 89 FD 31 FF 41 54 53 48 83 EC 20 E8"])
 
-    /// Constant-buffer fill helper in Windows `driver_vrlink.dll` (`0x1809f2870` in the
-    /// 2026-11-13 build): `(this, bool layer, bool flag, uint width, uint height, float *constants)`,
+    /// Constant-buffer fill helper in Windows `driver_vrlink.dll` (`0x1809f2870` in
+    /// SteamVR 2.19.4): `(this, bool layer, bool flag, uint width, uint height, float *constants)`,
     /// called between `Map` and `Unmap` of the constant buffer in the `"vrlink copy views to
     /// atlas"` pass before drawing with `genforencode_ps_copy_view[_cas]`.
     public static let updateConstantsD3D = Target(
@@ -98,7 +98,7 @@ public enum Scan {
     }
 
     /// Patches out the final call in `SVLHMDDriver::Activate` on Windows (`0x1809e9940` in
-    /// the 2026-11-13 build). That call invokes `IVRServerInternal` vtable slot 69 to set a
+    /// SteamVR 2.19.4). That call invokes `IVRServerInternal` vtable slot 69 to set a
     /// flag in `vrserver` that makes `vrcompositor` force
     /// `collisionBounds/CollisionBoundsGroundPerimeterOn` off, since VR Link assumes the
     /// headset draws its own boundary. Replacing the 6-byte call with a NOP lets the SteamVR

@@ -188,7 +188,7 @@ Remaining open questions:
   windowed `cRXpass`, which can be tested by publishing a growing `cRXerr`
   alongside `cRXpass = 100` while monitoring `dTargetBW`.
 
-## Probe results (2026-11-10): the `sRXerr` step
+## Probe results: the `sRXerr` step
 
 Across five 6 s probe sessions spaced 3 s apart starting from a cold host, the
 host's reported `sRXerr` at the end of each session was 0, 999, 1998, 2997, and

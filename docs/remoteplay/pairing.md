@@ -129,10 +129,10 @@ startup all succeeded.
 - Measure the count and interval of `InProgress` responses while the PIN dialog
   is open.
 
-## Probe results (2026-11-10)
+## Probe results
 
-Tested with `python3 -m ovrlink pair` against Steam for Windows (broadcast
-version 8). All **captured by probe**:
+Running `python3 -m ovrlink pair` against Steam for Windows (broadcast version
+8), all **captured by probe**:
 
 - A `StreamingRequest` from the unknown device received
   `StreamingResponse { result: Unauthorized }`.
@@ -149,11 +149,11 @@ version 8). All **captured by probe**:
 - Still open: whether the host inspects `encrypted_request` at all, and the
   count and interval of `InProgress` responses (the probe did not log them).
 
-## Client results (2026-11-10)
+## Client results
 
-The Swift client (`client`, `VRLinkCore/Broadcast.swift`) paired a fresh device
-identity with the same host via PIN and proceeded directly to streaming. Having
-a second independent implementation—built on `swift-crypto` rather than Python's
+OpenVRLink (`VRLinkCore/Broadcast.swift`) paired a fresh device identity with
+the same host via PIN and proceeded directly to streaming. Having a second
+independent implementation—built on `swift-crypto` rather than Python's
 `cryptography`—complete the exchange confirms the key-exchange path, including
 RSA-OAEP with SHA-1 for the escrow ticket. The host accepted an
 `AuthorizationRequest` sent immediately after its `Unauthorized` streaming

@@ -49,12 +49,12 @@ public final class ControllerTracking {
     /// Under the CompositorServices (Metal) renderer, `.rendered` aligns the
     /// host's virtual controller with the physical controller in passthrough,
     /// so we send `.rendered`. Under the RealityKit renderer, `.rendered`
-    /// drifts over time (measured on device on 2026-11-11: starting at 36 mm,
-    /// settling to 6 mm over ~30 s, then creeping back up, especially after
-    /// walking into another room). Because head and hand poses use raw tracking,
-    /// that drift offsets the controllers toward the user's eyes relative to
-    /// their hands. RealityKit therefore disables `.rendered` and applies the
-    /// static settled offset `renderedShiftAtRest` to the raw tracked pose.
+    /// drifts over time (starting around 36 mm, settling to 6 mm over ~30 s,
+    /// and creeping back up after walking into another room). Because head and
+    /// hand poses use raw tracking, that drift offsets the controllers toward
+    /// the user's eyes relative to their hands. RealityKit therefore disables
+    /// `.rendered` and applies the static settled offset `renderedShiftAtRest`
+    /// to the raw tracked pose.
     ///
     /// Configured by each display backend when connecting.
     public var gripsAsRendered: Bool {
@@ -65,10 +65,9 @@ public final class ControllerTracking {
     /// Static local-space offset (in meters along the grip axes) added to the
     /// raw tracked grip pose when `gripsAsRendered` is `false`. Defined for the
     /// right controller; the X component is negated for the left controller.
-    /// Tuned visually on device starting from the settled `.rendered` offset
-    /// measured in that session `(-0.002, 0.008, -0.001)`, shifted 1 cm lower
-    /// in Y. (+X runs from the thumbstick toward the circle button; +2 cm and
-    /// +4 cm shifts along X were tested and aligned worse.)
+    /// Tuned visually on Vision Pro starting from the settled `.rendered` offset
+    /// `(-0.002, 0.008, -0.001)`, shifted 1 cm lower in Y (+X runs from the
+    /// thumbstick toward the circle button).
     private static let renderedShiftAtRest = SIMD3<Float>(-0.002, -0.002, -0.001)
 
     public func start() {

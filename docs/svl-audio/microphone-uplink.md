@@ -81,14 +81,13 @@ timestamps (giving only lower-bound counts), every count here is complete.
   with a working microphone takes the type-0x0c, flush-every-callback path
   described above (**static**).
 
-## Client uplink test (2026-11-10)
+## Client uplink verification
 
-Tested with `client` on macOS sending a generated 440 Hz sine wave (amplitude
-12000) as microphone audio while recording three seconds from the host's
-default recording device, which SteamVR sets to "Steam Streaming Microphone"
-for the session (**captured** / **measured**):
+Sending a generated 440 Hz sine wave (amplitude 12000) from OpenVRLink on macOS
+as microphone audio while recording three seconds from the host's default
+recording device ("Steam Streaming Microphone", **captured** / **measured**):
 
-- `client` sent packets as class `0x0c`, type `0x10`, format word `0x4b00`
+- OpenVRLink sent packets as class `0x0c`, type `0x10`, format word `0x4b00`
   (48 kHz mono), with up to 1024 bytes of mono 16-bit samples per packet, two
   data packets followed by their XOR parity with the shorter length in the
   index field, one packet per datagram, starting after the first video packet

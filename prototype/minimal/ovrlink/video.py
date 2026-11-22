@@ -19,7 +19,7 @@ TYPE_DESCRIPTOR = 2
 TYPE_PACKET = 3
 PACKET_SIZE = 1024
 FIRST_PARITY_ID = 0x800
-SLOTS = 16  # the reference client keeps frames in slots indexed by frame_id & 0xf
+SLOTS = 16  # vrlink stores in-flight frames in 16 slots indexed by frame_id & 0xf
 
 
 @dataclass

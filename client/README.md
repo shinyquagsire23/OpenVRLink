@@ -13,6 +13,19 @@ swift run -c release OpenVRLink [host address]
 With no address it looks for Steam hosts on the local network. Drag to look around, W A S D to move, X to swap eyes, 
 space for the pretend controller's trigger. Pass `--boundary` to send a test room boundary to the host a few seconds after connecting.
 
+macOS OpenXR client (requires an OpenXR runtime such as [OXRSys](https://github.com/demonixis/oxrsys); set `XR_RUNTIME_JSON` to override the active runtime):
+
+```
+swift run -c release OpenVRLinkXR [host address] [--wivrn] [--pictures <folder>]
+```
+
+Android XR app (see `android/build.sh` for toolchain and SDK requirements):
+
+```
+cd android && ./build.sh             # build the APK
+cd android && ./build.sh --install   # build and install via adb
+```
+
 visionOS app (Xcode with the visionOS 26 SDK or later). The headset needs to be already paired with the Mac for development:
 
 ```
@@ -49,7 +62,14 @@ Everything compiles into one Swift package.
 | `VRLinkVisionCompositor` | visionOS: the stream in a compositor layer | CompositorServices |
 | `VRLinkVisionRooms` | visionOS: Room Setup and room selection for streaming sessions | ARKit, RealityKit |
 | `VRLinkVisionExperiments` | visionOS: the RealityKit renderer, Persona face and eye tracking, their calibrations | RealityKit |
+| `VRLinkOpenXR` | OpenXR session, frame loop, head/hand/controller tracking, and haptics | OpenXR (`COpenXR` headers, runtime loaded dynamically) |
+| `VRLinkOpenXRMetal` | Metal graphics backend for OpenXR | Metal |
+| `VRLinkMediaCodec` | Android video decoding into hardware buffers | MediaCodec (`CAndroidNDK`) |
+| `VRLinkVulkan` | Vulkan graphics backend for OpenXR on Android | Vulkan |
+| `VRLinkAndroidAudio` | Android audio playback | AAudio |
 | `OpenVRLink` | the macOS viewer | AppKit, MetalKit |
+| `OpenVRLinkXR` | macOS OpenXR client executable | |
+| `OpenVRLinkAndroid`, `android/` | Android XR `NativeActivity` library and APK build scripts | NDK |
 | `visionOS/` | the visionOS app: scenes, wiring, settings views | SwiftUI |
 
 ## On the PC

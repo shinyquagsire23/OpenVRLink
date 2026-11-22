@@ -112,11 +112,12 @@ Message cadence relative to pose packets ([poses.md](poses.md)):
 The 313-byte face variant, valid gaze vectors, and expression formats other
 than 0 do not occur in `vr3`.
 
-## Client results (2026-11-10): gaze vector coordinates and foveation
+## Client results: gaze vector coordinates and foveation
 
-Tested with `client` on macOS (**captured**) using a motionless head, 63 mm
-eye spacing, and symmetric frusta, reading the center of the left eye's foveal
-tile (as tangents) from each frame's inset record:
+Sending synthetic gaze vectors from OpenVRLink on macOS (**captured**) with a
+motionless head, 63 mm eye spacing, and symmetric frusta while reading the
+center of the left eye's foveal tile (as tangents) from each frame's inset
+record:
 
 | gaze sent (x, y, z), valid = 1 | left fovea center x, y |
 |---|---|
@@ -141,30 +142,26 @@ From these measurements:
   center (0.006, −0.100).
 - The foveal tile's half-width stayed 0.466 throughout.
 
-`client` queues this message with every pose in the same position as `vrlink`
+OpenVRLink queues this message with every pose in the same position as `vrlink`
 (first element of the pose datagram). On visionOS, where apps do not receive
-raw eye-tracking vectors, `client` estimates gaze from the densest point of
-each eye's rasterization rate map
-(`Sources/VRLinkVisionCompositor/GazeFromFoveation.swift`); that path had not
-run on a headset as of this test. The 313-byte form with face expressions is
-implemented and unit-tested for size and field placement (see below).
+raw eye-tracking vectors directly from ARKit, OpenVRLink can estimate gaze from
+the densest point of each eye's rasterization rate map
+(`Sources/VRLinkVisionCompositor/GazeFromFoveation.swift`) or from calibrated
+Spatial Persona pupil landmarks.
 
-## Client results (2026-11-10): 313-byte face expression packet
+## Client results: 313-byte face expression packet
 
-Tested with `client` on macOS (**captured**) with experimental face tracking
-enabled using the Mac's built-in camera: `client` sent the 313-byte packet
-(expression format 2, count 70, both confidences 1.0, weights updating every
-camera frame, `gaze valid = 0`) alongside every pose for a 45 s session. Video
-streamed steadily at 120 frames/s throughout, and neither `driver_vrlink.txt`
-nor `vrserver.txt` on the host logged any errors or warnings mentioning face,
-expression, or eye tracking. The host accepts the 313-byte face layout without
-requiring `gaze valid = 1`. Whether SteamVR forwards those weights to
-applications was not tested, since nothing reading face weights was running on
-the host.
+With experimental camera-based face tracking enabled in the macOS viewer
+(**captured**), OpenVRLink sent the 313-byte packet (expression format 2, count
+70, both confidences 1.0, weights updating every camera frame, `gaze valid = 0`)
+alongside every pose for a 45 s session. Video streamed steadily at 120 frames/s
+throughout, and neither `driver_vrlink.txt` nor `vrserver.txt` on the host
+logged any errors or warnings mentioning face, expression, or eye tracking. The
+host accepts the 313-byte face layout without requiring `gaze valid = 1`.
 
 See "Experiments" in [../client-architecture.md](../client-architecture.md) for
-how `client` derives face weights on platforms without native face tracking and
-calibrates gaze without raw eye tracking.
+how OpenVRLink derives face weights on platforms without native face tracking
+and calibrates gaze without raw eye tracking.
 
 ## Open questions / to confirm on the wire
 

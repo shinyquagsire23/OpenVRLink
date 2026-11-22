@@ -349,7 +349,7 @@ that clean sessions have no periodic IDRs. Remaining open questions:
    sees the next frame, given that each P frame references the immediately
    preceding frame ([retransmit.md](retransmit.md)).
 
-## Codec support (checked 2026-11-10)
+## Codec support
 
 - Across two `vrlink` builds (**static**)—2.0.20.1812 (analyzed throughout
   these docs) and 2.0.25.2532 (bundled inside the host SteamVR beta)—
@@ -365,19 +365,19 @@ that clean sessions have no periodic IDRs. Remaining open questions:
   the host encoder and headset decoder; its documentation states that it adds
   no codec negotiation. This indicates that the SVL packet framing is
   codec-agnostic, though we have not verified the mod directly.
-- Rather than assuming HEVC, this repo's `client` inspects each keyframe to
-  detect the codec (`VRLinkCore/Bitstream.swift`). HEVC and H.264 are supported
-  (H.264 has been tested only against a synthetic `ffmpeg` stream, never a live
-  host). AV1 is also wired to VideoToolbox using the sequence-header parser
-  from the ALVR visionOS client to construct the format description; that
-  parser is tested against an `ffmpeg`-generated keyframe, though end-to-end
-  AV1 hardware decoding has not run yet because the development Mac lacks AV1
-  decode hardware. Loss recovery uses the same multi-codec keyframe check
-  instead of scanning specifically for HEVC parameter sets.
-- `client` checks the descriptor's `fec_mode` (`0x20` in every capture) and
+- Rather than assuming HEVC, OpenVRLink inspects each keyframe to detect the
+  codec (`VRLinkCore/Bitstream.swift`). HEVC and H.264 are supported (H.264 has
+  been verified only against a synthetic `ffmpeg` stream, never a live host).
+  AV1 is also wired to VideoToolbox using the sequence-header parser from the
+  ALVR visionOS client to construct the format description; that parser is
+  unit-tested against an `ffmpeg`-generated keyframe, though end-to-end AV1
+  hardware decoding has not run on macOS hardware lacking AV1 decode support.
+  Loss recovery uses the same multi-codec keyframe check instead of scanning
+  specifically for HEVC parameter sets.
+- OpenVRLink checks the descriptor's `fec_mode` (`0x20` in every capture) and
   logs once if a different value appears.
 
-## Broken chroma from a Linux Vulkan Video host (2026-11-10)
+## Broken chroma from a Linux Vulkan Video host
 
 A stream **captured** by the probe from a Linux host (SteamVR beta on an ARM
 machine with an NVIDIA GB10, running Steam under an x86 translation layer; host

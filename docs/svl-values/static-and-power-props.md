@@ -115,7 +115,7 @@ exists in the file but the code path that would select it was not found — the
 missing-key path builds the hard-coded generic set instead (**static**).
 
 How the host maps these strings onto SteamVR driver properties is mostly
-host-side (see [Host handling of controller strings (2026-11-10)](#host-handling-of-controller-strings-2026-11-10)
+host-side (see [Host handling of controller strings](#host-handling-of-controller-strings)
 below for what `vrserver.txt` revealed); the safest default for an
 interoperable client is to reuse one of the shipped sets verbatim.
 
@@ -191,19 +191,19 @@ controllers'.
    set?
 3. What does `ubDriverType != 0` select on the host?
 
-## Reporting battery levels from our client (2026-11-11)
+## Reporting battery levels from OpenVRLink
 
-`client/` sends the headset's power flags the same way `vrlink` does (`0x1b`,
+OpenVRLink sends the headset's power flags the same way `vrlink` does (`0x1b`,
 or `0x1f` when charging) along with the reported battery level, updating
 whenever the level changes by at least 1%. For controllers whose battery status
-the platform reports, `client/` sends those same flag sets (`0x1b` / `0x1f`)
+the platform reports, OpenVRLink sends those same flag sets (`0x1b` / `0x1f`)
 and the reported level, whereas `vrlink` always sends `0x1a` and `0.0`.
 Treating flag bit 0 as "provides a battery level" is **inferred** from `vrlink`
 setting it on the headset and clearing it on controllers. Whether SteamVR
 displays either battery reading in its UI has not yet been verified on the
 host.
 
-## Host handling of controller strings (2026-11-10)
+## Host handling of controller strings
 
 The results below were **captured** from the host's `vrserver.txt` (which logs
 each string as `driver_vrlink` creates the device) across three cold starts
@@ -252,9 +252,8 @@ model strings at all.
 For an unrecognized model, `driver_vrlink` reads the `vrlink_<model>` settings
 section (using the exact model string sent by the headset) via `IVRSettings`.
 Because it queries `IVRSettings`, default sections shipped in another driver's
-`default.vrsettings` apply just like entries in `steamvr.vrsettings` (**live**,
-2026-11-20: verified with a section in an external driver's
-`default.vrsettings`).
+`default.vrsettings` apply just like entries in `steamvr.vrsettings` (**live**:
+verified with a section in an external driver's `default.vrsettings`).
 
 | key | type | default | behavior |
 |---|---|---|---|

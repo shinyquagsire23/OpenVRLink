@@ -171,10 +171,10 @@ in 1,020 of 1,637 packets), no hand-tracked hands, and no set button, touch, or
 axis bits (**captured** negatives). The index table above therefore remains
 **static** only in `vr3`.
 
-## Client results (2026-11-10)
+## Client results
 
-Tested with `client` (the macOS viewer sending synthetic hands against a
-SteamVR host speaking protocol version 14, **captured**):
+Sending synthetic hands from the OpenVRLink macOS viewer against a SteamVR host
+speaking protocol version 14 (**captured**):
 
 - Publishing no controller values at startup and then, on the first pose
   packet, publishing 0x0e/0x0f (the Touch strings) and 0x11/0x12 while sending
@@ -192,25 +192,24 @@ SteamVR host speaking protocol version 14, **captured**):
 - Leaving a hand absent (tracking result 1 / state 0 with the rest of the pose
   zeroed) causes the host to draw nothing for that hand.
 
-In the first headset test on Vision Pro with PS VR2 Sense controllers and bare
-hands (reported by the user), controllers appeared and tracked physical
-movement but swam because poses were sent unpredicted. Tracked hands appeared
-and mostly lined up with the user's hands, though pinching had no effect in
-SteamVR and a hand vanished when partly closed (a `client` bug that dropped the
-hand whenever any single joint was occluded). Whether the pinch gesture reaches
-the host as a button press remains open.
+In an early Vision Pro run with PS VR2 Sense controllers and bare hands,
+controllers appeared and tracked physical movement but swam when poses were
+sent unpredicted. Tracked hands appeared and mostly lined up with the user's
+hands, though pinching had no effect in SteamVR and a hand vanished when partly
+closed (due to an early bug that dropped the hand whenever any single joint was
+occluded). Whether the pinch gesture reaches the host as a button press is
+resolved in [skeleton.md](skeleton.md).
 
-This initial test did not exercise button presses, analog axes, active
-gestures, haptics, or articulated hand skeletons (the synthetic macOS hand is
-flat).
+That initial run did not exercise button presses, analog axes, active gestures,
+haptics, or articulated hand skeletons (the synthetic macOS hand is flat).
 
-## Client results (2026-11-10): button bit verification
+## Client results: button bit verification
 
-Tested with `client` on macOS (**captured**) by holding one control at a time
-on two synthetic Touch controllers and checking whether the corresponding part
-of SteamVR's rendered controller model moved (measured by differencing
-screenshots of the button region against an idle baseline; regions of the
-controller body away from the buttons changed by 0 pixels in every case):
+Holding one control at a time on two synthetic Touch controllers in the macOS
+viewer (**captured**) and checking whether the corresponding part of SteamVR's
+rendered controller model moved (measured by differencing screenshots of the
+button region against an idle baseline; regions of the controller body away
+from the buttons changed by 0 pixels in every case):
 
 | held | bit sent | left model | right model |
 |---|---|---|---|
@@ -222,7 +221,7 @@ controller body away from the buttons changed by 0 pixels in every case):
 Click bits 0, 1, and 3 match the action table above for both hands, and bit 2
 applies to the left hand only, matching `vrlink`'s configuration. On a headset,
 trigger and grip (axis bytes 0 and 3) also animate the corresponding parts on
-the controller model (reported by the user).
+the controller model.
 
 ## Open questions / to confirm on the wire
 

@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- This Source Code Form is subject to the terms of the Mozilla Public
+     License, v. 2.0. If a copy of the MPL was not distributed with this
+     file, You can obtain one at https://mozilla.org/MPL/2.0/. -->
+
+<!-- Android XR manifest for OpenVRLink. Android's built-in NativeActivity loads libOpenVRLinkAndroid.so
+     (Sources/OpenVRLinkAndroid) without custom Java or Kotlin code. build.sh substitutes @PACKAGE@,
+     @VERSION@, @BUILD@, and @MIN_SDK@ at build time. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="@PACKAGE@"
+    android:versionCode="@BUILD@"
+    android:versionName="@VERSION@">
+
+    <uses-sdk android:minSdkVersion="@MIN_SDK@" android:targetSdkVersion="34" />
+
+    <!-- Requires OpenXR 1.0 and Vulkan 1.1. -->
+    <uses-feature android:name="android.software.xr.api.openxr" android:version="0x00010000" android:required="true" />
+    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x00401000" android:required="true" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Required for hand tracking on Android XR. Because runtime permission prompts are not requested via
+         JNI yet, grant it manually with: adb shell pm grant @PACKAGE@ android.permission.HAND_TRACKING -->
+    <uses-permission android:name="android.permission.HAND_TRACKING" />
+
+    <!-- Permissions and package-visibility queries required by the Khronos OpenXR Android loader. -->
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR" />
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR_SYSTEM" />
+    <queries>
+        <provider android:authorities="org.khronos.openxr.runtime_broker;org.khronos.openxr.system_runtime_broker" />
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRRuntimeService" />
+        </intent>
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRApiLayerService" />
+        </intent>
+    </queries>
+
+    <application android:label="OpenVRLink" android:hasCode="false" android:extractNativeLibs="true">
+        <activity android:name="android.app.NativeActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="landscape"
+            android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|uiMode">
+            <meta-data android:name="android.app.lib_name" android:value="OpenVRLinkAndroid" />
+            <!-- Launch directly into unmanaged full-space OpenXR rendering rather than 2D system panels. -->
+            <property android:name="android.window.PROPERTY_XR_ACTIVITY_START_MODE"
+                android:value="XR_ACTIVITY_START_MODE_FULL_SPACE_UNMANAGED" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

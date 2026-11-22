@@ -304,7 +304,7 @@ inset record matches the rendered pixels. Open questions following `vr3`
    decoded image confirms the host renders the two eyes from separated
    positions.
 
-## Probe results (2026-11-10)
+## Probe results
 
 Decoding a frame from the probe's saved stream with `ffmpeg` shows the SteamVR
 dashboard stacked four times down the `1536x6144` atlas: a magnified central
@@ -314,7 +314,7 @@ with a stationary head viewing a distant dashboard had too little disparity on
 its own to distinguish which eye came first without the cross-correlation
 check above.
 
-## Client results (2026-11-10): asymmetric frusta on a headset
+## Client results: asymmetric frusta on a headset
 
 The visionOS client published each eye's physical frustum from an Apple Vision
 Pro—left eye tangents left `-1.73`, right `1.00`, down `-1.19`, up `1.00` (with
@@ -326,29 +326,29 @@ that the tile order (left fovea, left base, right fovea, right base) holds on a
 stereo headset, and that the foveal FOV formulas hold for an asymmetric base
 frustum (open question 5 above).
 
-## Client results (2026-11-10): rotated eye poses
+## Client results: rotated eye poses
 
-Testing `client` on macOS against a SteamVR host (**captured**) shows that the
-host honors the rotation component of `VTE_EYE_TO_HEAD` (`0x08`). Across two
-sessions with the same stationary head pose and identical frustum tangents, the
-left eye was published once facing straight ahead and once rotated 15 degrees
-to the left. `client` places each base tile by composing the eye's published
-head-relative pose onto the frame's render pose. In the rotated session, world
-geometry remained stationary while the tile's outline rotated 15 degrees with
-the eye, proving the host rendered through the rotated eye pose; if the host
-had ignored eye rotation, the scene would have shifted by 15 degrees along with
-the tile.
+Running OpenVRLink on macOS against a SteamVR host (**captured**) shows that
+the host honors the rotation component of `VTE_EYE_TO_HEAD` (`0x08`). Across
+two sessions with the same stationary head pose and identical frustum tangents,
+the left eye was published once facing straight ahead and once rotated 15
+degrees to the left. OpenVRLink places each base tile by composing the eye's
+published head-relative pose onto the frame's render pose. In the rotated
+session, world geometry remained stationary while the tile's outline rotated 15
+degrees with the eye, proving the host rendered through the rotated eye pose;
+if the host had ignored eye rotation, the scene would have shifted by 15
+degrees along with the tile.
 
 In principle, a headset with canted displays can publish each eye's physical
 orientation along with frustum tangents measured around that eye's axes,
-placing the tiles with the matching orientation. (The earlier headset test
-published identity rotations with frusta measured around canted axes, which is
-internally self-consistent—the host rendered a forward-aimed cone and the
-client displayed it straight ahead—but under-samples the outer display margin.)
+placing the tiles with the matching orientation. (Publishing identity rotations
+with frusta measured around canted axes is internally self-consistent—the host
+renders a forward-aimed cone and the client displays it straight ahead—but
+under-samples the outer display margin.)
 
-## Client results (2026-11-10): asymmetric frusta and eye spacing, measured
+## Client results: asymmetric frusta and eye spacing, measured
 
-To verify frustum and IPD handling quantitatively (**captured** with `client`
+To verify frustum and IPD handling quantitatively (**captured** with OpenVRLink
 on macOS), we measured the pixel centroid of a controller model rendered by
 SteamVR Home at a fixed pose roughly 0.5 m in front of a stationary head,
 projected into an 1800-pixel window spanning tangents `-1..1`:
@@ -366,24 +366,24 @@ matching tangents) and honors the published eye spacing (shifting the left eye
 31.5 mm further left moves the controller by 56 pixels, or `0.063` in tangent
 space, matching 31.5 mm at 0.50 m depth).
 
-## Headset result (2026-11-10): canted displays and parallel projection
+## Headset result: canted displays and parallel projection
 
-When `client` published the Vision Pro's physical eye rotations (each display
-canted roughly 0.5 degrees outward and 1.2 degrees upward), the user saw
-game-rendered hands sit further away than their physical hands, with the depth
-error increasing with distance. Local debug markers drawn by `client` at the
-same tracked coordinates aligned directly with the user's physical hands,
-confirming that tracking and local display composition were accurate while the
-streamed video had wrong stereo convergence. In SteamVR's empty construct
-scene, the hands aligned much more closely.
+When OpenVRLink published the Vision Pro's physical eye rotations (each display
+canted roughly 0.5 degrees outward and 1.2 degrees upward), game-rendered hands
+appeared further away than physical hands, with the depth error increasing with
+distance. Local debug markers drawn by OpenVRLink at the same tracked
+coordinates aligned directly with physical hands, confirming that tracking and
+local display composition were accurate while the streamed video had wrong
+stereo convergence. In SteamVR's empty construct scene, the hands aligned much
+more closely.
 
 **inferred**: Although SteamVR and the `vrlink` host driver honor
 `VTE_EYE_TO_HEAD` rotations (as measured above), many VR titles render assuming
 parallel eye views—the same issue seen on other canted headsets, where SteamVR
 works around it via "parallel projection". Losing 1 degree of convergence
-pushes a hand at 0.5 m roughly 20% further away. `client` now publishes
+pushes a hand at 0.5 m roughly 20% further away. OpenVRLink therefore publishes
 parallel forward-facing eyes with each frustum widened to enclose the canted
 display's FOV (`Frustum.enclosing`), then renders the received image through
-the physical canted views. With parallel eyes published, the user confirmed
-that stereo depth looks natural and virtual hands align with physical hands in
-the same game, both on a fresh SteamVR launch and on reconnect.
+the physical canted views. With parallel eyes published, stereo depth looks
+natural and virtual hands align with physical hands both on a fresh SteamVR
+launch and on reconnect.

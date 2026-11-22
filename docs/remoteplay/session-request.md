@@ -100,7 +100,7 @@ string.
 | field | meaning |
 |---|---|
 | 0 | host IP address (prepended by the client in step 3) |
-| 1, 2 | UDP port (`10400` in both fields in earlier captures). SteamVR 2.19.4 (2026-11-19, **observed** with streaming encryption enabled) returns `~0~10400~0,0,0~~~~AES0…` while binding its `vrlink` UDP socket to port 10400, so field 2 is the host port to connect to and field 1 can be `0`. The purpose of field 1 is unknown |
+| 1, 2 | UDP port (`10400` in both fields in mode-1 captures). SteamVR 2.19.4 (**observed** with streaming encryption enabled) returns `~0~10400~0,0,0~~~~AES0…` while binding its `vrlink` UDP socket to port 10400, so field 2 is the host port to connect to and field 1 can be `0`. The purpose of field 1 is unknown |
 | 3 | `sStartInfo`, three comma-separated integers. `0,0,0` in this project's captures, `0,0,1` in an older Klepton log. Meaning unknown |
 | 4–6 | empty |
 | 7 | transport key: a four-character prefix (`MID0`) followed by 44 characters of URL-safe base64 encoding 32 bytes. See [../svl-transport/](../svl-transport/) |
@@ -127,7 +127,7 @@ message when it receives an `InProgress` response with a stale `request_id`.
 - How long after `Success` the host waits for the initial SVL packet before
   expiring the session.
 
-## Probe results (2026-11-10)
+## Probe results
 
 Running `python3 -m ovrlink session` and `stream` using the probe's own pairing
 key confirmed steps 1–3 of `StreamingResponse` handling: decryption yielded a

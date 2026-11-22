@@ -168,7 +168,7 @@ host sends 0x21 within 3 ms of receiving 0x20 without waiting for static props.
    of the XR context and is referenced only from vtables; nothing in
    `libvrlink_scene.so` calls it (**static**). Stream dimensions come from the
    host's own settings; see
-   [Stream and render resolution from host logs (2026-11-11)](#stream-and-render-resolution-from-host-logs-2026-11-11)
+   [Stream and render resolution from host logs](#stream-and-render-resolution-from-host-logs)
    below.
 5. What is the host doing between 42 ms and 926 ms? Measuring 0.23–0.30 s to
    the first frame on a warm host versus 1.25 s on a cold host suggests most of
@@ -178,7 +178,7 @@ host sends 0x21 within 3 ms of receiving 0x20 without waiting for static props.
    QoS), 0x27, and 0x2b—have any effect on a client that ignores them? The
    probe ignores 0x29 and 0x27 and still receives video.
 
-## Probe results (2026-11-10)
+## Probe results
 
 The Python probe (`prototype/minimal/ovrlink/client.py`) published the §3
 baseline set as a stationary headset with no controllers and received video:
@@ -349,24 +349,24 @@ and monitor the host's frame cadence and `encResets`.
   **Inferred**: the host opens its audio stream at startup, detects silence,
   and stops sending after about ten seconds.
 
-### Refresh-rate selection on a cold host (2026-11-10)
+### Refresh-rate selection on a cold host
 
-The Swift viewer on a 120 Hz display offered 120 Hz as its sole refresh rate to
-a cold host. The host requested 120.0 Hz and delivered 119–120 complete frames
-per second (**captured by client**). Combined with the probe's 90 Hz runs, this
-confirms that the host selects its refresh rate from the client's 0x20 list
-when creating the HMD device.
+The OpenVRLink macOS viewer on a 120 Hz display offered 120 Hz as its sole
+refresh rate to a cold host. The host requested 120.0 Hz and delivered 119–120
+complete frames per second (**captured by client**). Combined with the probe's
+90 Hz runs, this confirms that the host selects its refresh rate from the
+client's 0x20 list when creating the HMD device.
 
 This also explains the `vr3` rate discrepancy (120 Hz agreed, 108.3 fps
 delivered to `vrlink` under Klepton): a client whose frame loop sustains the
 agreed rate receives frames at that rate, whereas `vrlink`'s loop in `vr3` was
 running at 108.3 Hz.
 
-## Stream and render resolution from host logs (2026-11-11)
+## Stream and render resolution from host logs
 
 The table below is **captured** from the host's `vrserver.txt` and
-`steamvr.vrsettings` across three sessions on 2026-11-11 (inspecting logs and
-settings files only, not host binaries):
+`steamvr.vrsettings` across three sessions (inspecting logs and settings files
+only, not host binaries):
 
 | client | identity published | frusta published | host log |
 |---|---|---|---|

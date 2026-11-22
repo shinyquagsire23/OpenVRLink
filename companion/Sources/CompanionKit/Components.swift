@@ -234,7 +234,7 @@ public struct Setup {
 
     /// Per-eye encoded stream width in pixels (`driver_vrlink/streamFormatWidth`) applied by
     /// the High-PPD option. SteamVR's UI slider stops well below this value; 3200 is the
-    /// maximum width observed working on a Windows host streaming to an Apple Vision Pro (2026-11-20).
+    /// maximum width observed working on a Windows host streaming to an Apple Vision Pro.
     public static let highStreamWidth = 3200
     static let vrlinkSection = "driver_vrlink", widthKey = "streamFormatWidth", automaticWidthKey = "automaticStreamFormatWidth"
 

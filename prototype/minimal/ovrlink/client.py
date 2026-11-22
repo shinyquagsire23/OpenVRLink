@@ -5,10 +5,9 @@
 """A minimal SVL client: enough to make a host send video, and to save it.
 
 It presents a motionless head with no controllers, publishes the startup
-values the reference client publishes, acks what the host sends, and writes
-completed frames out as an HEVC elementary stream. Every behavior here is a
-candidate for "change it and see what the host does"; docs/ records the
-answers.
+values vrlink publishes, acks what the host sends, and writes completed frames
+out as an HEVC elementary stream. Every behavior here is a candidate for
+"change it and see what the host does"; docs/ records the answers.
 """
 import random
 import socket
@@ -29,7 +28,7 @@ TYPE_FRAME_REPORT = 0x0F
 
 POSE_BLOCK = 0x168          # fixed part of the pose message; value transport follows
 VTS_BUDGET = 0x174
-POSES_PER_FRAME = 4         # the reference client sends sub-indices 0..3 each frame
+POSES_PER_FRAME = 4         # vrlink sends sub-indices 0..3 each frame
 HEAD_HEIGHT_METERS = 1.6
 
 
@@ -233,9 +232,9 @@ class Client:
                     self.log(f"host message: {element.value[4:].decode(errors='replace')}")
 
     def close(self):
-        """Tell the host the session is over, the way the reference client's
-        scene destructor does: sequence 0xffff, one empty class-3 type-0x13
-        message, five times 100 ms apart (docs/svl-transport/connection-lifecycle.md)."""
+        """Send the session teardown packet matching vrlink's scene destructor:
+        sequence 0xffff, one empty class-3 type-0x13 message, sent five times
+        100 ms apart (docs/svl-transport/connection-lifecycle.md)."""
         goodbye = self.link.pack(0xFFFF, [svl.Element(CLASS_STREAM, 0x13, 0, 0, b"")])
         for _ in range(5):
             self.sock.send(goodbye)

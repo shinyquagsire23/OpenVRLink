@@ -438,9 +438,8 @@ public final class WiVRnSession: StreamingSession {
         let last = head
         lock.unlock()
         // Extrapolate poses using linear and angular velocity, matching SteamVR's
-        // host-side prediction. (Querying ARKit directly at the future timestamp
-        // was tested on-device on 2026-11-14 and produced similar overshoot on
-        // small controller movements.)
+        // host-side prediction. Querying ARKit directly at the future timestamp
+        // produces similar overshoot on small controller movements.
         let ahead = Float(prediction) / 1e9
         let head = (headProvider?() ?? last).predicted(seconds: ahead)
         let resolved = handResolver.resolve(handsProvider?() ?? [], head: head.pose, seconds: Double(time) / 1e9)

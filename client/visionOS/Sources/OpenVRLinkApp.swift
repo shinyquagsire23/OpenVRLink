@@ -396,8 +396,7 @@ struct EntryView: View {
                 return
             }
             // visionOS has undocumented timing requirements between the RealityKit scene, the app
-            // window, and the Spatial Persona camera. Headset testing (2026-11-20) showed the
-            // following behavior across different startup orders:
+            // window, and the Spatial Persona camera across different startup orders:
             //  - Dismissing the window when the space opened and starting the camera once the scene
             //    was ready worked when scene setup was quick (apart from occasional silent starts),
             //    but produced no frames when scene setup was slow because the window closed before

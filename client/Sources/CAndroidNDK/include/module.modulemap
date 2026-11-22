@@ -1,0 +1,4 @@
+module CAndroidNDK {
+    header "CAndroidNDK.h"
+    export *
+}

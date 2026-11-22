@@ -5,10 +5,9 @@ host. Its wire protocol is open source; everything documented here was read from
 the WiVRn **26.9** source tree (`common/wivrn_packets.h`,
 `wivrn_serialization.h`, `wivrn_sockets.cpp`,
 `server/driver/wivrn_connection.cpp`, tagged **source**) or verified against a
-live 26.9 host on 2026-11-13 (tagged **measured**). Because WiVRn is licensed
-under GPL-3, this repository contains no WiVRn code—only this wire-protocol
-description and a clean-room Swift implementation in
-`client/Sources/VRLinkCore/WiVRn/`.
+live 26.9 host (tagged **measured**). Because WiVRn is licensed under GPL-3,
+this repository contains no WiVRn code—only this wire-protocol description and
+a clean-room Swift implementation in `client/Sources/VRLinkCore/WiVRn/`.
 
 Encryption, PIN pairing (the host must currently be started with
 `--no-encrypt`), and querying the host's application list are not implemented
@@ -87,8 +86,8 @@ total bitrate, a host with NVENC selected 10-bit HEVC for both eyes at
 
 If the requested encoded pixel rate exceeds hardware encoder capacity, the host
 reports no error and simply delivers fewer frames per second. Throughput on an
-NVIDIA GB10 (NVENC, two HEVC streams, 120 Hz requested; **measured** 2026-11-13,
-identical for 8-bit and 10-bit):
+NVIDIA GB10 (NVENC, two HEVC streams, 120 Hz requested; **measured**, identical
+for 8-bit and 10-bit):
 
 | per-eye encoded resolution | frames/s | megapixels/s, both eyes |
 |---|---|---|
@@ -150,9 +149,9 @@ A 2048 x 2048 render target compressed into 1536 x 1536 used five bands per axis
 with no visible seams.
 
 Foveation bands can change mid-stream and do not need to match between eyes: in
-one capture without eye gaze (**measured**, 2026-11-14), one eye used 11
-horizontal bands while the other used 17. Zero-pixel bands are omitted, so the
-two eyes can produce different quad counts.
+one capture without eye gaze (**measured**), one eye used 11 horizontal bands
+while the other used 17. Zero-pixel bands are omitted, so the two eyes can
+produce different quad counts.
 
 ### Alpha passthrough (**source**; **measured** with WayVR see-through mode)
 
@@ -181,15 +180,14 @@ timestamp, the target pose timestamp, the head pose with world-space velocities,
 and per-eye head-relative poses and frusta (allowing eye geometry to update
 mid-stream).
 
-This client extrapolates the latest known head pose forward using its velocities
+OpenVRLink extrapolates the latest known head pose forward using its velocities
 (`TrackedPose.predicted`); platforms whose tracking API supports querying a
 future timestamp directly should do so instead. Controller poses are
 extrapolated the same way, but using half of their angular velocity
 (`ControllerState.spinSent`, matching the scale used for Steam hosts) and
 reporting that halved angular velocity to the host. Using the full angular
-velocity caused small controller motions to overshoot noticeably on the headset
-(2026-11-14), and querying ARKit at the future timestamp showed the same
-overshoot.
+velocity caused small controller motions to overshoot noticeably on Vision Pro,
+and querying ARKit at the future timestamp showed the same overshoot.
 
 ### Controllers and hand input (**source**; poses **measured**, button inputs and haptics unverified)
 

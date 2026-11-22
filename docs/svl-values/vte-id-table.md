@@ -99,7 +99,7 @@ reads them:
 A compatible client must parse and ack these ids. Their meanings are unknown
 apart from 0x35 (see below).
 
-### Host values during application launch (**captured**, 2026-11-11)
+### Host values during application launch (**captured**)
 
 Two sessions were recorded with the Swift client logging every host VTS value
 and unhandled message whenever payload bytes changed (`OPENVRLINK_LOG_HOST=1`):
@@ -199,20 +199,19 @@ limit the number of walls.
 
 OpenVRLink sends one wall per edge of the room's boundary in the same corner
 order, setting `play_area` to the largest origin-centered axis-aligned
-rectangle that fits inside (`PlaySpace.chaperone`). In a **live** test
-(2026-11-20, macOS viewer with `--boundary` against SteamVR 2.19.4 on Windows),
-publishing a six-wall boundary mid-session with a new `universeID`—followed by
-a four-wall boundary eight seconds later with another `universeID`—updated
-SteamVR immediately both times. `vrserver.txt` logged `UpdateChaperone got new
-universe (len 792)`, `Configuring VRLINK Chaperone Prop container`, `Found
-universe 1795199424 in chaperone file`, and broadcast
-`ChaperoneUniverseHasChanged` to other drivers on each update.
+rectangle that fits inside (`PlaySpace.chaperone`). In a **live** session
+(macOS viewer with `--boundary` against SteamVR 2.19.4 on Windows), publishing
+a six-wall boundary mid-session with a new `universeID`—followed by a four-wall
+boundary eight seconds later with another `universeID`—updated SteamVR
+immediately both times. `vrserver.txt` logged `UpdateChaperone got new universe
+(len 792)`, `Configuring VRLINK Chaperone Prop container`, `Found universe
+1795199424 in chaperone file`, and broadcast `ChaperoneUniverseHasChanged` to
+other drivers on each update.
 
-By default, SteamVR hides this boundary during normal VR gameplay; in headset
-testing (2026-11-20), it only appeared while SteamVR's Chaperone settings menu
-was open. Static analysis of `vrcompositor.exe` (SteamVR 2.19.4, sha256
-`1f23a1da...`, **static**) shows two hardcoded overrides with no settings keys
-to disable them:
+By default, SteamVR hides this boundary during normal VR gameplay, displaying
+it only while SteamVR's Chaperone settings menu is open. Static analysis of
+`vrcompositor.exe` (SteamVR 2.19.4, sha256 `1f23a1da...`, **static**) shows two
+hardcoded overrides with no settings keys to disable them:
 
 - At startup, `vrcompositor` checks whether the HMD imports bounds from its
   driver (`collisionBounds/enableDriverBoundsImport`, true by default, with
@@ -243,8 +242,8 @@ SteamVR has two separate recenter paths:
 
 - SteamVR's standard zero-pose reset (such as `vrcmd --recenter`) is handled
   entirely on the host. `vrserver.txt` logs `Update ZeroPose for the chaperone
-  universe <id>` and sends nothing to the client (**live**, 2026-11-20: no 0x16
-  packet arrived).
+  universe <id>` and sends nothing to the client (**live**: no 0x16 packet
+  arrived).
 - Sending `handle_recenter` to the `svl/driver` mailbox causes `driver_vrlink`
   to send VTE event 0x16 to the client (**static**). The sender of that mailbox
   message has not been traced (**inferred**: the recenter button in the Steam
@@ -268,8 +267,8 @@ SteamVR has two separate recenter paths:
 4. Is 0x20 actually re-sent once per second while waiting for 0x21 (**static**)?
    In `vr3` the host replied after 33 ms, so the 1 s timer never fired.
 5. What triggers updates to 0x06? Capture `vr3` had one version in 40 s, `vr1`
-   had three, and both 2026-11-11 sessions (one of which launched and quit an
-   application) had a single version each.
+   had three, and both application-launch sessions above (one of which launched
+   and quit The Lab) had a single version each.
 6. Does the host read 0x13 event codes other than 4 and 5, or send codes other
    than 2?
 7. Do 0x1d (network test) and 0x25 (Wi-Fi BSSID) affect host behavior when

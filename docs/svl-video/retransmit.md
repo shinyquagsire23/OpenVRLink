@@ -233,8 +233,8 @@ in the earlier, lossy `vr1` capture appear at the end of this section.
   the bookend unprompted.
 - Host retransmission behavior—what the host sends in reply, response latency,
   the 3,000 us cooldown, whether it answers requests for unsent Q packets, and
-  `0xffff` descriptor resends—is therefore **not observable in `vr3`** (see
-  later `client` loss-injection tests below). Across 60,945 video elements in
+  `0xffff` descriptor resends—is therefore **not observable in `vr3`** (see the
+  OpenVRLink loss-injection results below). Across 60,945 video elements in
   `vr3`, the host sent zero duplicate data, parity, or bookend messages.
 
 ### IDR frames and resets
@@ -263,8 +263,8 @@ in the earlier, lossy `vr1` capture appear at the end of this section.
   (`probe1`, 2,217 access units) has parameter sets and an IDR only at access
   unit 0, with no second IDR.
 - **The `rst` -> IDR path was not exercised in `vr3`** because `vrlink` never
-  encountered an unrecoverable error and `rst` stayed at `0` (verified later
-  with `client` below).
+  encountered an unrecoverable error and `rst` stayed at `0` (verified with
+  OpenVRLink below).
 
 ### Frame reports (kind 4, type 0x0f)
 
@@ -343,7 +343,7 @@ the same datagram (accurate to ~`0.2 ms`).
 ## Open questions / to confirm on the wire
 
 1. Capturing a `0xffff` descriptor retransmit request from `vrlink` when a
-   frame's initial bookend is lost (tested from `client` below).
+   frame's initial bookend is lost (verified with OpenVRLink below).
 2. Determining which fields of `LastVideoPacket_t` the host acts on and how it
    uses the reported timestamps.
 3. Tracing a single `vrlink` reset to its `rst` increment and resulting host
@@ -359,12 +359,11 @@ the same datagram (accurate to ~`0.2 ms`).
 7. Determining the exact transport behavior of the third argument (`true`) of
    the `SVLDataLink` send call used for descriptors and retransmit requests.
 
-## Client results (2026-11-10): loss recovery against a SteamVR host
+## Client results: loss recovery against a SteamVR host
 
-The Swift viewer (`client`, `VRLinkCore/Video.swift`) randomly dropped a
-configurable fraction of incoming kind-5 messages (data, parity, and
-descriptors alike) over an otherwise clean LAN at 90 Hz (**captured** by
-`client`, ~12 s per row):
+OpenVRLink (`VRLinkCore/Video.swift`) randomly dropped a configurable fraction
+of incoming kind-5 messages (data, parity, and descriptors alike) over an
+otherwise clean LAN at 90 Hz (**captured**, ~12 s per row):
 
 | simulated loss | frames per second | packets repaired by FEC | packets re-requested | frames abandoned |
 |---|---|---|---|---|
@@ -381,12 +380,12 @@ These runs confirm three behaviors:
 - **Live FEC repairs** against host parity succeed, including on short final
   stripes when out-of-range data blocks are treated as known zeros.
 - **Incrementing the pose `rst` counter triggers a fresh keyframe.** An earlier
-  build of `client`'s frame assembler abandoned frames and incremented the pose
-  packet's `rst` counter; each increment was answered by `[SVLS]
+  build of OpenVRLink's frame assembler abandoned frames and incremented the
+  pose packet's `rst` counter; each increment was answered by `[SVLS]
   ResetVideoStream` from the host followed by a new IDR keyframe, confirming
   the `rst` -> keyframe mechanism.
 
-`client` uses a simpler retransmit policy than `vrlink`: when a packet from a
+OpenVRLink uses a simpler retransmit policy than `vrlink`: when a packet from a
 later group arrives, request every missing data packet from earlier groups;
 when an incomplete frame has been idle for 4 ms, request up to 20 missing data
 packets (or `0xffff` if the descriptor is missing); and never request parity
@@ -398,19 +397,19 @@ These runs did not measure single-packet retransmit round-trip latency, the
 picture-quality impact of retransmit bitrate overhead, or recovery under burst
 loss (simulated drops were independent per message).
 
-## Client results (2026-11-10): pacing of unprompted requests
+## Client results: pacing of unprompted requests
 
-Initially, whenever an incomplete frame had been quiet for 4 ms, `client`
+Initially, whenever an incomplete frame had been quiet for 4 ms, OpenVRLink
 requested its first 20 missing packets and reset the 4 ms timer. When many
 frames were incomplete at once during a stall, that unthrottled rule sent
 thousands of requests per second (570,000 requested packet ids in 15 s of a
-stalled session). `client` now implements `vrlink`'s unguided budget rule
+stalled session). OpenVRLink now implements `vrlink`'s unguided budget rule
 above: it requests only as many missing packets as the host should have
 transmitted so far—counted at 104 us per packet from the end of the 4 ms quiet
 window, capped at 20 packets per request—and while waiting for a recovery
 keyframe it sends retries only for the three newest frames.
 
-With that pacing and an optimized build, `client` recovers from 10% and 25%
+With that pacing and an optimized build, OpenVRLink recovers from 10% and 25%
 simulated packet loss on a 120 Hz stream of `100..150 kB` frames at full frame
 rate with zero abandoned frames (roughly 1,000 packets repaired by FEC and
 1,700 re-requested over 15 s at 10% loss).

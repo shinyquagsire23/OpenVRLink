@@ -63,7 +63,7 @@ public final class UDPSocket {
         var address = UDPSocket.address(host, port)
         return withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Foundation.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+                systemConnect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
             }
         }
     }
@@ -100,7 +100,7 @@ public final class UDPSocket {
     }
 
     public func send(_ bytes: Bytes) {
-        _ = Foundation.send(descriptor, bytes, bytes.count, 0)
+        _ = systemSend(descriptor, bytes, bytes.count, 0)
     }
 
     public func send(_ bytes: Bytes, host: String, port: UInt16) {
@@ -149,6 +149,9 @@ public final class UDPSocket {
         return bytes.isEmpty ? nil : bytes
     }
 
+    /// Raw values for `IFF_UP` and `IFF_LOOPBACK` (imported as C enum cases rather than integer macros on Linux/Android).
+    private static let interfaceUp: UInt32 = 0x1, interfaceLoopback: UInt32 = 0x8
+
     /// Enumerates host IPv4 addresses on active local subnets for discovery
     /// sweeps, skipping subnets larger than `limit` hosts.
     public static func localSubnetAddresses(limit: Int = 1022) -> [String] {
@@ -161,7 +164,7 @@ public final class UDPSocket {
             cursor = interface.ifa_next
             guard let address = interface.ifa_addr, let mask = interface.ifa_netmask,
                   address.pointee.sa_family == sa_family_t(AF_INET),
-                  interface.ifa_flags & UInt32(IFF_UP) != 0, interface.ifa_flags & UInt32(IFF_LOOPBACK) == 0
+                  interface.ifa_flags & UDPSocket.interfaceUp != 0, interface.ifa_flags & UDPSocket.interfaceLoopback == 0
             else { continue }
             let own = address.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { UInt32(bigEndian: $0.pointee.sin_addr.s_addr) }
             let netmask = mask.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { UInt32(bigEndian: $0.pointee.sin_addr.s_addr) }

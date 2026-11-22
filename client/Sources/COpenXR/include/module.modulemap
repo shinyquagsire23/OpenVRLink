@@ -1,0 +1,4 @@
+module COpenXR {
+    header "COpenXR.h"
+    export *
+}

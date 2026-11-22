@@ -38,7 +38,7 @@ public final class TCPSocket {
         _ = fcntl(descriptor, F_SETFL, flags | O_NONBLOCK)
         let started = withUnsafePointer(to: &target) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Foundation.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                systemConnect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
         if started != 0 {
@@ -54,7 +54,7 @@ public final class TCPSocket {
         }
         _ = fcntl(descriptor, F_SETFL, flags)
         var on: Int32 = 1
-        setsockopt(descriptor, IPPROTO_TCP, TCP_NODELAY, &on, socklen_t(MemoryLayout<Int32>.size))
+        setsockopt(descriptor, Int32(IPPROTO_TCP), TCP_NODELAY, &on, socklen_t(MemoryLayout<Int32>.size))
         #if canImport(Darwin)
         // Return EPIPE on writes to a closed peer instead of raising SIGPIPE.
         setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
@@ -65,7 +65,7 @@ public final class TCPSocket {
 
     /// Shuts down both directions of the socket immediately so the peer sees EOF before deallocation.
     public func shutDown() {
-        _ = shutdown(descriptor, SHUT_RDWR)
+        _ = shutdown(descriptor, Int32(SHUT_RDWR))
     }
 
     /// Writes all of `bytes` to the socket, returning false if the connection fails. Thread-safe.
@@ -75,7 +75,7 @@ public final class TCPSocket {
         defer { sendLock.unlock() }
         var sent = 0
         while sent < bytes.count {
-            let wrote = bytes.withUnsafeBytes { Foundation.send(descriptor, $0.baseAddress! + sent, bytes.count - sent, 0) }
+            let wrote = bytes.withUnsafeBytes { systemSend(descriptor, $0.baseAddress! + sent, bytes.count - sent, 0) }
             if wrote <= 0 { return false }
             sent += wrote
         }

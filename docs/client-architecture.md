@@ -58,15 +58,15 @@ a separate mDNS/Bonjour discovery path alongside UDP subnet probing).
 | library | handles | imports | current target |
 |---|---|---|---|
 | core | protocol, pairing, session, FEC, timing, geometry, frame composition (`[Quad]`), settings, calibration math | Foundation, POSIX sockets, system crypto frameworks on Apple platforms or swift-crypto elsewhere | `VRLinkCore` |
-| XR runtime | eye poses, predicted display time, and drawable render surfaces | CompositorServices *or* OpenXR | `VRLinkVisionCompositor` |
-| tracking and input | head pose, controller and hand poses, buttons and axes, haptics out | ARKit + GameController *or* OpenXR | `VRLinkVisionTracking` |
-| graphics | drawing quads through eye views from a decoded frame | Metal *or* Vulkan | `VRLinkMetal` |
-| decoder | access units in, decoded frames out | VideoToolbox *or* a platform decoder | `VRLinkVideoToolbox` |
-| audio | PCM out, microphone in | CoreAudio *or* a platform API | `VRLinkAppleAudio` |
-| session glue | host discovery, pairing, starting and stopping a session with its decoder and audio, live settings updates | platform-specific backends | `VRLinkAppleSession` |
+| XR runtime | eye poses, predicted display time, and drawable render surfaces | CompositorServices *or* OpenXR | `VRLinkVisionCompositor`, `VRLinkOpenXR` |
+| tracking and input | head pose, controller and hand poses, buttons and axes, haptics out | ARKit + GameController *or* OpenXR | `VRLinkVisionTracking`, `VRLinkOpenXR` |
+| graphics | drawing quads through eye views from a decoded frame | Metal *or* Vulkan | `VRLinkMetal`, `VRLinkOpenXRMetal`, `VRLinkVulkan` |
+| decoder | access units in, decoded frames out | VideoToolbox *or* a platform decoder | `VRLinkVideoToolbox`, `VRLinkMediaCodec` |
+| audio | PCM out, microphone in | CoreAudio *or* a platform API | `VRLinkAppleAudio`, `VRLinkAndroidAudio` |
+| session glue | host discovery, pairing, starting and stopping a session with its decoder and audio, live settings updates | platform-specific backends | `VRLinkAppleSession`, `StreamLink` (in `VRLinkCore`) |
 | rooms | room selection for streaming sessions and the Room Setup immersive space | ARKit + RealityKit | `VRLinkVisionRooms` |
 | experiments | experimental features isolated so core targets do not depend on them | platform frameworks as needed | `VRLinkVisionExperiments`, `VRLinkAppleFace` |
-| app shells | wiring, window or immersive space, settings UI | the platform's app framework | `OpenVRLink` (macOS viewer), `client/visionOS` |
+| app shells | wiring, window or immersive space, settings UI | the platform's app framework | `OpenVRLink` (macOS viewer), `client/visionOS`, `OpenVRLinkXR` (macOS OpenXR), `OpenVRLinkAndroid` + `client/android` (Android XR) |
 
 Apple-specific frameworks are avoided outside Apple-specific targets, and
 platform differences are isolated via `#if` conditionals or separate target
@@ -235,6 +235,179 @@ Two lifecycle cases remain unimplemented: keeping a stream alive across brief
 interruptions within the host's 30 s grace window, and displaying connection
 status inside the immersive space while resuming.
 
+## OpenXR
+
+`VRLinkOpenXR` implements the XR runtime, tracking, and input backends for
+OpenXR headsets. Unlike visionOS, where `VRLinkVisionCompositor` and
+`VRLinkVisionTracking` wrap separate system frameworks, OpenXR exposes display
+timing, swapchains, and input through a single API, so `VRLinkOpenXR` handles
+all of them in one target. Rendering is delegated to an `XRGraphics` backend
+(`VRLinkOpenXRMetal` or `VRLinkVulkan`) that the app shell pairs with a matching
+video decoder.
+
+| component | location |
+|---|---|
+| Unmodified Khronos OpenXR headers (no loader linked at build time) | `COpenXR` |
+| Runtime discovery and function pointer resolution | `VRLinkOpenXR/Loader.swift`, `XRInstance.swift` |
+| Session management, frame loop, swapchains, display metrics, and timing reports | `XRDisplay.swift` |
+| Action bindings, `ControllerState` mapping, hand tracking, and haptics | `XRInput.swift` |
+| Graphics backend protocol for OpenXR swapchains | `XRGraphics.swift` |
+| Metal graphics backend (`XR_KHR_metal_enable`) using `QuadRenderer` | `VRLinkOpenXRMetal` |
+| Vulkan graphics backend (`XR_KHR_vulkan_enable2`) sampling `AHardwareBuffer` | `VRLinkVulkan` |
+
+### Runtime loading
+
+`VRLinkOpenXR` does not link an OpenXR loader at build time. Instead, it
+resolves every OpenXR function pointer through `xrGetInstanceProcAddr` at
+runtime. On macOS and Linux, `Loader` reads the active runtime manifest directly
+(`XR_RUNTIME_JSON`, followed by `~/.config/openxr/1/active_runtime.json` and
+standard XDG/system directories), loads the runtime shared library, and calls
+`xrNegotiateLoaderRuntimeInterface` directly. Setting `OPENXR_LOADER` loads an
+external Khronos loader library instead when API layers are needed. On Android,
+`libopenxr_loader.so` is bundled in the APK because connecting to the device's
+runtime goes through Android's OpenXR runtime broker. Windows registry lookup
+for active runtimes is not implemented yet.
+
+### Frame loop and session lifecycle
+
+Each frame, `XRDisplay` waits for the runtime's predicted display time, samples
+head, controller, and hand poses for that timestamp, locates both eye views, and
+draws the latest decoded frame's quads into per-eye swapchains. It submits a
+single `XrCompositionLayerProjection` in the same reference space as the quads
+so the runtime performs late-stage reprojection, matching visionOS. When
+`XR_KHR_convert_timespec_time` is available, display timestamps are converted to
+the monotonic clock used by `Uptime` for `frameShown` and `displayRefreshes`
+telemetry; otherwise, the display time is estimated as one refresh period ahead.
+
+Stream connections follow the OpenXR session state. Once the runtime begins the
+session and reports valid eye views, `XRDisplay.onReady` delivers a
+`DeviceProfile` populated from `xrLocateViews` in view space, the recommended
+swapchain dimensions, and the refresh rate from `XR_FB_display_refresh_rate` (or
+the predicted frame period), allowing the app to connect without a separate
+measurement pass. When the runtime stops the session (for example, when the
+headset is removed or another app takes focus), the stream disconnects and
+automatically reconnects when the session resumes.
+
+### Reference spaces and input
+
+Tracking and rendering prefer the `STAGE` reference space when supported (using
+`xrGetReferenceSpaceBoundsRect` as the room chaperone boundary sent to the
+host), falling back to `LOCAL_FLOOR` and then `LOCAL`. Saved rooms, spatial
+anchors, and Room Setup are not implemented on OpenXR yet.
+
+`XRInput` defines a single action set covering `ControllerState` inputs, with
+suggested bindings for Oculus Touch, Meta Touch Plus, Pico 4, Valve Index, and
+Khronos simple controller profiles. When a hand is not holding an active
+controller, `XRInput` queries the 26 joints from `XR_EXT_hand_tracking`, which
+already match the joint ordering and axis convention of `TrackedHand`.
+Transparent or chroma-keyed streams request `XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND`
+when the headset supports passthrough blending.
+
+### macOS OpenXR client
+
+`OpenVRLinkXR` runs OpenVRLink as a macOS OpenXR application, combining
+VideoToolbox decoding, `QuadRenderer`, and CoreAudio with an `XRDisplay` session
+instead of an AppKit window. It can be tested against
+[OXRSys](https://github.com/demonixis/oxrsys), a macOS OpenXR runtime that
+forwards frames to a Quest, Pico, or Vision Pro headset:
+
+```
+XR_RUNTIME_JSON=<oxrsys>/build/runtime/oxrsys-runtime.json swift run OpenVRLinkXR [host address]
+```
+
+In headless desktop runs against OXRSys 1.3.0 (without a physical headset
+attached), the session ran at 72 Hz, streamed from a Steam host at 72 fps, and
+rendered the SteamVR dashboard cleanly in swapchain captures saved via
+`--pictures`. Controller input, hand tracking, haptics, and on-headset display
+output have not been verified yet.
+
+### Android XR
+
+`client/android/build.sh` cross-compiles `libOpenVRLinkAndroid.so` using the
+Swift SDK for Android and packages it into a signed APK using the Android SDK
+command-line tools (`aapt2`, `zipalign`, and `apksigner`), without Gradle, Java,
+or Kotlin sources. Android's built-in `NativeActivity` loads the native library
+and calls `ANativeActivity_onCreate` in `OpenVRLinkAndroid/Activity.swift`,
+which attaches a background thread to the JVM and starts the OpenXR session.
+
+| component | Android implementation | location |
+|---|---|---|
+| decoder | `AMediaCodec` decoding into `AImageReader` surfaces (`AHardwareBuffer` frames, one codec per video stream) | `VRLinkMediaCodec/MediaCodecDecoder.swift` |
+| graphics | Vulkan renderer importing `AHardwareBuffer` images with `VkSamplerYcbcrConversion` | `VRLinkVulkan/VulkanXRGraphics.swift`, `Shaders/` |
+| audio | Low-latency PCM output via AAudio | `VRLinkAndroidAudio/AudioOutput.swift` |
+| NDK bindings | C module exposing NativeActivity, MediaCodec, AAudio, and Vulkan headers | `CAndroidNDK` |
+
+The Vulkan shaders are written in GLSL under `VRLinkVulkan/Shaders` and
+precompiled to SPIR-V into `QuadShaders.swift` by `compile.sh`.
+
+**The Android build has not run on a device yet.** With Swift 6.4.3 and Android
+NDK r27d (API 34), all targets cross-compile cleanly for
+`aarch64-unknown-linux-android34`, and `build.sh` produces a signed 69 MB APK
+(roughly 40 MB of which is Foundation's ICU data) with a verified manifest and
+exported `ANativeActivity_onCreate` symbol.
+
+Current limitations on Android:
+
+- There is no in-headset UI yet. The app reads the target host from `host.txt`
+  in its internal data directory (or falls back to UDP Steam discovery) and logs
+  connection status and pairing PINs to `logcat`.
+- WiVRn mDNS discovery (`ServiceBrowser` currently uses Apple's Network
+  framework), microphone capture, battery reporting, and wired-interface
+  detection are not implemented.
+- Runtime permission prompts for `android.permission.HAND_TRACKING` are not
+  requested via JNI yet (grant manually via `adb shell pm grant`).
+- Vulkan chroma keying (requires dual-source blending), depth-buffer submission,
+  and parsing initial coded dimensions from H.264/HEVC/AV1 parameter sets before
+  configuring `AMediaCodec` are not implemented yet.
+- AAudio stream recovery after audio output device changes is not handled yet.
+
+### Cross-platform refactoring
+
+Adding the OpenXR and Android backends moved several shared abstractions into
+`VRLinkCore`:
+
+- `StreamFrame` and `StreamDecoder` (`VRLinkCore/StreamLink.swift`) make
+  `DisplayQueue`, `XRDisplay`, and session management generic over platform
+  frame and decoder types.
+- `StreamLink` manages host connection, pairing, decoder wiring, and `PlaySpace`
+  transforms without depending on SwiftUI or platform session frameworks.
+- `PictureAssembler` groups decoded images from multi-stream frames (such as
+  WiVRn stereo and alpha streams) into complete frames.
+- `QuadMesh` projects world-space quads into clip-space triangle meshes for
+  per-eye rendering.
+- `Log.write` lets platforms redirect log output (for example, to Android
+  `logcat`).
+- `SystemCalls.swift` re-exports platform C libraries (`Android` or `Glibc` on
+  non-Apple platforms) and wraps POSIX socket calls and flags whose types differ
+  on Linux and Android.
+
+Remaining platform coupling to clean up:
+
+- `VRLinkAppleSession.Connection`, `VideoDecoder`, and `QuadRenderer` still
+  maintain separate implementations of session management, multi-picture
+  assembly, and vertex packing (for visionOS single-pass stereo) rather than
+  sharing `StreamLink`, `PictureAssembler`, and `QuadMesh`.
+- Host discovery (combining Steam UDP probing and WiVRn mDNS browsing) is
+  duplicated between `Connection` and the CLI targets; moving it into
+  `VRLinkCore` behind an mDNS browser protocol would let Android and desktop
+  targets share it.
+- `SystemVersion` lives in `VRLinkAppleNetwork` with Apple-only `#if` branches,
+  and `DeviceProfile.ownModel` checks for `"visionOS"` by string.
+- Video parameter-set parsing (SPS/PPS/VPS via CoreMedia and the AV1
+  sequence-header parser) lives in `VRLinkVideoToolbox`, whereas
+  `MediaCodecDecoder` also needs coded dimensions before configuring
+  `AMediaCodec`.
+- Room selection, recentering, and spatial anchors (`RoomTracker` and Room
+  Setup) are currently tied to ARKit and RealityKit, though the room data model
+  and polygon math already live in `VRLinkCore`.
+- OpenXR targets need an in-session overlay layer for host selection, pairing
+  PINs, connection status, and settings (visionOS uses SwiftUI windows).
+- Stream settings (`fovScale`, chroma key, and microphone toggle) are applied
+  separately in each app target.
+- `DeviceProfile.handValues` currently selects between Oculus Touch and PSVR2
+  Sense controller models rather than using the active OpenXR interaction
+  profile.
+
 ## Rooms
 
 A room defines a saved play area with a center point, forward direction, floor
@@ -357,44 +530,40 @@ drawn in gray.
 
 ### ARKit anchor coordinate drift
 
-In headset testing (2026-11-20), ARKit's reported `WorldAnchor` transforms did
-not stay aligned with the tracking origin used for `queryDeviceAnchor` head
-poses: rooms shifted whenever an immersive space opened or the Digital Crown
-recentered, and newly created rooms sometimes appeared below the floor behind
-the user until a crown recenter. To compensate, `RoomAnchors` places a temporary
-marker `WorldAnchor` at the current head position, where its true tracking-space
-transform is known. When polling `allAnchors`, `RoomAnchors` computes the
-correction transform from the marker's reported pose to its true pose and
-applies that correction to every room anchor in the same snapshot.
+On visionOS, ARKit's reported `WorldAnchor` transforms do not stay aligned with
+the tracking origin used for `queryDeviceAnchor` head poses: rooms can shift
+whenever an immersive space opens or the Digital Crown recenters, and newly
+created rooms can appear below the floor behind the user until a crown recenter.
+To compensate, `RoomAnchors` places a temporary marker `WorldAnchor` at the
+current head position, where its true tracking-space transform is known. When
+polling `allAnchors`, `RoomAnchors` computes the correction transform from the
+marker's reported pose to its true pose and applies that correction to every
+room anchor in the same snapshot.
 
 `RoomAnchors` places a fresh marker whenever the tracking origin may have
 changed (when tracking starts in an immersive space, when the head position
 jumps by more than 0.5 m between samples, or on a recenter). Until the new
 marker is reported back, rooms are hidden briefly in Room Setup and active
 streaming sessions hold their previous play space. Because some origin shifts
-happen without an obvious jump (for example, the floor height was offset on the
-first stream after launch until a crown recenter), `RoomAnchors` also refreshes
-the marker every 5 s while keeping the previous correction active until the new
-marker resolves. If the origin moves while a marker is still being added, that
-marker is discarded. Significant corrections are logged
+happen without an obvious jump (for example, an initial floor-height offset on
+the first stream after launch), `RoomAnchors` also refreshes the marker every
+5 s while keeping the previous correction active until the new marker resolves.
+If the origin moves while a marker is still being added, that marker is
+discarded. Significant corrections are logged
 (`rooms: anchor transforms offset from tracking origin by ...`).
 
 All ARKit calls in `RoomAnchors` (anchor queries, marker placement, and anchor
 deletion) run in independent tasks with a 3 s timeout so a hung ARKit call
-cannot stall tracking. During headset testing (2026-11-20), a room disappeared
-from both the stream and Room Setup after a mid-stream crown recenter until the
-app was restarted, even though it remained in `rooms.json`—consistent with an
-ARKit call hanging when operations ran sequentially. Diagnostic logs report
-anchor state transitions
+cannot stall tracking (previously, a mid-stream crown recenter could cause a
+room to disappear from both the stream and Room Setup until app restart if a
+sequential ARKit call hung). Diagnostic logs report anchor state transitions
 (`rooms: room <id> anchor is tracked / reported but not tracked / not reported`),
 stalled marker measurements (`rooms: waiting N s for anchor marker ...`), and
 timed-out ARKit calls.
 
-Headset testing on 2026-11-20 verified Room Setup, hand-drawn boundaries,
-automatic room selection, and room-relative streaming with marker correction.
 Timeout recovery and host-initiated recentering (0x16, not yet seen on the wire)
-have not been tested on device yet, and SteamVR currently renders the boundary
-only while its Chaperone settings page is open.
+have not been verified on hardware yet, and SteamVR currently renders the
+boundary only while its Chaperone settings page is open.
 
 ## Networking quirks and minutiae
 
@@ -611,10 +780,12 @@ with a 50 ms time constant.
 2. **Windows helper**: install PSVR2 assets and optionally patch
    `driver_vrlink` for additional features (such as improved transport
    encoding).
-3. **Windows**: Vulkan, OpenXR, platform video decoder, and audio backends
-   (primarily a desktop debugging target rather than an end-user build).
-4. **Android**: reuse the Vulkan and OpenXR backends and iron out remaining
-   visionOS-specific assumptions.
+3. **Android XR**: test the initial build on hardware (see [OpenXR](#openxr)),
+   add an in-headset UI, and finish sharing the remaining session and discovery
+   code with `VRLinkCore`.
+4. **Windows**: pair `VRLinkOpenXR` with a Vulkan or Direct3D graphics backend,
+   a platform video decoder, and audio output (primarily as a desktop debugging
+   target rather than an end-user build).
 
 ## Open questions
 

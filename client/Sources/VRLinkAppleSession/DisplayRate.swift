@@ -21,11 +21,11 @@ import VRLinkCore
 ///   requires a `CMFormatDescription`, we apply it once the decoder parses the
 ///   stream's parameter sets.
 ///
-/// In system logs (2026-11-13), `AVDisplayCriteria` is the hint that triggers a
-/// rate switch: setting it asserts content playback at 90, 96, 100, or 120 Hz
-/// to the system rate manager, and the displays switch roughly four seconds
-/// after the last assertion. Re-assigning identical criteria resets that
-/// four-second timer, so we deduplicate updates in `applyCriteria()`.
+/// In system logs, `AVDisplayCriteria` is the hint that triggers a rate switch:
+/// setting it asserts content playback at 90, 96, 100, or 120 Hz to the system
+/// rate manager, and the displays switch roughly four seconds after the last
+/// assertion. Re-assigning identical criteria resets that four-second timer, so
+/// we deduplicate updates in `applyCriteria()`.
 ///
 /// Because visionOS may ignore both hints, the streaming session still measures
 /// the actual display refresh interval directly.

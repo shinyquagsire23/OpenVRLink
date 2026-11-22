@@ -210,15 +210,15 @@ its final packet is an ordinary pose datagram (`seq 17445`), the host was still
 sending video 1 ms earlier, and no `3/0x13`, `seq 0xffff`, `3/0x0e`, or
 sideband frame appears.
 
-### Host behavior on client disconnect (measured 2026-11-10)
+### Host behavior on client disconnect
 
-Host disconnect behavior was **captured** in `driver_vrlink.txt` across four
-12–14 s probe sessions:
+Host disconnect behavior (**captured** in `driver_vrlink.txt` across four
+12–14 s probe sessions on an earlier host build):
 
 - When client datagrams stop, the host logs `Connection inactive at <seconds>`,
   and 30 s later logs `Connection inactive for 30.1 > 30 seconds. Sending quit
   event.`, shutting down SteamVR. This occurred consistently across runs.
-- In these initial tests, the teardown datagram did not shorten the 30 s
+- On that earlier host build, the teardown datagram did not shorten the 30 s
   timeout. When sent validly (five times, 100 ms apart; in mode 2 with tag word
   `0x02ffffff`), the host logged `"inactive"` within ~1 s, versus ~3 s when the
   datagram was malformed (mode 2 using an ordinary sequence word) and the host
@@ -229,8 +229,8 @@ Host disconnect behavior was **captured** in `driver_vrlink.txt` across four
 - In `vrlink` 2.0.25 (**static**), this `3/0x13` teardown datagram is the only
   shutdown packet the VR client sends.
 
-Follow-up testing on 2026-11-13 (**captured** in `vrserver.txt` against a
-protocol-version-14 host) showed updated behavior on the teardown datagram:
+Against a protocol-version-14 host (**captured** in `vrserver.txt`), the
+teardown datagram quits SteamVR immediately:
 
 - The host acts on the teardown datagram immediately, logging `Client sent
   SYST_CLIENT_SHUTDOWN` followed by `Sending quit event because SteamVR launched
@@ -265,7 +265,7 @@ are measured (§2).
 
 Remaining open questions:
 - Capturing `vrlink`'s own transmitted teardown datagram on the wire (host
-  handling of our client's teardown packet is documented above).
+  handling of OpenVRLink's teardown packet is documented above).
 - Tracing which call sites invoke `PrepareForPossibleShutdown` to arm the
   teardown closure.
 - Determining the effective `SO_RCVTIMEO` value chosen at runtime
@@ -275,7 +275,7 @@ Remaining open questions:
 - How the host responds if the client's very first datagram has an invalid
   session ID.
 
-## Probe results (2026-11-10)
+## Probe results
 
 The Python probe opened a session with no handshake: its first datagram was
 `[3/0x07 values][4/0x0f frame report][3/0x01 pose + value transport]` sent from
@@ -283,7 +283,7 @@ an unbound, connected UDP socket with default socket options (no `IP_TOS`,
 8 MiB receive buffer), and the host answered within 1 s. The probe exchanged
 37,842 datagrams over 20 s with every checksum valid (**captured** by probe).
 
-## Client results (2026-11-10): concurrent clients with the same device ID
+## Client results: concurrent clients with the same device ID
 
 When two instances of the Swift client accidentally streamed from the same host
 at the same time using the same device identity, each requested its own session

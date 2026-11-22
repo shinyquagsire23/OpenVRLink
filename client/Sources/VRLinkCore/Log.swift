@@ -12,7 +12,11 @@ import Foundation
 public enum Log {
     private static let queue = DispatchQueue(label: "log", qos: .utility)
 
+    /// Output sink for log messages. Defaults to `print`, and can be overridden at startup on platforms
+    /// that route logs to a system logger such as Android `logcat`.
+    public nonisolated(unsafe) static var write: (String) -> Void = { print($0) }
+
     public static func note(_ line: String) {
-        queue.async { print(line) }
+        queue.async { write(line) }
     }
 }

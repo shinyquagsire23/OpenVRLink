@@ -10,11 +10,10 @@ import Foundation
 /// Fixed constants in the SVL pose message (docs/svl-tracking-input/poses.md).
 enum PoseMessage {
     /// Protocol version in byte 0. The host drops pose messages with any other
-    /// value and logs "svl protocol version mismatch. Server expects 10"
-    /// (probed 2026-11-13).
+    /// value and logs "svl protocol version mismatch. Server expects 10".
     static let protocolVersion: UInt8 = 0x0A
     /// Byte 2 is always 0x20 in captures; its meaning is unknown, and the host
-    /// streams normally when sent 0 (probed 2026-11-13).
+    /// streams normally when sent 0.
     static let unknownConstant: UInt8 = 0x20
     /// Holdoff flag in byte 3. Non-zero asks the host to pause streaming; we always send 0.
     static let noHoldoff: UInt8 = 0
@@ -22,12 +21,12 @@ enum PoseMessage {
     /// 8 reserved zero bytes, flags, and a 0xFF trailer byte).
     ///
     /// The host logs this field as "Peer Minor Version Number" and gates
-    /// protocol features on it. Steam Link 2.0.25 sends 14, matching the wire
+    /// protocol features on it. `vrlink` 2.0.25 sends 14, matching the wire
     /// behavior implemented here (docs/svl-transport/): publishing the
     /// capabilities value, using the extended frame report and eye-tracking
     /// message formats, and answering link probes. If a client reports version
     /// 14 without publishing the capabilities value, the host never activates
-    /// the headset (probed 2026-11-13).
+    /// the headset.
     static let minorVersion: UInt32 = 14
     static let hmdInputReserved = 8
     static let hmdInputFlagNothingInHands: UInt8 = 0x08
@@ -147,8 +146,8 @@ public final class StreamSession: StreamingSession {
         // version 14, the host sends packets to that port on the client's IP
         // regardless of the source port it receives from; if nothing is bound
         // there, the resulting ICMP port-unreachable errors cause the host to
-        // recreate its socket every two seconds (probed 2026-11-13). Fall back
-        // to an ephemeral port if that port is already in use.
+        // recreate its socket every two seconds. Fall back to an ephemeral port
+        // if that port is already in use.
         guard let link = SVLLink(token: args.token),
               let socket = UDPSocket(interface: interface, localPort: args.port) ?? UDPSocket(interface: interface),
               socket.connect(host: args.host, port: args.port)
@@ -472,7 +471,7 @@ public final class StreamSession: StreamingSession {
     /// address family (`0` for IPv4), remaining record length (`19`), big-endian
     /// port, subnet prefix length, and 16-byte padded IP address. Under minor
     /// version 14, the host recreates its socket every two seconds if it does not
-    /// receive this list (probed 2026-11-13).
+    /// receive this list.
     private func addressList() -> SVLElement? {
         guard let local = socket.localEndpoint() else { return nil }
         var out: Bytes = [1, 0, 19, UInt8(local.port >> 8), UInt8(local.port & 0xFF), local.prefixLength]

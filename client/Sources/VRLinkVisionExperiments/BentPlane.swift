@@ -18,14 +18,13 @@ import simd
 /// RealityKit interpolates vertex attributes linearly across each triangle in 3D space.
 /// When a triangle's vertices sit at different depths, standard UVs shift within the
 /// triangle relative to the rendering eye's projection (by up to a quarter of the depth
-/// step across the triangle). In headset testing (2026-11-20), this caused straight lines
-/// near depth discontinuities like the floor boundary to look jagged and shimmer with
-/// depth noise. When `projected` is enabled, each vertex stores `uv * depth` in `uv0` and
-/// `depth` in `uv1.x`, and `SBSMaterialBilinearProjected` divides `uv0` by `uv1.x` per
-/// pixel to recover perspective-correct UVs from the rendering eye. In an offscreen test
-/// on macOS (2026-11-20) across a quad spanning 1 m to 4 m in depth, 16 evenly spaced
-/// stripes rendered 16 to 186 pixels apart with standard UVs versus 55 to 56 pixels apart
-/// with projected UVs.
+/// step across the triangle), causing straight lines near depth discontinuities such as
+/// the floor boundary to look jagged and shimmer with depth noise. When `projected` is
+/// enabled, each vertex stores `uv * depth` in `uv0` and `depth` in `uv1.x`, and
+/// `SBSMaterialBilinearProjected` divides `uv0` by `uv1.x` per pixel to recover
+/// perspective-correct UVs from the rendering eye. Across an offscreen test quad
+/// spanning 1 m to 4 m in depth, 16 evenly spaced stripes rendered 16 to 186 pixels
+/// apart with standard UVs versus 55 to 56 pixels apart with projected UVs.
 @MainActor
 final class BentPlane {
     let resource: MeshResource

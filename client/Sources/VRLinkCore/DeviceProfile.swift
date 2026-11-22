@@ -22,10 +22,9 @@ public struct DeviceProfile {
     /// Encoded video resolution is controlled separately from the application render target.
     ///
     /// On the wire, the client sends a panel display size that the host multiplies by ~1.1436
-    /// on each axis to compute the render target (probed 2026-11-13: 2160 -> 2472,
-    /// 3200 -> 3660, 3660 -> 4184, 4096 -> 4684). We divide `eyePixels` by
-    /// `renderTargetPerDisplayPixel` before sending so SteamVR lands on the requested render
-    /// target (within 4-pixel rounding).
+    /// on each axis to compute the render target (for example, 2160 -> 2472, 3200 -> 3660,
+    /// 3660 -> 4184, 4096 -> 4684). We divide `eyePixels` by `renderTargetPerDisplayPixel`
+    /// before sending so SteamVR lands on the requested render target (within 4-pixel rounding).
     public var eyePixels: (width: Int, height: Int)?
     /// Ratio of SteamVR's 100% render target resolution to the reported panel display size on each axis.
     static let renderTargetPerDisplayPixel: Float = 1.1436
@@ -84,8 +83,8 @@ public struct DeviceProfile {
 
     /// Whether this headset sends eye or face tracking to a SteamVR host.
     /// This also controls the HMD model name reported to SteamVR, because the host
-    /// gates capabilities by model name and no built-in profile enables every feature at once
-    /// (probed 2026-11-13 across all model names in `vrlink` 2.0.25 plus Steam Frame):
+    /// gates capabilities by model name and no built-in profile in `vrlink` 2.0.25
+    /// enables every feature at once:
     ///
     /// - Unrecognized model name: honors the requested `eyePixels` render target and
     ///   enables the standard SteamVR dashboard, but limits video to 8-bit and disables
@@ -121,11 +120,11 @@ public struct DeviceProfile {
     public var hostKnowsHeadset = false
 
     /// Returns the native `(model, manufacturer)` pair for this device. Windows builds of
-    /// `driver_vrlink` (2026-11) recognize `"Apple Vision Pro M2"` and `"Apple Vision Pro M5"`
+    /// `driver_vrlink` (SteamVR 2.19.4) recognize `"Apple Vision Pro M2"` and `"Apple Vision Pro M5"`
     /// with a fixed 1800 x 1920 render target and no eye tracking, while `"Apple Vision Pro"`
-    /// is treated as an unknown model today. We report `"Apple Vision Pro (OpenVRLink)"`, which uses the
-    /// `vrlink_Apple Vision Pro (OpenVRLink)` settings section, so a later driver that learns the plain
-    /// name still does not recognize ours.
+    /// is treated as an unknown model. We report `"Apple Vision Pro (OpenVRLink)"`, which uses the
+    /// `vrlink_Apple Vision Pro (OpenVRLink)` settings section, so a later driver that adds the plain
+    /// name will not override our settings.
     var ownModel: (model: String, manufacturer: String) {
         systemName == "visionOS" ? ("Apple Vision Pro (OpenVRLink)", "Apple") : (DeviceProfile.headsetModel, "OpenVRLink")
     }
@@ -230,8 +229,7 @@ public struct DeviceProfile {
     }
 
     /// `VTE_CAPABILITIES` 32-byte feature bitfield. `vrlink` sets only bit 0 (meaning unknown).
-    /// Bit 45 advertises chroma-key passthrough according to host logs (probed 2026-11-13) and
-    /// is left unset here.
+    /// Bit 45 advertises chroma-key passthrough according to host logs and is left unset here.
     static let capabilities: Bytes = [1] + Bytes(repeating: 0, count: 31)
 
     /// Serializes the list of supported refresh rates: validity mask (`1`), count, 8 zero bytes, and each rate in Hz.

@@ -160,9 +160,9 @@ struct WiVRnPinCheck {
 ///
 /// In WiVRn 26.9, keys end up derived solely from the PIN because the server passes
 /// its X448 shared secret to OpenSSL's PBKDF2 under an ignored parameter name,
-/// leaving the key agreement output unused (verified against a 26.9 host on
-/// 2026-11-14). Previously paired headsets derive keys from the fixed PIN
-/// `"000000"`, so this encryption provides wire compatibility rather than confidentiality.
+/// leaving the key agreement output unused. Previously paired headsets derive keys
+/// from the fixed PIN `"000000"`, so this encryption provides wire compatibility
+/// rather than confidentiality.
 struct WiVRnSecrets {
     /// Fixed PIN string used when reconnecting as an already-paired headset.
     static let pairedPin = "000000"

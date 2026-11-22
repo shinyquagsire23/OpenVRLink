@@ -397,9 +397,9 @@ holdoff, non-zero `rst`, "no input" mode, absent controllers, or hand tracking.
 - Why `toff` drops by 7.7 ms at 0.11 s after its initial value
   (docs/svl-timing/).
 
-## Probe results (2026-11-10)
+## Probe results
 
-Probe tests varying the target-time field at dataset offset 0x18 (**captured**):
+Probe runs varying the target-time field at dataset offset 0x18 (**captured**):
 
 - The host uses 0x18 as a per-frame pacing reference. When every pose packet of
   a frame carried the same value (the timestamp when that `nFrameID` began), the
@@ -414,31 +414,30 @@ writing each sample's timestamp. Using frame start versus `frame start + 1
 period` made no difference to delivered frame rate (both gave 90.0 frames/s);
 effects on pose prediction with a moving head are tested below.
 
-## Client results (2026-11-10): host head-pose extrapolation
+## Client results: host head-pose extrapolation
 
-Tested with `client` (macOS viewer on a wired LAN, **captured**), rotating the
-synthetic head at a steady 30 deg/s in place and populating angular velocity
-accordingly:
+Rotating the synthetic head at a steady 30 deg/s in place in the OpenVRLink
+macOS viewer on a wired LAN (**captured**) with matching angular velocity:
 
 - With a stationary head, the render pose in each video frame's metadata equals
   the sent head pose to the last digit.
 - With the head turning at 30 deg/s, the render pose of an arriving frame is
-  rotated ~0.15 deg *further along the turn* than the newest pose `client` had
+  rotated ~0.15 deg *further along the turn* than the newest pose OpenVRLink had
   sent by that moment (reversing sign when turning the opposite direction),
   whereas an unpredicted render pose would lag by the round-trip time. The host
   therefore extrapolates head orientation using the client's reported velocities
   to a timestamp a few milliseconds past frame arrival on LAN.
 - Adding +50 ms to the target-time field (0x18) produced no visible change;
   adding +200 ms shifted lead to 0.6..0.8 deg with instability. What controls
-  the host's prediction horizon is resolved in the next test.
+  the host's prediction horizon is covered next.
 
-## Client results (2026-11-11): prediction horizon and display-time reports
+## Client results: prediction horizon and display-time reports
 
-Tested with `client` (macOS viewer, wired LAN, 120 Hz, **captured**), turning
-the head at a steady 30 deg/s with matching angular velocity so the render-pose
-yaw in each frame's metadata indicates the exact timestamp the host rendered
-for. In the table below, "lead" is that rendered timestamp minus the frame's
-local arrival time (median of per-second medians over ~25 s):
+Turning the synthetic head at a steady 30 deg/s with matching angular velocity
+in the macOS viewer (wired LAN, 120 Hz, **captured**) so the render-pose yaw in
+each frame's metadata indicates the exact timestamp the host rendered for. In
+the table below, "lead" is that rendered timestamp minus the frame's local
+arrival time (median of per-second medians over ~25 s):
 
 | what was sent | lead |
 |---|---|
@@ -462,11 +461,11 @@ On a headset whose display pipeline exceeds what the host extrapolates for, the
 uncompensated latency appears as controller lag and near-object parallax shift
 during head rotation; `client/visionOS` logs that head residual as `drift:`.
 
-## Client results (2026-11-11): Vision Pro prediction tuning
+## Client results: Vision Pro prediction tuning
 
-Evaluated visually by the user on a Vision Pro with PS VR2 Sense controllers and
-the RealityKit renderer (~34 ms from frame arrival to display; host-side share
-not isolated; qualitative observations without numeric capture):
+Qualitative evaluation on Vision Pro with PS VR2 Sense controllers and the
+RealityKit renderer (~34 ms from frame arrival to display; host-side share not
+isolated):
 
 | what was sent | head | controllers |
 |---|---|---|
@@ -480,10 +479,11 @@ not isolated; qualitative observations without numeric capture):
 Host-side velocity extrapolation works well for controller position, and ARKit
 forward prediction with zeroed velocities cannot replace it across the full
 streaming delay. However, sending full controller angular velocity causes
-rotational overshoot, so `client` scales sent controller angular velocity by 0.5
-(`ControllerState.spinSent`). Head rotation shows no overshoot in either case
-because the headset reprojects each video frame using its render pose at display
-time, correcting over-predicted head rotation whereas rendered controllers
-remain baked into the frame. Whether the host expects controller angular
-velocity in body-local or world coordinates was not tested independently on the
-headset and still relies on `vrlink`'s static behavior above.
+rotational overshoot, so OpenVRLink scales sent controller angular velocity by
+0.5 (`ControllerState.spinSent`). Head rotation shows no overshoot in either
+case because the headset reprojects each video frame using its render pose at
+display time, correcting over-predicted head rotation whereas rendered
+controllers remain baked into the frame. Whether the host expects controller
+angular velocity in body-local or world coordinates was not verified
+independently on the headset and still relies on `vrlink`'s static behavior
+above.

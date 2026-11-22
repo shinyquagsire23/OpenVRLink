@@ -7,12 +7,12 @@ in memory. Both sides remain compatible with stock peers: an unpatched
 records.
 
 Claims in this document use the same evidence tags as the rest of `docs/`.
-**static** host claims cite `driver_vrlink.dll` (Windows build from 2026-11-13,
+**static** host claims cite `driver_vrlink.dll` (SteamVR 2.19.4 on Windows,
 SHA-256 `c2a2e70e…920d1b`, image base `0x180000000`) or `driver_vrlink.so`
 (Linux build ID `b30b2657…`, which retains its symbol table). **tested** means
 covered by the test suites in `companion/` and `client/`. **live** means
-verified on 2026-11-19 using the macOS viewer against a Windows 11 host running
-SteamVR 2.19.4 with `driver_openvrlink` installed.
+verified using the macOS viewer against a Windows 11 host running SteamVR 2.19.4
+with `driver_openvrlink` installed.
 
 ## 1. Key/value channel transport
 
@@ -221,29 +221,29 @@ default sections for OpenVRLink's two native model names:
 `recommendedRenderWidth` and `recommendedRenderHeight` to `-1` so
 `driver_vrlink` honors the client's requested resolution. Any user overrides in
 `steamvr.vrsettings` under the same section names take precedence over these
-defaults. In **live** testing (2026-11-20, macOS viewer reporting
-`Apple Vision Pro` against SteamVR 2.19.4 on Windows) with only
-`driver_openvrlink`'s defaults installed, `vrserver.txt` logged
-`Found settings for unknown hmd`, `Found properties for unknown hmd`,
-`Using 10bit mode: 1`, and `Render Target: 3008 2404` for a requested 3000 x 2400
-eye resolution. End-to-end eye tracking delivery under this profile has not been
-verified yet. That test predates the `(OpenVRLink)` suffix, which keeps the
-name ours should `driver_vrlink` ever recognize plain `Apple Vision Pro`; the
-suffixed name has not been run against a host.
+defaults. In a **live** session (macOS viewer reporting `Apple Vision Pro`
+against SteamVR 2.19.4 on Windows) with only `driver_openvrlink`'s defaults
+installed, `vrserver.txt` logged `Found settings for unknown hmd`, `Found
+properties for unknown hmd`, `Using 10bit mode: 1`, and `Render Target: 3008
+2404` for a requested 3000 x 2400 eye resolution. End-to-end eye tracking
+delivery under this profile has not been verified yet, and the `(OpenVRLink)`
+model-name suffix (added so a future `driver_vrlink` build that recognizes plain
+`Apple Vision Pro` does not override these settings) has not been exercised
+against a live host yet.
 
 `driver_openvrlink` sets bit 1 of `oxAvail` whenever both `vrlink_<model>`
 sections are present with `enable` set to `true`. However, the client must send
-its static HMD properties before the host starts sending `ox` records: when we
-delayed sending static HMD properties by 6 s in a **live** test (2026-11-20),
-the host still did not send its first `ox` record until 2.8 s after those
-properties arrived. To work around that ordering, the client caches whether each
-host supports bit 1 in `hosts.json` (`KnownHosts`, keyed by discovery `clientID`)
-and reports its native model name starting on the next session with that host
+its static HMD properties before the host starts sending `ox` records: even when
+static HMD properties were delayed by 6 s in a **live** session, the host did
+not send its first `ox` record until 2.8 s after those properties arrived. To
+work around that ordering, the client caches whether each host supports bit 1 in
+`hosts.json` (`KnownHosts`, keyed by discovery `clientID`) and reports its
+native model name starting on the next session with that host
 (`DeviceProfile.hostKnowsHeadset`). If a host streams for 15 s without sending
 extension records, or sends `oxAvail` without bit 1, the cached flag is cleared.
-In **live** testing with the macOS viewer, the first session recorded support for
-the host and the second session connected under its native model name; this has
-not been tested on a physical Vision Pro yet.
+With the macOS viewer (**live**), the first session recorded support for the
+host and the second session connected under its native model name; this has not
+been verified on a Vision Pro yet.
 
 ## 4. Settings
 

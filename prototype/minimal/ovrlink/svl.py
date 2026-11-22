@@ -88,7 +88,7 @@ def unpack(data, session_id=None):
         end = offset + ELEMENT_HEADER_LEN + length
         if length > MAX_ELEMENT_VALUE or end > len(data):
             break
-        if cls == 0:            # padding: the reference client skips it and carries on
+        if cls == 0:            # padding element skipped by vrlink
             offset = end
             continue
         elements.append(Element(cls, type_, id_, index, data[offset + ELEMENT_HEADER_LEN:end]))
@@ -139,7 +139,7 @@ class AesLink:
         # The goodbye datagram (sequence 0xffff) carries a counter of all ones.
         counter = 0xFFFFFF if seq == 0xFFFF else self.wraps & 0xFFFFFF
         clear = struct.pack("<HHI", seq, 0, counter | 0x02000000) + body
-        clear += bytes(((len(clear) + 0x13) & ~0xF) - len(clear))     # the reference client's padding rule
+        clear += bytes(((len(clear) + 0x13) & ~0xF) - len(clear))     # vrlink AES-CBC block padding rule
         encryptor = self._cipher().encryptor()
         return encryptor.update(clear) + encryptor.finalize()
 

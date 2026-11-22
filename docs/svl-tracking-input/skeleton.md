@@ -241,32 +241,30 @@ to 0.
 Neither the `0x17` packet layout nor the skeleton codec was captured on the wire
 in `vr3`; both remain **static**.
 
-## Client results (2026-11-10)
+## Client results
 
-Tested with `client` (**captured**): sending `0x17` for a synthetic flat hand
-built from the formulas on this page is accepted by the host (see "Client
-results" in [controllers.md](controllers.md)), confirming that the packet size
-and framing are accepted. Because SteamVR Home did not draw a hand skeleton in
-that macOS test, bone transforms required headset testing.
-
-In Vision Pro runs later the same day using ARKit hand joints (reported by the
-user), the rendered SteamVR hands tracked the user's hands and pinch worked in
-SteamVR, confirming the bone formulas and the index-pinch button bit. Once the
-eye-to-head transform included the displays' canted rotation, the rendered hands
-no longer appeared rolled, though they sat roughly 1 cm away from the physical
-hands.
+Sending `0x17` from OpenVRLink for a synthetic flat hand built from the
+formulas on this page is accepted by the host (**captured**; see "Client
+results" in [controllers.md](controllers.md)), confirming the packet size and
+framing. Because SteamVR Home did not draw a hand skeleton in that desktop run,
+bone transforms were verified on Vision Pro using ARKit hand joints: the
+rendered SteamVR hands tracked physical hand motion and index pinches triggered
+input in SteamVR, confirming both the bone formulas and the index-pinch button
+bit. Once the eye-to-head handling accounted for canted displays, the rendered
+hands no longer appeared rolled, though they sat roughly 1 cm away from the
+physical hands.
 
 Recomputing from `vrlink`'s **static** constants shows that the hand offset pose
 `O` and constant wrist bone 1 do not cancel out: `O.p + O.q·bone1.p =
 (−0.0007, 0.0140, −0.0077)` m in the left wrist joint's frame, placing the
 drawn wrist 16 mm from the reported wrist joint (14 mm out the back of the
 hand). These constants are likely tuned for the wrist joint convention of the
-headsets `vrlink` runs on (**inferred**). `client` briefly shifted the sent
-wrist pose by the opposite offset, which the user reported aligned the hands,
-but the 1 cm discrepancy turned out to come from publishing canted eye frusta
+headsets `vrlink` runs on (**inferred**). OpenVRLink briefly shifted the sent
+wrist pose by the opposite offset to improve alignment, but the 1 cm
+discrepancy turned out to come from publishing canted eye frusta
 (docs/svl-video/frame-layout.md). Once eye canting was corrected, the wrist
-shift was removed and `client` sends the tracked wrist joint directly. Whether
-the 16 mm offset is noticeable on its own remains open.
+shift was removed and OpenVRLink sends the tracked wrist joint directly.
+Whether the 16 mm offset is noticeable on its own remains open.
 
 ## Open questions / to confirm on the wire
 

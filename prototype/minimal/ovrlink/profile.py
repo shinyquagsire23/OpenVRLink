@@ -91,7 +91,7 @@ def chaperone(universe_id):
 
 
 def startup_values(instance_id):
-    """Everything the reference client publishes before video starts."""
+    """Startup values published by vrlink before video starts."""
     return {
         CLIENT_INSTANCE: struct.pack("<Q", instance_id | 1),
         PROJECTION: projection(),

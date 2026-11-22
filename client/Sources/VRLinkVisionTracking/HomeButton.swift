@@ -19,13 +19,13 @@ import VRLinkCore
 /// Button discovery details are logged because controller button reporting is
 /// undocumented and varies across controller models and OS releases.
 ///
-/// Tested on visionOS 27 with PlayStation VR2 Sense controllers (2026-11-10):
-/// Sense controllers do not expose a Home button in `physicalInputProfile`,
-/// live inputs, unmapped inputs, or `extendedGamepad` (which is `nil`), even
-/// when the user selects "Defer to app". Pressing PS generates no input event
-/// under any name, whereas Create/Options (`"Button Menu"`) and face buttons
-/// work normally. This class is therefore a no-op for Sense controllers,
-/// retained for spatial or standard controllers that do expose `Button Home`.
+/// On visionOS 27, PlayStation VR2 Sense controllers do not expose a Home button
+/// in `physicalInputProfile`, live inputs, unmapped inputs, or `extendedGamepad`
+/// (which is `nil`), even when "Defer to app" is selected. Pressing PS generates
+/// no input event under any name, whereas Create/Options (`"Button Menu"`) and
+/// face buttons work normally. This class is therefore a no-op for Sense
+/// controllers, retained for spatial or standard controllers that do expose
+/// `Button Home`.
 public final class HomeButton: ObservableObject {
     public init() {}
 

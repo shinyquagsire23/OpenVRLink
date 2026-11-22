@@ -3,7 +3,7 @@
 The broadcast protocol uses three cryptographic primitives, identified via
 **static** analysis of `libshell_arm64-v8a.so` and matching all **captured**
 wire lengths (subsequently verified against a live host; see
-[Probe results](#probe-results-2026-11-10)).
+[Probe results](#probe-results)).
 
 ## Symmetric encryption (`CCrypto::SymmetricEncrypt`, +0xfbf210)
 
@@ -98,7 +98,7 @@ ticket to Steam's servers. The Public key is included in
 - Whether a host that completes the X25519 key exchange ever inspects
   `encrypted_request`.
 
-## Probe results (2026-11-10)
+## Probe results
 
 Running the Python probe to pair and start a session exercised these primitives
 against a live host: the symmetric scheme (`device_token`, proof response,

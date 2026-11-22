@@ -114,7 +114,7 @@ first datagram. Each value is a ValueTransportSystem record formatted as
   renders at most one frame per distinct pose target time up to the agreed
   refresh rate.
 
-## Probe results (2026-11-10)
+## Probe results
 
 See "Refresh rate and pacing (probe)" in
 [../svl-values/startup-exchange.md](../svl-values/startup-exchange.md): the
@@ -122,7 +122,7 @@ host's 0x21 request was 90.0 Hz regardless of the offered list, while the
 delivered frame rate followed the offered rate (73 fps with only 72 Hz offered,
 and 90.0 fps with 90 Hz offered) rather than the client's pose cadence.
 
-## Mid-session rate changes (probe, 2026-11-10)
+## Mid-session rate changes (probe)
 
 In a single session, the probe stepped through six rate changes at six seconds
 per step, pacing its pose loop to match each new rate (**captured**):

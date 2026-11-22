@@ -21,3 +21,7 @@ client/visionOS/Resources/Icon*.png
 
 # local release helper
 package_all.sh
+
+# Android build output
+.build-android/
+client/android/build/
