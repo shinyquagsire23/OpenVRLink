@@ -27,10 +27,14 @@ public final class XRDisplay<Graphics: XRGraphics> {
     public var streamingSession: () -> (any StreamingSession)? = { nil }
     /// Returns the current chroma-key configuration for each frame.
     public var chromaKey: () -> ChromaKey? = { nil }
+    /// Returns whether stereo depth estimation (`use`) and the debug depth overlay (`show`) are enabled.
+    public var depthFromPicture: () -> (use: Bool, show: Bool) = { (false, false) }
     /// Invoked on the render thread once the session starts and initial eye geometry is measured.
     public var onReady: ((DeviceProfile) -> Void)?
     /// Invoked on the render thread when the OpenXR session stops or exits.
     public var onPaused: (() -> Void)?
+    /// Invoked on the render thread when a pending OpenXR reference-space or boundary change takes effect.
+    public var onSpaceChanged: (() -> Void)?
 
     /// Reference space used for pose tracking and projection layer submission.
     public enum Origin: String {
@@ -62,6 +66,21 @@ public final class XRDisplay<Graphics: XRGraphics> {
     private var measured = false
     private var described = false
     private var latestDisplayTime: XrTime = 0
+    private var pace = FramePace()
+    private var face: XRFace?
+    /// Whether face tracking is active for this session.
+    public var tracksFace: Bool { face != nil }
+    /// Latest face expression weights, or `nil` when face tracking is unavailable or untracked. Thread-safe.
+    public func faceExpressions() -> FaceExpressions? { face?.expressions() }
+    /// Whether face tracking is supported by the runtime but awaiting system face calibration. Thread-safe.
+    public var faceNeedsCalibration: Bool { face?.needsCalibration ?? false }
+    private lazy var depth = StereoDepthEstimator<Graphics.Frame>(measure: graphics.measure) { [graphics] in
+        graphics.shrink($0, width: $1, done: $2)
+    }
+    private var depthInUse = false
+    private var depthNoted: UInt64 = 0
+    /// Timestamp (`XrTime`) at which a pending reference-space change takes effect.
+    private var spaceChangesAt: XrTime?
 
     public init(applicationName: String, graphics: Graphics, frames: DisplayQueue<Graphics.Frame>, panel: XRPanelLayer? = nil,
                 process: XRProcess = XRProcess(), log: @escaping (String) -> Void) throws {
@@ -74,6 +93,7 @@ public final class XRDisplay<Graphics: XRGraphics> {
         let calls = instance.calls
         log("openxr: \(instance.runtimeName), headset \"\(instance.systemName())\"")
         log("openxr: extensions \(instance.extensions.sorted().joined(separator: " "))")
+        log("openxr: also offered \(instance.offered.subtracting(instance.extensions).sorted().joined(separator: " "))")
 
         try graphics.prepare(instance: instance)
         var made: XrSession?
@@ -108,6 +128,7 @@ public final class XRDisplay<Graphics: XRGraphics> {
         log("openxr: tracking in the \(origin.rawValue) space")
 
         input = try XRInput(instance: instance, session: made, log: log)
+        face = XRFace(instance: instance, session: made, log: log)
 
         let stereo = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO
         try check(calls.enumerateViewConfigurationViews(instance.handle, instance.system, stereo, 0, &count, nil),
@@ -187,6 +208,10 @@ public final class XRDisplay<Graphics: XRGraphics> {
         _ = calls.destroySession(session)
     }
 
+    /// Whether the headset supports `XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND` passthrough, required for chroma
+    /// keying and alpha-blended streams.
+    public var canShowRoom: Bool { blendModes.contains(XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND) }
+
     /// Requests that the OpenXR session exit, causing `run()` to return once shutdown completes. Thread-safe.
     public func quit() {
         lock.lock()
@@ -243,8 +268,9 @@ public final class XRDisplay<Graphics: XRGraphics> {
             case XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED:
                 input.noteControllers()
             case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:
-                // TODO: Update the play-space transform across reference-space changes like RoomTracker on visionOS.
+                let change = withUnsafeBytes(of: &event) { $0.load(as: XrEventDataReferenceSpaceChangePending.self) }
                 log("openxr: \(origin.rawValue) reference space change pending")
+                spaceChangesAt = max(spaceChangesAt ?? 0, change.changeTime)
             case XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB:
                 let change = withUnsafeBytes(of: &event) { $0.load(as: XrEventDataDisplayRefreshRateChangedFB.self) }
                 log("openxr: display refresh rate changed from \(change.fromDisplayRefreshRate) to \(change.toDisplayRefreshRate) Hz")
@@ -338,13 +364,22 @@ public final class XRDisplay<Graphics: XRGraphics> {
         let calls = instance.calls
         var timing = XrFrameState()
         timing.type = XR_TYPE_FRAME_STATE
+        let began = Uptime.nanoseconds
         try check(calls.waitFrame(session, nil, &timing), "xrWaitFrame")
+        let waited = Uptime.nanoseconds
         try check(calls.beginFrame(session, nil), "xrBeginFrame")
         let time = timing.predictedDisplayTime
         let period = timing.predictedDisplayPeriod > 0 ? Double(timing.predictedDisplayPeriod) / 1e9 : 1.0 / 90
         latestDisplayTime = time
 
         if let space { input.update(at: time, in: space) }
+        face?.update(at: time)
+        if let changes = spaceChangesAt, time >= changes {
+            spaceChangesAt = nil
+            // Reset the panel pose so it is placed in front of the user in the updated reference space.
+            panel?.pose = nil
+            onSpaceChanged?()
+        }
         if !measured, let profile = measure(at: time, period: period) {
             measured = true
             onReady?(profile)
@@ -358,6 +393,7 @@ public final class XRDisplay<Graphics: XRGraphics> {
             if let picked, picked.isNew { stream.frameShown(picked.frame.frameID, at: shown) }
         }
 
+        let field = followDepth(picked)
         let key = chromaKey()
         if graphics.chromaKey != key { graphics.chromaKey = key }
         let frame = picked?.frame
@@ -390,8 +426,12 @@ public final class XRDisplay<Graphics: XRGraphics> {
             try check(calls.waitSwapchainImage(swapchain.handle, &wait), "xrWaitSwapchainImage")
 
             let view = EyeView(eye: Pose(views[eye.rawValue].pose), frustum: Frustum(views[eye.rawValue].fov))
-            draws.append(XREyeDraw(eye: eye.rawValue, image: Int(image), view: view,
-                                   quads: frame.map { Composition.quads(for: eye, layout: $0.layout) } ?? []))
+            var quads: [Quad] = []
+            if let frame {
+                quads = Composition.quads(for: eye, layout: frame.layout, depth: field.use)
+                if let shown = field.show { quads += Composition.picture(of: shown, for: eye, layout: frame.layout) }
+            }
+            draws.append(XREyeDraw(eye: eye.rawValue, image: Int(image), view: view, quads: quads))
             var layerView = XrCompositionLayerProjectionView()
             layerView.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW
             layerView.pose = views[eye.rawValue].pose
@@ -400,7 +440,9 @@ public final class XRDisplay<Graphics: XRGraphics> {
             layerView.subImage.imageRect.extent = XrExtent2Di(width: Int32(swapchain.width), height: Int32(swapchain.height))
             projected.append(layerView)
         }
+        let drawBegan = Uptime.nanoseconds
         graphics.draw(draws, frame: frame, transparent: transparent)
+        let drawn = Uptime.nanoseconds
         for swapchain in swapchains {
             try check(calls.releaseSwapchainImage(swapchain.handle, nil), "xrReleaseSwapchainImage")
         }
@@ -432,6 +474,54 @@ public final class XRDisplay<Graphics: XRGraphics> {
                 }
             }
         }
+        if frame != nil {
+            let ended = Uptime.nanoseconds
+            pace.add(new: picked?.isNew == true, wait: waited - began, prepare: drawBegan - waited, draw: drawn - drawBegan,
+                     end: ended - drawn, at: ended)
+            if let line = pace.report(at: ended, period: period) { log(line) }
+        }
+    }
+
+    /// Feeds newly decoded frames to the stereo depth estimator when enabled and returns the reprojected depth
+    /// field for the current frame (plus the debug overlay field when requested).
+    private func followDepth(_ picked: (frame: Graphics.Frame, isNew: Bool)?) -> (use: DepthField?, show: DepthField?) {
+        let wanted = depthFromPicture()
+        guard wanted.use, graphics.supportsDepth else {
+            if depthInUse {
+                depthInUse = false
+                depthNoted = 0
+                depth.forget()
+            }
+            return (nil, nil)
+        }
+        depthInUse = true
+        guard let picked else { return (nil, nil) }
+        if picked.isNew {
+            // Sample depth densely around the hands or controllers and straight ahead.
+            let hands = input.hands().compactMap { hand -> Vec3? in
+                switch hand {
+                case .controller(let state)?: return state.grip.pose.position
+                case .hand(let tracked)?: return tracked.joints.first?.position
+                case nil: return nil
+                }
+            }
+            depth.offer(picked.frame, interests: DepthSampling.interests(layout: picked.frame.layout, hands: hands))
+        }
+        let now = Uptime.nanoseconds
+        if depthNoted == 0 { depthNoted = now }
+        if now - depthNoted > 5_000_000_000 {
+            depthNoted = now
+            if let report = depth.report {
+                log(String(format: "depth: %.0f%% coverage; center %.2f m, nearest %.2f m; %.1f ms to match, %.1f ms latency, "
+                               + "%d frames processed, %d skipped",
+                           report.measured * 100, 1 / max(0.001, report.ahead), 1 / max(0.001, report.nearest), report.milliseconds,
+                           report.behind, report.taken, report.passed))
+            } else {
+                log("depth: no depth estimate available yet")
+            }
+        }
+        let field = depth.field?.fitted(to: picked.frame.layout)
+        return (field, wanted.show ? field : nil)
     }
 
     /// Updates the panel for this frame (positioning, pointer input, and swapchain upload) and returns its
@@ -458,6 +548,11 @@ public final class XRDisplay<Graphics: XRGraphics> {
         guard panel.isWanted?() ?? panel.visible else {
             panel.pose = nil
             return nil
+        }
+        // Reposition the panel if the user has walked away from it or the tracking origin shifted.
+        if let pose = panel.pose, let head = input.head()?.pose {
+            let away = pose.position - head.position
+            if away.dot(away).squareRoot() > panel.metersAway * 2.5 { panel.pose = nil }
         }
         if panel.pose == nil {
             guard let head = input.head() else { return nil }
@@ -486,5 +581,44 @@ public final class XRDisplay<Graphics: XRGraphics> {
         quad.pose = pose.xr
         quad.size = XrExtent2Df(width: panel.metersWide, height: panel.metersWide * Float(panel.height) / Float(panel.width))
         return quad
+    }
+}
+
+/// Accumulates per-stage frame-loop timings during streaming and formats a periodic summary log line.
+struct FramePace {
+    static let every = 5.0
+
+    private var since: UInt64 = 0, last: UInt64 = 0
+    private var frames = 0, new = 0, late = 0
+    private var wait: UInt64 = 0, prepare: UInt64 = 0, draw: UInt64 = 0, end: UInt64 = 0
+    private var longestDraw: UInt64 = 0, longestGap: UInt64 = 0
+
+    /// Records timing for one displayed frame (in nanoseconds) across `xrWaitFrame`, frame preparation, GPU draw
+    /// submission, and `xrEndFrame`.
+    mutating func add(new isNew: Bool, wait: UInt64, prepare: UInt64, draw: UInt64, end: UInt64, at now: UInt64) {
+        if since == 0 { since = now }
+        if last != 0 { longestGap = max(longestGap, now - last) }
+        last = now
+        frames += 1
+        if isNew { new += 1 }
+        self.wait += wait
+        self.prepare += prepare
+        self.draw += draw
+        self.end += end
+        longestDraw = max(longestDraw, draw)
+    }
+
+    /// Formats and resets the accumulated metrics once `every` seconds have elapsed. `period` is the display
+    /// refresh period in seconds.
+    mutating func report(at now: UInt64, period: Double) -> String? {
+        let seconds = Double(now - since) / 1e9
+        guard since != 0, seconds >= FramePace.every, frames > 0 else { return nil }
+        func each(_ total: UInt64) -> Double { Double(total) / Double(frames) / 1e6 }
+        let line = String(format: "openxr: showed %.0f frames/s of %.0f (%.0f new pictures/s); each frame waited %.1f ms, "
+                              + "prepared %.1f, drew %.1f (longest %.1f), ended %.1f; longest between frames %.1f ms",
+                          Double(frames) / seconds, 1 / period, Double(new) / seconds, each(wait), each(prepare), each(draw),
+                          Double(longestDraw) / 1e6, each(end), Double(longestGap) / 1e6)
+        self = FramePace()
+        return line
     }
 }

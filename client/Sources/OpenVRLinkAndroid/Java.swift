@@ -79,6 +79,24 @@ struct Java {
         return threw() ? nil : result
     }
 
+    func bool(_ target: jobject?, _ name: String, _ signature: String, _ arguments: [jvalue] = []) -> Bool? {
+        guard let method = method(of: target, name, signature) else { return nil }
+        let result = calls.CallBooleanMethodA(env, target, method, arguments)
+        return threw() ? nil : result != 0
+    }
+
+    func long(_ target: jobject?, _ name: String, _ signature: String, _ arguments: [jvalue] = []) -> Int64? {
+        guard let method = method(of: target, name, signature) else { return nil }
+        let result = calls.CallLongMethodA(env, target, method, arguments)
+        return threw() ? nil : result
+    }
+
+    /// Returns the non-null elements of a Java object array.
+    func elements(_ array: jobject?) -> [jobject] {
+        guard let array else { return [] }
+        return (0..<calls.GetArrayLength(env, array)).compactMap { calls.GetObjectArrayElement(env, array, $0) }
+    }
+
     @discardableResult
     func void(_ target: jobject?, _ name: String, _ signature: String, _ arguments: [jvalue] = []) -> Bool {
         guard let method = method(of: target, name, signature) else { return false }
@@ -143,6 +161,25 @@ struct ActivityCalls {
     /// re-check `has(_:)`.
     func request(_ permissions: [String]) {
         java.void(activity, "requestPermissions", "([Ljava/lang/String;I)V", [jvalue(l: java.strings(permissions)), jvalue(i: 1)])
+    }
+
+    /// Returns connected Ethernet and USB networks as `(interfaceName, networkHandle)` pairs for
+    /// `android_setsocknetwork`. Requires `ACCESS_NETWORK_STATE`.
+    func wiredNetworks() -> [(name: String, handle: Int64)] {
+        let manager = java.object(activity, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;",
+                                  [jvalue(l: java.string("connectivity"))])
+        let networks = java.elements(java.object(manager, "getAllNetworks", "()[Landroid/net/Network;"))
+        return networks.compactMap { network in
+            let can = java.object(manager, "getNetworkCapabilities", "(Landroid/net/Network;)Landroid/net/NetworkCapabilities;",
+                                  [jvalue(l: network)])
+            // NetworkCapabilities.TRANSPORT_ETHERNET = 3, TRANSPORT_USB = 8.
+            guard [3, 8].contains(where: { java.bool(can, "hasTransport", "(I)Z", [jvalue(i: $0)]) == true }) else { return nil }
+            let link = java.object(manager, "getLinkProperties", "(Landroid/net/Network;)Landroid/net/LinkProperties;", [jvalue(l: network)])
+            guard let name = java.text(java.object(link, "getInterfaceName", "()Ljava/lang/String;")),
+                  let handle = java.long(network, "getNetworkHandle", "()J")
+            else { return nil }
+            return (name, handle)
+        }
     }
 
     /// Reads the user-assigned device name from `Settings.Global`, if set.

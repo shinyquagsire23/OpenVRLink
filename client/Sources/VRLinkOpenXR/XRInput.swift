@@ -89,6 +89,22 @@ public final class XRInput {
         ]) { $1 }),
     ]
 
+    /// Polls a platform system button not exposed through OpenXR (such as Android's back button) and maps it to
+    /// the left controller menu button or left-hand menu gesture.
+    public var systemButton: (() -> Bool)?
+
+    /// Per-hand local grip pose offsets (`[left, right]`) used to align the headset's controller grip with Quest
+    /// Touch (`HeadsetQuirks.gripOffset`). Configured before streaming starts.
+    public var gripOffsets: [Pose]?
+
+    /// Gaze fixation point in head space (+X right, +Y up, +Z back, in meters), or `nil` when eye gaze is
+    /// untracked. Thread-safe.
+    public func gaze() -> Vec3? {
+        lock.lock()
+        defer { lock.unlock() }
+        return latestGaze
+    }
+
     private let instance: XRInstance
     private let session: XrSession
     private let log: (String) -> Void
@@ -98,6 +114,18 @@ public final class XRInput {
     private var grips: [XrSpace?] = [nil, nil], aims: [XrSpace?] = [nil, nil], points: [XrSpace?] = [nil, nil]
     private var trackers: [XrHandTrackerEXT?] = [nil, nil]
     private var headSpace: XrSpace?
+    /// Eye gaze pose action and action space when `XR_EXT_eye_gaze_interaction` is active.
+    private var gazeAction: XrAction?
+    private var gazeSpace: XrSpace?
+    private var latestGaze: Vec3?
+    private var gazeNoted = false
+    /// Synthetic fixation distance in meters along the gaze ray, since `XR_EXT_eye_gaze_interaction` reports
+    /// direction without convergence depth.
+    private static let gazeDistance: Float = 10
+
+    /// Whether eye gaze tracking is available on this session (on Android XR, requires `EYE_TRACKING_FINE`
+    /// granted before instance creation).
+    public var tracksGaze: Bool { gazeAction != nil }
 
     private let lock = NSLock()
     private var latestHead: TrackedPose?
@@ -159,6 +187,33 @@ public final class XRInput {
             if result.rawValue < 0 { log("openxr: \(profile.path) not offered (\(XRFailure.name(of: result)))") }
         }
 
+        if instance.extensions.contains("XR_EXT_eye_gaze_interaction") {
+            var info = XrActionCreateInfo()
+            info.type = XR_TYPE_ACTION_CREATE_INFO
+            info.actionType = XR_ACTION_TYPE_POSE_INPUT
+            fill(&info.actionName, with: "gaze")
+            fill(&info.localizedActionName, with: "Eye gaze")
+            var action: XrAction?
+            if calls.createAction(actionSet, &info, &action).rawValue >= 0, let action,
+               let path = try? instance.path("/user/eyes_ext/input/gaze_ext/pose"),
+               let profile = try? instance.path("/interaction_profiles/ext/eye_gaze_interaction") {
+                var binding = XrActionSuggestedBinding(action: action, binding: path)
+                var suggestion = XrInteractionProfileSuggestedBinding()
+                suggestion.type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING
+                suggestion.interactionProfile = profile
+                suggestion.countSuggestedBindings = 1
+                let result = withUnsafePointer(to: &binding) { one -> XrResult in
+                    suggestion.suggestedBindings = one
+                    return calls.suggestInteractionProfileBindings(instance.handle, &suggestion)
+                }
+                if result.rawValue >= 0 {
+                    gazeAction = action
+                } else {
+                    log("openxr: eye gaze not offered (\(XRFailure.name(of: result)))")
+                }
+            }
+        }
+
         var attach = XrSessionActionSetsAttachInfo()
         attach.type = XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO
         try withUnsafePointer(to: actionSet) { set in
@@ -172,6 +227,15 @@ public final class XRInput {
             aims[side.rawValue] = try actionSpace(.aim, side)
             points[side.rawValue] = try actionSpace(.point, side)
         }
+
+        if let gazeAction {
+            var info = XrActionSpaceCreateInfo()
+            info.type = XR_TYPE_ACTION_SPACE_CREATE_INFO
+            info.action = gazeAction
+            info.poseInActionSpace = .identity
+            if calls.createActionSpace(session, &info, &gazeSpace).rawValue < 0 { self.gazeAction = nil }
+        }
+        log("openxr: eye gaze \(gazeAction != nil ? "available" : "not available")")
 
         var view = XrReferenceSpaceCreateInfo()
         view.type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO
@@ -196,7 +260,7 @@ public final class XRInput {
     deinit {
         let calls = instance.calls
         for tracker in trackers { if let tracker { _ = calls.destroyHandTracker?(tracker) } }
-        for space in grips + aims + points + [headSpace] { if let space { _ = calls.destroySpace(space) } }
+        for space in grips + aims + points + [headSpace, gazeSpace] { if let space { _ = calls.destroySpace(space) } }
     }
 
     private func actionSpace(_ control: Control, _ side: Side) throws -> XrSpace? {
@@ -294,11 +358,11 @@ public final class XRInput {
         guard instance.calls.getActionStatePose(session, &which, &held).rawValue >= 0, held.isActive != 0,
               let grip = locate(grips[side.rawValue], in: base, at: time)
         else { return nil }
-        var state = ControllerState(grip: grip)
+        var state = ControllerState(grip: gripOffsets.map { grip.placing($0[side.rawValue]) } ?? grip)
         state.aim = locate(aims[side.rawValue], in: base, at: time)?.pose
         state.lowerButton = pressed(.lower, side)
         state.upperButton = pressed(.upper, side)
-        state.menuButton = pressed(.menu, side)
+        state.menuButton = pressed(.menu, side) || (side == .left && systemButton?() == true)
         state.stickClick = pressed(.stickClick, side)
         state.lowerButtonTouched = pressed(.lowerTouch, side)
         state.upperButtonTouched = pressed(.upperTouch, side)
@@ -327,15 +391,27 @@ public final class XRInput {
         var joints = [XrHandJointLocationEXT](repeating: XrHandJointLocationEXT(), count: TrackedHand.jointCount)
         var located = XrHandJointLocationsEXT()
         located.type = XR_TYPE_HAND_JOINT_LOCATIONS_EXT
+        // Chain XrHandTrackingAimStateFB when supported to read Quest's palm-pinch menu gesture.
+        var aim = XrHandTrackingAimStateFB()
+        aim.type = XR_TYPE_HAND_TRACKING_AIM_STATE_FB
+        let readsMenu = instance.extensions.contains("XR_FB_hand_tracking_aim")
         let result = joints.withUnsafeMutableBufferPointer { all -> XrResult in
             located.jointCount = UInt32(all.count)
             located.jointLocations = all.baseAddress
-            return locateJoints(tracker, &which, &located)
+            guard readsMenu else { return locateJoints(tracker, &which, &located) }
+            return withUnsafeMutablePointer(to: &aim) { chained in
+                located.next = UnsafeMutableRawPointer(chained)
+                return locateJoints(tracker, &which, &located)
+            }
         }
         let needed = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT
         guard result.rawValue >= 0, located.isActive != 0, joints.allSatisfy({ $0.locationFlags & needed == needed })
         else { return nil }
-        return TrackedHand(joints: joints.map { Pose($0.pose) })
+        var tracked = TrackedHand(joints: joints.map { Pose($0.pose) })
+        // The host reads the menu gesture from the left hand only.
+        let gestured = readsMenu && aim.status & XR_HAND_TRACKING_AIM_MENU_PRESSED_BIT_FB != 0
+        tracked.menu = side == .left && (gestured || systemButton?() == true)
+        return tracked
     }
 
     /// Synchronizes OpenXR actions and samples head, controller, and hand poses at `time` in `base`.
@@ -367,7 +443,25 @@ public final class XRInput {
             else { return nil }
             return Pointer(ray: ray.pose, press: amount(.press, side))
         }
+        // Sample eye gaze in head space and project a fixation point along the gaze ray.
+        var gaze: Vec3?
+        if let gazeAction, let headSpace {
+            var which = XrActionStateGetInfo()
+            which.type = XR_TYPE_ACTION_STATE_GET_INFO
+            which.action = gazeAction
+            var state = XrActionStatePose()
+            state.type = XR_TYPE_ACTION_STATE_POSE
+            if calls.getActionStatePose(session, &which, &state).rawValue >= 0, state.isActive != 0,
+               let look = locate(gazeSpace, in: headSpace, at: time)?.pose {
+                gaze = look.position + look.forward * XRInput.gazeDistance
+            }
+            if (gaze != nil) != gazeNoted {
+                gazeNoted = gaze != nil
+                log("openxr: eye gaze \(gazeNoted ? "active" : "inactive")")
+            }
+        }
         lock.lock()
+        latestGaze = gaze
         latestHead = head
         latestHands = hands
         latestPointers = pointers

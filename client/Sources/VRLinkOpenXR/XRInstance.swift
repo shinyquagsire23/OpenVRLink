@@ -57,6 +57,8 @@ public final class XRInstance {
     public let system: XrSystemId
     /// Instance extensions enabled during creation.
     public let extensions: Set<String>
+    /// All instance extensions advertised by the OpenXR runtime, recorded for diagnostic logging.
+    public let offered: Set<String>
     /// Human-readable runtime name and version string.
     public let runtimeName: String
 
@@ -68,6 +70,9 @@ public final class XRInstance {
         "XR_KHR_convert_timespec_time",      // display times on the client's clock
         "XR_EXT_hand_tracking",
         "XR_EXT_hand_interaction",           // hand aim ray and pinch actions for panel UI
+        "XR_EXT_eye_gaze_interaction",       // eye gaze for foveated encoding and social gaze
+        "XR_ANDROID_face_tracking",
+        "XR_FB_hand_tracking_aim",           // system hand gestures (such as Quest's left-hand menu pinch)
         "XR_FB_display_refresh_rate",
         "XR_EXT_local_floor",
         "XR_META_touch_controller_plus",
@@ -112,6 +117,7 @@ public final class XRInstance {
         for name in wanted where !available.contains(name) { throw XRFailure.unsupported(name) }
         wanted += XRInstance.optional.filter { available.contains($0) && !wanted.contains($0) }
         extensions = Set(wanted)
+        self.offered = available
 
         var info = XrInstanceCreateInfo()
         info.type = XR_TYPE_INSTANCE_CREATE_INFO

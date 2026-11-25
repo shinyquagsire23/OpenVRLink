@@ -36,6 +36,9 @@ final class App: @unchecked Sendable {
     static let flatSuffix = ".Panel"
     static let immersiveClass = "android.app.NativeActivity"
     static let handTracking = "android.permission.HAND_TRACKING"
+    /// Required on Android XR for OpenXR eye gaze tracking.
+    static let eyeTracking = "android.permission.EYE_TRACKING_FINE"
+    static let faceTracking = "android.permission.FACE_TRACKING"
     static let recordAudio = "android.permission.RECORD_AUDIO"
 
     private var vm: UnsafeMutablePointer<JavaVM?>?
@@ -60,6 +63,10 @@ final class App: @unchecked Sendable {
     private var touch: (x: Float, y: Float, pressed: Bool)?
     /// Remaining frames to keep reporting a released touch position so ImGui registers the button release.
     private var touchLingers = 0
+    /// Back-button state and minimum hold deadline (uptime in nanoseconds) so brief presses aren't missed
+    /// between polls. Guarded by `lock`.
+    private var backDown = false, backHeldUntil: UInt64 = 0
+    private var keysNoted: Set<Int32> = []
 
     private var immersive: UnsafeMutablePointer<ANativeActivity>?
     private var quitImmersive: (() -> Void)?
@@ -220,10 +227,25 @@ final class App: @unchecked Sendable {
 
     private func runImmersive(_ activity: UnsafeMutablePointer<ANativeActivity>) {
         guard let model, let panel else { return }
-        // Request hand-tracking permission before the OpenXR session creates hand trackers.
-        ask(for: [App.handTracking], from: activity)
+        // Request hand, eye, and face tracking permissions before creating the OpenXR instance, since the runtime
+        // checks granted permissions at instance creation.
+        ask(for: [App.handTracking, App.eyeTracking, App.faceTracking], from: activity)
 
         var platform = XRPlatform(device: device)
+        platform.gripOffset = quirks.gripOffset
+        platform.systemButton = { [weak self] in
+            guard let self else { return false }
+            lock.lock()
+            defer { lock.unlock() }
+            return backDown || Uptime.nanoseconds < backHeldUntil
+        }
+        // Android routes sockets over the default network unless explicitly bound by handle, and a direct USB or
+        // Ethernet link to a PC without internet access never becomes the default.
+        platform.preferredInterfaces = { [weak self] in self?.with(activity) { $0.wiredNetworks().map(\.name) } ?? [] }
+        NetworkInterfaces.bind = { [weak self] descriptor, name in
+            guard let handle = self?.with(activity, { $0.wiredNetworks().first { $0.name == name }?.handle }) ?? nil else { return false }
+            return android_setsocknetwork(net_handle_t(bitPattern: handle), descriptor) == 0
+        }
         platform.startAudio = { [weak self] session in self?.audio = AudioOutput(buffer: session.audio) }
         platform.stopAudio = { [weak self] in self?.audio = nil }
         platform.startMicrophone = { [weak self] sink in self?.startMicrophone(into: sink, from: activity) }
@@ -238,6 +260,7 @@ final class App: @unchecked Sendable {
         panelLock.lock()
         defer {
             // Restore panel and model callbacks for the 2D window when the immersive session exits.
+            NetworkInterfaces.bind = nil
             panel.showsPointer = false
             panel.hint = ""
             panel.pointer = nil
@@ -362,6 +385,17 @@ final class App: @unchecked Sendable {
             while AInputQueue_getEvent(queue, &event) >= 0, let event {
                 if AInputQueue_preDispatchEvent(queue, event) != 0 { continue }
                 var handled: Int32 = 0
+                if AInputEvent_getType(event) == Int32(AINPUT_EVENT_TYPE_KEY) {
+                    let key = AKeyEvent_getKeyCode(event), down = AKeyEvent_getAction(event) == Int32(AKEY_EVENT_ACTION_DOWN)
+                    if keysNoted.insert(key).inserted { Log.note("input: key \(key) \(down ? "pressed" : "released") for the first time") }
+                    // Intercept the back button during an immersive session so it acts as the host system button
+                    // (`XRPlatform.systemButton`) instead of closing the activity.
+                    if key == Int32(AKEYCODE_BACK), immersive != nil, queue != flatQueue {
+                        backDown = down
+                        if down { backHeldUntil = Uptime.nanoseconds + 150_000_000 }
+                        handled = 1
+                    }
+                }
                 if queue == flatQueue, AInputEvent_getType(event) == Int32(AINPUT_EVENT_TYPE_MOTION), let panel {
                     let x = AMotionEvent_getX(event, 0) / flatSize.width * Float(panel.width)
                     let y = AMotionEvent_getY(event, 0) / flatSize.height * Float(panel.height)

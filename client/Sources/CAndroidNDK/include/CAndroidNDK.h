@@ -13,6 +13,7 @@
 #include <aaudio/AAudio.h>
 #include <android/hardware_buffer.h>
 #include <android/log.h>
+#include <android/multinetwork.h>
 #include <android/looper.h>
 #include <android/native_activity.h>
 #include <android/native_window.h>

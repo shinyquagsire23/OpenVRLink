@@ -67,4 +67,16 @@ public protocol XRGraphics: AnyObject {
 
     /// Optional chroma-key filter applied during quad rendering.
     var chromaKey: ChromaKey? { get set }
+    /// Whether the graphics device supports chroma-keyed rendering. Valid after `prepare` completes.
+    var supportsChromaKey: Bool { get }
+
+    /// Whether decoded frames can be read back for stereo depth estimation.
+    var supportsDepth: Bool { get }
+    /// Optional GPU stereo-matching hook; when `nil`, `StereoDepthEstimator` falls back to `shrink` and matches
+    /// on the CPU. Valid after `adopt` completes.
+    var measure: StereoDepthEstimator<Frame>.Measure? { get }
+    /// Downsamples both eyes of `frame` to `width`-pixel-wide grayscale images (`StereoPlan`) for CPU stereo
+    /// matching, completing on any queue with `nil` if readback fails. Called off the render thread; GPU-backed
+    /// implementations may defer the work to the next `draw` call.
+    func shrink(_ frame: Frame, width: Int, done: @escaping (StereoPair?) -> Void)
 }

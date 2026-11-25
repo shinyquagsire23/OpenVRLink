@@ -26,6 +26,8 @@ public enum SettingsForm {
         /// Runs in a separate 2D window that can be dismissed when streaming starts.
         public static let window = Features(rawValue: 1 << 6)
         public static let senseControllers = Features(rawValue: 1 << 7)
+        /// Supports estimating scene depth from decoded stereo video frames.
+        public static let depthFromPicture = Features(rawValue: 1 << 8)
     }
 
     public enum Control {
@@ -65,6 +67,11 @@ public enum SettingsForm {
             Item(title: "Min Color Distance", control: .slider(\.chromaKeyNear, in: 0...1, step: 0.01), needs: .chromaKey),
             Item(title: "Max Color Distance", control: .slider(\.chromaKeyFar, in: 0.01...1, step: 0.01), needs: .chromaKey),
             Item(title: "Disable passthrough during games", control: .toggle(\.chromaKeyOffInGames), needs: .chromaKey),
+        ]),
+        Section(title: "Depth", footer: "Estimates scene depth from stereo disparity so nearby surfaces stay in place "
+                    + "as your head moves between frames", items: [
+            Item(title: "Estimate depth from stereo video", control: .toggle(\.depthFromPicture), needs: .depthFromPicture),
+            Item(title: "Display estimated depth (debug)", control: .toggle(\.showDepth), needs: .depthFromPicture),
         ]),
         Section(title: "Field of view", footer: "Increase FoV for timewarp comfort, or sacrifice FoV for sharpness", items: [
             Item(title: "Across", control: .slider(\.fovScaleHorizontal, in: Settings.fovScaleRange, step: 0.05)),

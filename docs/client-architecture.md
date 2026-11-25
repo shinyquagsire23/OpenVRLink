@@ -298,8 +298,34 @@ notice so the host closes the session.
 
 Tracking and rendering prefer the `STAGE` reference space when supported (using
 `xrGetReferenceSpaceBoundsRect` as the room chaperone boundary sent to the
-host), falling back to `LOCAL_FLOOR` and then `LOCAL`. Saved rooms, spatial
-anchors, and Room Setup are not implemented on OpenXR yet.
+host), falling back to `LOCAL_FLOOR` and then `LOCAL`. OpenXR relies directly on
+the runtime's boundary system rather than maintaining saved rooms or spatial
+anchors. When the user recenters or edits their boundary in the system UI, the
+runtime posts a reference-space change event; once its change timestamp arrives,
+`XRDisplay.onSpaceChanged` fires so `XRClient` can re-read the bounds and send
+them to the host. When the host requests a recenter, `XRClient` moves the
+play-space origin beneath the user's head for the rest of the session (matching
+visionOS) and transforms the boundary corners so the chaperone stays in the same
+physical spot.
+
+Eye gaze uses `XR_EXT_eye_gaze_interaction`. Because that extension provides a
+gaze ray in view space without a convergence distance, `XRInput` projects a
+fixation point 10 m along the ray. Face tracking uses
+`XR_ANDROID_face_tracking` (`XRFace.swift`), whose first 63 blendshape weights
+match the `XR_FB_face_tracking2` layout expected by the host (`TONGUE_OUT` maps
+to index 68). On Galaxy XR, the runtime reports no face weights until the user
+completes system face calibration; `XRFace` queries
+`xrGetFaceCalibrationStateANDROID` so the in-headset panel can prompt the user
+to calibrate.
+
+On Android, the system back button is delivered to the `NativeActivity` input
+queue rather than OpenXR. During an immersive session, `Activity.swift` consumes
+`AKEYCODE_BACK` so it does not close the activity, and `XRInput.systemButton`
+forwards it as the left controller menu button (or the left-hand menu gesture
+when using hand tracking) to open the SteamVR dashboard. On runtimes that
+support `XR_FB_hand_tracking_aim` (such as Quest), `XRInput` also reads the
+left-hand menu pinch gesture alongside the hand joints and maps it to the same
+menu bit.
 
 `XRInput` defines a single action set covering `ControllerState` inputs, with
 suggested bindings for Oculus Touch, Meta Touch Plus, Pico 4, Valve Index, and
@@ -307,7 +333,27 @@ Khronos simple controller profiles. When a hand is not holding an active
 controller, `XRInput` queries the 26 joints from `XR_EXT_hand_tracking`, which
 already match the joint ordering and axis convention of `TrackedHand`.
 Transparent or chroma-keyed streams request `XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND`
-when the headset supports passthrough blending.
+when the headset supports passthrough blending. Both `MetalXRGraphics` and
+`VulkanXRGraphics` support chroma keying; the Vulkan backend compiles a second
+`quad.frag` variant that uses dual-source blending to match `Quad.metal`.
+
+### Depth correction
+
+`StereoDepthEstimator` (in `VRLinkCore`, generic over the decoded frame type and
+typealiased as `DepthEstimator` in `VRLinkVideoToolbox`) estimates scene depth
+from stereo disparity between the left and right eye views, allowing `XRDisplay`
+to warp the stream quads for translational reprojection just like
+`CompositorDisplay` on visionOS. Each `XRGraphics` backend supplies its own
+frame readback path:
+
+- `MetalXRGraphics` runs stereo downsampling and matching on the GPU with
+  `StereoShrink`, sharing the implementation used on visionOS.
+- `VulkanXRGraphics` renders both eyes side by side into a small offscreen image
+  using the existing quad pipeline and render pass, copies the result into a
+  host-visible buffer, and reads the pixels back once that frame's fence
+  signals. `StereoDepthEstimator` then runs `StereoMatcher` on the CPU on a
+  utility-priority queue. This path is enabled when using an 8-bit swapchain
+  format.
 
 ### In-headset panel
 
@@ -389,14 +435,21 @@ manifest includes metadata for Android XR, Quest, and Pico, targeting Android 10
 The Vulkan shaders are written in GLSL under `VRLinkVulkan/Shaders` and
 precompiled to SPIR-V into `QuadShaders.swift` by `compile.sh`. The signed APK
 is roughly 70 MB, about 40 MB of which is Swift Foundation's ICU data. The
-Android build has not been tested on a headset yet.
+launcher icon is an adaptive icon generated from the visionOS icon layers by
+`android/make-icon.py` and compiled from `android/res` with `aapt2`.
+
+Android XR's OpenXR runtime is a system library (`libopenxr.google.so`), so
+`AndroidManifest.xml` must declare it with `<uses-native-library>` to expose it
+to the app's linker namespace; otherwise the OpenXR loader fails with
+`XR_ERROR_RUNTIME_UNAVAILABLE`.
 
 #### Launch modes
 
 Some standalone headsets launch VR apps directly into an immersive OpenXR
-session, while others expect a 2D launcher window first. `AndroidManifest.xml`
-declares an entry point for each, and `build.sh --flat` selects which one gets
-the `LAUNCHER` intent category:
+session, while others expect a 2D launcher window first. By default, `build.sh`
+includes only the immersive entry point in `AndroidManifest.xml`; passing
+`--flat` adds the 2D entry point and marks it with the `LAUNCHER` intent
+category:
 
 - `android.app.NativeActivity` starts directly in an immersive session
   (`XR_ACTIVITY_START_MODE_FULL_SPACE_UNMANAGED`) and runs `XRClient` with the
@@ -413,6 +466,15 @@ which entry point started it. Both activities run in the same process and share
 one `ClientModel` and `Panel` behind a lock, since Dear ImGui uses a single
 global context.
 
+The `--flat` 2D entry point is not supported on Android XR. On Galaxy XR, an
+`<activity-alias>` inherits the target activity's unmanaged full-space mode
+regardless of its own start-mode property, leaving a 2D window stuck on the
+splash screen without pointer input. Because the Galaxy XR launcher also opened
+the alias even when only the immersive activity carried `LAUNCHER`, default
+builds omit the alias from the manifest. Supporting a 2D launcher window on
+Android XR would require a separate Java `Activity` subclass and a DEX build
+step.
+
 #### Permissions
 
 Runtime permissions are requested over JNI with `Activity.requestPermissions`.
@@ -420,10 +482,13 @@ Receiving `onRequestPermissionsResult` would require a custom Java `Activity`
 subclass, so native code waits for the activity to pause and resume around the
 system permission dialog and then re-checks the permission state.
 
-- `android.permission.HAND_TRACKING` (Android XR) is requested when the
-  immersive activity starts, before the session creates hand trackers. Devices
-  that do not define that permission skip the prompt (Quest grants
-  `com.oculus.permission.HAND_TRACKING` at install time).
+- `android.permission.HAND_TRACKING`, `EYE_TRACKING_FINE`, and `FACE_TRACKING`
+  (Android XR) are requested when the immersive activity starts, before creating
+  the OpenXR instance, because the runtime only advertises hand tracking,
+  `XR_EXT_eye_gaze_interaction`, and `XR_ANDROID_face_tracking` when the
+  corresponding permission is already granted. Devices that do not define those
+  permissions skip the prompt (Quest grants `com.oculus.permission.HAND_TRACKING`
+  at install time).
 - `android.permission.RECORD_AUDIO` is requested when a stream starts with
   "Send my microphone" enabled.
 
@@ -440,7 +505,9 @@ MediaCodec do not report. Defaults follow ALVR's OpenXR client:
 | `videoRange` | as reported by decoder | Overrides narrow or full YCbCr range conversion for decoders that misreport color range. |
 | `decoderWidth`, `decoderHeight` | 2048 x 2048 | Initial decoder dimensions used when parameter sets are not parsed beforehand (currently AV1). `PictureSize` parses H.264 and HEVC dimensions from the SPS. |
 | `decoderLowLatency` | on | Enables the Android 11 `low-latency` key and Qualcomm's vendor low-latency extension. |
-| `decoderOperatingRate` | 32767 | `operating-rate` given to the decoder (0 leaves it unset). Qualcomm decoders clock themselves from it and assume 30 frames a second without it; 32767 is ALVR's "as fast as possible". If the decoder refuses to start with it, it is started again without. |
+| `gripOffset` | per-headset (from ALVR) | Local transform `(x, y, z, pitch, yaw, roll)` applied to the left controller grip pose (and mirrored for the right) so non-Quest controllers align with the Quest Touch profile reported to the host. Computed by composing ALVR's per-headset offset with the inverse of ALVR's Quest offset (`get_controller_offset` in `alvr/client_openxr/src/interaction.rs`); on Galaxy XR this shifts the grip 5.5 cm back along +Z with +15 deg of pitch. |
+| `waitForGPU` | on | Waits on the frame's GPU fence before releasing swapchain images to the OpenXR runtime. |
+| `decoderOperatingRate` | 32767 | `operating-rate` passed to `AMediaCodec` (0 leaves it unset). Qualcomm decoders scale clocks from this hint and default to 30 fps without it; 32767 matches ALVR's maximum-rate setting. If configuring the codec fails with this key set, the decoder retries without it. |
 
 You can override any of these without rebuilding by setting
 `debug.openvrlink.*` system properties before launching the app. Active values
@@ -451,6 +518,8 @@ reported YCbCr model and range:
 adb shell setprop debug.openvrlink.float_target 1
 adb shell setprop debug.openvrlink.float_encoded 0
 adb shell setprop debug.openvrlink.video_range full      # narrow, full, or auto
+adb shell setprop debug.openvrlink.decoder_operating_rate 0
+adb shell setprop debug.openvrlink.grip_offset 0,0,0.055,15,0,0   # x,y,z meters; pitch,yaw,roll degrees
 adb logcat -s OpenVRLink
 ```
 
@@ -459,11 +528,51 @@ To connect without using the panel during testing, write a target host
 in the app's internal files directory, and the immersive activity will connect
 to it on launch.
 
+#### Wired networks
+
+Android routes sockets over its default network unless bound explicitly, and a
+direct USB or Ethernet connection to a PC without internet access never becomes
+the default network. `Activity.swift` queries `ConnectivityManager` over JNI for
+connected `TRANSPORT_ETHERNET` and `TRANSPORT_USB` networks and passes their
+interface names to `HostConnector`. When connecting over one of those
+interfaces, `NetworkInterfaces.bind` (in `VRLinkCore`) binds each socket to the
+matching network handle via `android_setsocknetwork` and logs
+`using wired interface <name>`.
+
+#### Performance logging
+
+During an active stream, `XRDisplay` and `MediaCodecDecoder` log summary metrics
+every five seconds:
+
+- `openxr: showed N frames/s of R (M new pictures/s); each frame waited ...,
+  prepared ..., drew ..., ended ...` (`FramePace` in `XRDisplay`): reports
+  average time spent in `xrWaitFrame`, building quad meshes, `XRGraphics.draw`
+  (including waiting on the previous frame's fence), and `xrEndFrame`.
+- `decoder: N pictures/s in (B Mbit/s), M out, each taking T ms`
+  (`MediaCodecDecoder`): reports input packet rate and bitrate, decoded output
+  rate, and queue-to-output decode latency.
+
+If the new-picture rate drops while draw times stay short, the bottleneck is on
+the network or in `MediaCodec`; if draw times grow or displayed frames fall
+below the refresh rate, rendering is falling behind. Stream resolution is chosen
+by the host (`driver_vrlink/streamFormatWidth`, which the companion sets to 2048
+for a 2048 x 8192 atlas) and cannot be negotiated by the client
+(`docs/svl-values/startup-exchange.md`).
+
+`MediaCodecDecoder` outputs pooled `AHardwareBuffer` instances that
+`VulkanXRGraphics` imports once and caches by buffer ID. Because the hardware
+decoder writes into those buffers from an external queue, `VulkanXRGraphics`
+records a queue-family ownership transfer from `VK_QUEUE_FAMILY_FOREIGN_EXT`
+before sampling a buffer in a frame and releases ownership back at the end of
+the command buffer so newly decoded contents are visible to Vulkan.
+
 Current limitations on Android:
 
-- Vulkan chroma keying (which needs dual-source blending) and depth-buffer
-  submission are not implemented, so chroma key settings are hidden.
-- Battery reporting and wired-interface detection are not implemented.
+- Chroma keying requires Vulkan `dualSrcBlend` and
+  `XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND` passthrough; the chroma-key settings
+  are hidden when either is unsupported.
+- Vulkan stereo depth readback requires an 8-bit swapchain format.
+- Battery reporting is not implemented.
 - AV1 streams configure the decoder with placeholder initial dimensions.
 - AAudio streams do not recover after audio output device changes yet.
 - Hand tracking has no gesture to reopen the panel during a stream.
@@ -544,9 +653,9 @@ Remaining platform coupling to clean up:
 - The AV1 sequence-header parser lives in `VRLinkVideoToolbox`, so `PictureSize`
   does not support AV1 yet.
 - `DeviceProfile.ownModel` checks for `"visionOS"` by string.
-- Room selection, recentering, and spatial anchors (`RoomTracker` and Room
-  Setup) are tied to ARKit and RealityKit, though the room data model and
-  polygon math live in `VRLinkCore`.
+- Room selection and spatial anchors (`RoomTracker` and Room Setup) are tied
+  to ARKit and RealityKit, though the room data model and polygon math live in
+  `VRLinkCore` (OpenXR uses the runtime's stage boundary directly).
 - `DeviceProfile.handValues` picks between Oculus Touch and PSVR2 Sense
   controller models rather than reading the active OpenXR interaction profile.
 - The visionOS settings views build their forms in SwiftUI instead of using
@@ -930,9 +1039,10 @@ with a 50 ms time constant.
 2. **Windows helper**: install PSVR2 assets and optionally patch
    `driver_vrlink` for additional features (such as improved transport
    encoding).
-3. **Android**: test the build on hardware (Quest, Galaxy XR, Lynx; see
-   [OpenXR](#openxr)), settle the per-headset quirks and which launch mode each
-   headset needs, then add Vulkan chroma keying and depth submission.
+3. **Android**: profile Wi-Fi streaming performance on Galaxy XR, verify Vulkan
+   chroma keying, stereo depth estimation, controller grip offsets, and
+   wired-network socket binding on hardware, and test Quest, Pico, and Lynx to
+   finalize per-headset quirks and launch modes.
 4. **Windows**: pair `VRLinkOpenXR` with a Vulkan or Direct3D graphics backend,
    a platform video decoder, and audio output (primarily as a desktop debugging
    target rather than an end-user build).

@@ -16,6 +16,9 @@ public struct TrackedHand {
     public var joints: [Pose]
     /// Optional platform-provided pinch state (see `SystemPinch`); overrides joint-based index pinch detection when set.
     public var systemPinch: SystemPinch?
+    /// Whether the platform reports a menu gesture or system button on this hand (used on the left hand to open
+    /// the SteamVR dashboard when no controller is held).
+    public var menu = false
 
     /// 26 joints: palm, wrist, then metacarpal-to-tip for thumb (4 joints)
     /// and index, middle, ring, little (5 each).
@@ -87,6 +90,8 @@ struct HandGestures {
     var grip = false
     /// Index finger straight, the other three curled.
     var point = false
+    /// Platform menu gesture or system button (`TrackedHand.menu`).
+    var menu = false
 
     /// Hysteresis thresholds in meters between thumb tip and fingertip to enter
     /// (`pinchStart`) and exit (`pinchEnd`) a pinch. `vrlink` relies on the headset
@@ -111,6 +116,7 @@ struct HandGestures {
         let wasGripping = previous?.grip == true, wasPointing = previous?.point == true
         grip = (0..<4).allSatisfy { curled($0, alreadyOn: wasGripping) }
         point = curl[0] < (wasPointing ? 40 : 18) && (1..<4).allSatisfy { curled($0, alreadyOn: wasPointing) }
+        menu = hand.menu
         // Override index-finger pinch when the platform provides system pinch state.
         switch hand.systemPinch {
         case .notPinching: pinch[0] = false
@@ -138,9 +144,10 @@ struct HandGestures {
         return out
     }
 
-    /// The gesture bits of the hand message. Bit 4, "menu", is never set.
+    /// Packed gesture bitmask for the hand packet. Bit 4 is the menu gesture, which SteamVR reads from the left
+    /// hand.
     var bits: UInt16 {
-        var out: UInt16 = point ? 1 << 5 : 0
+        var out: UInt16 = (point ? 1 << 5 : 0) | (menu ? 1 << 4 : 0)
         for finger in 0..<4 where pinch[finger] { out |= 1 << UInt16(finger) }
         return out
     }

@@ -13,15 +13,17 @@ import VRLinkOpenXR
 /// Renders OpenXR swapchains on Android using Vulkan (`XR_KHR_vulkan_enable2`), importing `MediaCodecDecoder`
 /// `AHardwareBuffer` images directly and converting YCbCr to RGB via `VkSamplerYcbcrConversion`.
 ///
-/// All methods on `VulkanXRGraphics` run on the OpenXR render thread. Chroma keying (which requires Vulkan
-/// dual-source blending) and depth-layer submission are not implemented yet.
+/// All methods on `VulkanXRGraphics` run on the OpenXR render thread. Chroma keying is enabled when the
+/// Vulkan device supports `dualSrcBlend` (`supportsChromaKey`).
 public final class VulkanXRGraphics: XRGraphics {
     public typealias Frame = HardwareFrame
 
     public static let extensions = ["XR_KHR_vulkan_enable2"]
 
-    /// Stored to conform to `XRGraphics`; chroma keying is not implemented in the Vulkan shader yet.
+    /// Active chroma-key configuration applied when `supportsChromaKey` is true.
     public var chromaKey: ChromaKey?
+    /// Whether the physical device supports Vulkan dual-source blending for chroma keying. Valid after `prepare`.
+    public private(set) var supportsChromaKey = false
 
     private let log: (String) -> Void
     private var instance: VkInstance?
@@ -35,6 +37,7 @@ public final class VulkanXRGraphics: XRGraphics {
     private var submitted = false
 
     private var renderPass: VkRenderPass?
+    private var targetFormat = VK_FORMAT_UNDEFINED
     private var linearTarget = false
     /// Per-eye Vulkan image views and framebuffers for the OpenXR swapchains.
     private var targets: [[Target]] = []
@@ -56,6 +59,8 @@ public final class VulkanXRGraphics: XRGraphics {
         var setLayout: VkDescriptorSetLayout?
         var layout: VkPipelineLayout?
         var pipeline: VkPipeline?
+        /// Chroma-keyed graphics pipeline using dual-source blending, when supported.
+        var keyedPipeline: VkPipeline?
         var descriptors: VkDescriptorPool?
     }
     private var sampling: Sampling?
@@ -66,6 +71,8 @@ public final class VulkanXRGraphics: XRGraphics {
         var memory: VkDeviceMemory?
         var view: VkImageView?
         var lastUsed: Int
+        /// Frame index in which this image was last acquired from `VK_QUEUE_FAMILY_FOREIGN_EXT`.
+        var acquiredIn = 0
     }
     /// Imported Vulkan images keyed by `AHardwareBuffer_getId` across the decoder's buffer pool.
     private var imports: [UInt64: Imported] = [:]
@@ -146,8 +153,15 @@ public final class VulkanXRGraphics: XRGraphics {
         conversion.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES
         conversion.samplerYcbcrConversion = 1
         let names = ["VK_ANDROID_external_memory_android_hardware_buffer", "VK_EXT_queue_family_foreign"]
+        var offered = VkPhysicalDeviceFeatures()
+        vkGetPhysicalDeviceFeatures(physical, &offered)
+        supportsChromaKey = offered.dualSrcBlend != 0
+        var enabled = VkPhysicalDeviceFeatures()
+        enabled.dualSrcBlend = offered.dualSrcBlend
+        log("vulkan: chroma keying \(supportsChromaKey ? "available" : "unavailable (dualSrcBlend unsupported)")")
         var deviceInfo = VkDeviceCreateInfo()
         deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+        deviceInfo.pEnabledFeatures = UnsafePointer(arena.keep(enabled))
         deviceInfo.pNext = UnsafeRawPointer(arena.keep(conversion))
         deviceInfo.queueCreateInfoCount = 1
         deviceInfo.pQueueCreateInfos = UnsafePointer(arena.keep(queueInfo))
@@ -205,6 +219,7 @@ public final class VulkanXRGraphics: XRGraphics {
     public func adopt(_ swapchains: [XRSwapchain], instance xr: XRInstance) throws {
         guard let first = swapchains.first else { return }
         let format = VkFormat(rawValue: UInt32(first.format))
+        targetFormat = format
         // sRGB attachments encode linear output automatically on write. Float swapchain encoding is left
         // unspecified by OpenXR and varies across headsets (`HeadsetQuirks.floatTargetIsEncoded`).
         if format == VK_FORMAT_R16G16B16A16_SFLOAT {
@@ -380,7 +395,8 @@ public final class VulkanXRGraphics: XRGraphics {
             try Vulkan.check(vkCreateDescriptorPool(device, &poolInfo, nil, &made.descriptors), "vkCreateDescriptorPool")
         }
 
-        made.pipeline = try makePipeline(layout: made.layout)
+        made.pipeline = try makePipeline(layout: made.layout, keyed: false)
+        if supportsChromaKey { made.keyedPipeline = try makePipeline(layout: made.layout, keyed: true) }
         log(String(format: "vulkan: sampling decoded pictures of format %d (external %llx), %@ chroma", format.format.rawValue,
                    format.externalFormat, linear ? "linear" : "nearest"))
         return made
@@ -401,10 +417,11 @@ public final class VulkanXRGraphics: XRGraphics {
         return module
     }
 
-    private func makePipeline(layout: VkPipelineLayout?) throws -> VkPipeline? {
+    /// Creates the quad graphics pipeline, using the dual-source chroma-key fragment shader when `keyed` is true.
+    private func makePipeline(layout: VkPipelineLayout?, keyed: Bool) throws -> VkPipeline? {
         let arena = Arena()
         defer { arena.free() }
-        let vertex = try shader(QuadShaders.vertex), fragment = try shader(QuadShaders.fragment)
+        let vertex = try shader(QuadShaders.vertex), fragment = try shader(keyed ? QuadShaders.keyedFragment : QuadShaders.fragment)
         defer {
             vkDestroyShaderModule(device, vertex, nil)
             vkDestroyShaderModule(device, fragment, nil)
@@ -467,10 +484,10 @@ public final class VulkanXRGraphics: XRGraphics {
         var blend = VkPipelineColorBlendAttachmentState()
         blend.blendEnable = 1
         blend.srcColorBlendFactor = VK_BLEND_FACTOR_ONE
-        blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
+        blend.dstColorBlendFactor = keyed ? VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA : VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
         blend.colorBlendOp = VK_BLEND_OP_ADD
         blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE
-        blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
+        blend.dstAlphaBlendFactor = keyed ? VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA : VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
         blend.alphaBlendOp = VK_BLEND_OP_ADD
         blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT.rawValue | VK_COLOR_COMPONENT_G_BIT.rawValue
             | VK_COLOR_COMPONENT_B_BIT.rawValue | VK_COLOR_COMPONENT_A_BIT.rawValue
@@ -499,6 +516,7 @@ public final class VulkanXRGraphics: XRGraphics {
 
     private func destroy(_ sampling: Sampling) {
         vkDestroyPipeline(device, sampling.pipeline, nil)
+        if let keyed = sampling.keyedPipeline { vkDestroyPipeline(device, keyed, nil) }
         vkDestroyDescriptorPool(device, sampling.descriptors, nil)
         vkDestroyPipelineLayout(device, sampling.layout, nil)
         vkDestroyDescriptorSetLayout(device, sampling.setLayout, nil)
@@ -518,9 +536,25 @@ public final class VulkanXRGraphics: XRGraphics {
         // which stays stable while pooled by `AImageReader`.
         var id = UInt64(UInt(bitPattern: Int(bitPattern: picture.buffer)))
         if #available(Android 31, *) { AHardwareBuffer_getId(picture.buffer, &id) }
-        if imports[id] != nil {
+        if let known = imports[id] {
             imports[id]?.lastUsed = frameCount
-            return imports[id]?.view
+            if known.acquiredIn != frameCount {
+                // Acquire ownership from VK_QUEUE_FAMILY_FOREIGN_EXT once per frame so writes from the hardware
+                // decoder are visible to shader reads rather than served from stale GPU caches.
+                imports[id]?.acquiredIn = frameCount
+                var barrier = VkImageMemoryBarrier()
+                barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+                barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT.rawValue
+                barrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                barrier.srcQueueFamilyIndex = Vulkan.foreignQueueFamily
+                barrier.dstQueueFamilyIndex = family
+                barrier.image = known.image
+                barrier.subresourceRange = Vulkan.wholeColor
+                vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT.rawValue, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT.rawValue,
+                                     0, 0, nil, 0, nil, 1, &barrier)
+            }
+            return known.view
         }
         let (properties, format) = try describe(picture.buffer)
         if let current = sampling, current.externalFormat != format.externalFormat || current.format != format.format {
@@ -605,8 +639,26 @@ public final class VulkanXRGraphics: XRGraphics {
         barrier.subresourceRange = Vulkan.wholeColor
         vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT.rawValue, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT.rawValue,
                              0, 0, nil, 0, nil, 1, &barrier)
+        imported.acquiredIn = frameCount
         imports[id] = imported
         return imported.view
+    }
+
+    /// Releases all hardware-buffer images acquired during this frame back to `VK_QUEUE_FAMILY_FOREIGN_EXT`.
+    private func releasePictures() {
+        for imported in imports.values where imported.acquiredIn == frameCount {
+            var barrier = VkImageMemoryBarrier()
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+            barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT.rawValue
+            barrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+            barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+            barrier.srcQueueFamilyIndex = family
+            barrier.dstQueueFamilyIndex = Vulkan.foreignQueueFamily
+            barrier.image = imported.image
+            barrier.subresourceRange = Vulkan.wholeColor
+            vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT.rawValue, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT.rawValue,
+                                 0, 0, nil, 0, nil, 1, &barrier)
+        }
     }
 
     // MARK: Drawing
@@ -644,6 +696,263 @@ public final class VulkanXRGraphics: XRGraphics {
         try Vulkan.check(vkBindBufferMemory(device, buffer.handle, buffer.memory, 0), "vkBindBufferMemory")
         try Vulkan.check(vkMapMemory(device, buffer.memory, 0, Vulkan.wholeSize, 0, &buffer.mapped), "vkMapMemory")
         buffer.capacity = capacity
+    }
+
+    // MARK: Depth
+
+    /// Offscreen side-by-side stereo render target used to downsample frames for depth estimation, allocated in
+    /// `targetFormat` so it can reuse the main `renderPass` and quad pipeline.
+    private struct ShrinkTarget {
+        var image: VkImage?
+        var memory: VkDeviceMemory?
+        var view: VkImageView?
+        var framebuffer: VkFramebuffer?
+        var eyeWidth = 0, height = 0
+    }
+    private var shrinkTarget = ShrinkTarget()
+    private var shrinkVertices = Buffer(), shrinkPixels = Buffer()
+    private let shrinkLock = NSLock()
+    /// Pending downsampling request queued for the next `draw` call (guarded by `shrinkLock`).
+    private var shrinkAsked: (frame: HardwareFrame, width: Int, done: (StereoPair?) -> Void)?
+    /// In-flight downsampling request whose GPU copy into `shrinkPixels` will complete with the current frame fence.
+    private var shrinkDrawn: (frame: HardwareFrame, plan: StereoPlan, done: (StereoPair?) -> Void)?
+    private var shrinkComplained = false
+
+    /// Stereo depth readback requires an 8-bit RGBA/BGRA swapchain format.
+    public var supportsDepth: Bool { VulkanXRGraphics.formats.contains(targetFormat) }
+
+    /// Vulkan downsamples on the GPU via `shrink` and runs stereo matching on the CPU.
+    public var measure: StereoDepthEstimator<HardwareFrame>.Measure? { nil }
+
+    public func shrink(_ frame: HardwareFrame, width: Int, done: @escaping (StereoPair?) -> Void) {
+        shrinkLock.lock()
+        let passedOver = shrinkAsked
+        shrinkAsked = (frame, width, done)
+        shrinkLock.unlock()
+        passedOver?.done(nil)
+    }
+
+    private func destroy(_ target: ShrinkTarget) {
+        vkDestroyFramebuffer(device, target.framebuffer, nil)
+        vkDestroyImageView(device, target.view, nil)
+        vkDestroyImage(device, target.image, nil)
+        vkFreeMemory(device, target.memory, nil)
+    }
+
+    /// Allocates or resizes `shrinkTarget` to `2 * eyeWidth` by `height`. Must be called while the GPU queue is idle.
+    private func readyShrinkTarget(eyeWidth: Int, height: Int) throws {
+        if shrinkTarget.eyeWidth == eyeWidth, shrinkTarget.height == height, shrinkTarget.framebuffer != nil { return }
+        if shrinkTarget.image != nil { destroy(shrinkTarget) }
+        var made = ShrinkTarget()
+        var info = VkImageCreateInfo()
+        info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+        info.imageType = VK_IMAGE_TYPE_2D
+        info.format = targetFormat
+        info.extent = VkExtent3D(width: UInt32(eyeWidth * 2), height: UInt32(height), depth: 1)
+        info.mipLevels = 1
+        info.arrayLayers = 1
+        info.samples = VK_SAMPLE_COUNT_1_BIT
+        info.tiling = VK_IMAGE_TILING_OPTIMAL
+        info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT.rawValue | VK_IMAGE_USAGE_TRANSFER_SRC_BIT.rawValue
+        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE
+        info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED
+        try Vulkan.check(vkCreateImage(device, &info, nil, &made.image), "vkCreateImage(depth)")
+        var needs = VkMemoryRequirements()
+        vkGetImageMemoryRequirements(device, made.image, &needs)
+        var memory = VkPhysicalDeviceMemoryProperties()
+        vkGetPhysicalDeviceMemoryProperties(physical, &memory)
+        let types = withUnsafeBytes(of: &memory.memoryTypes) { Array($0.bindMemory(to: VkMemoryType.self)) }
+        let fitting = (0..<Int(memory.memoryTypeCount)).filter { needs.memoryTypeBits & (1 << UInt32($0)) != 0 }
+        let local = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT.rawValue
+        guard let type = fitting.first(where: { types[$0].propertyFlags & local != 0 }) ?? fitting.first else {
+            vkDestroyImage(device, made.image, nil)
+            throw XRFailure.unsupported("Vulkan memory for stereo depth target")
+        }
+        var allocate = VkMemoryAllocateInfo()
+        allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+        allocate.allocationSize = needs.size
+        allocate.memoryTypeIndex = UInt32(type)
+        try Vulkan.check(vkAllocateMemory(device, &allocate, nil, &made.memory), "vkAllocateMemory(depth)")
+        try Vulkan.check(vkBindImageMemory(device, made.image, made.memory, 0), "vkBindImageMemory(depth)")
+        var viewInfo = VkImageViewCreateInfo()
+        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+        viewInfo.image = made.image
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D
+        viewInfo.format = targetFormat
+        viewInfo.subresourceRange = Vulkan.wholeColor
+        try Vulkan.check(vkCreateImageView(device, &viewInfo, nil, &made.view), "vkCreateImageView(depth)")
+        var framebuffer = VkFramebufferCreateInfo()
+        framebuffer.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+        framebuffer.renderPass = renderPass
+        framebuffer.attachmentCount = 1
+        framebuffer.width = UInt32(eyeWidth * 2)
+        framebuffer.height = UInt32(height)
+        framebuffer.layers = 1
+        try withUnsafePointer(to: &made.view) { view in
+            framebuffer.pAttachments = view
+            try Vulkan.check(vkCreateFramebuffer(device, &framebuffer, nil, &made.framebuffer), "vkCreateFramebuffer(depth)")
+        }
+        made.eyeWidth = eyeWidth
+        made.height = height
+        shrinkTarget = made
+    }
+
+    /// Records an offscreen pass that renders both eyes of `shrinkAsked` side by side into `shrinkTarget` and
+    /// copies the pixels into `shrinkPixels` for CPU readback on the next frame (`finishShrink`).
+    private func recordShrink(_ sets: inout [Int: VkDescriptorSet?]) {
+        shrinkLock.lock()
+        let asked = shrinkAsked
+        shrinkAsked = nil
+        shrinkLock.unlock()
+        guard let asked else { return }
+        do {
+            guard supportsDepth, let plan = StereoPlan(layout: asked.frame.layout, width: asked.width) else {
+                asked.done(nil)
+                return
+            }
+            // Import and acquire decoded buffers before beginning the render pass, since acquisition records a barrier.
+            let views = try asked.frame.pictures.map { try view(of: $0, with: commands) }
+            guard let sampling else {
+                asked.done(nil)
+                return
+            }
+            try readyShrinkTarget(eyeWidth: plan.width, height: plan.height)
+
+            // Emit two triangles per tile using QuadMesh's vertex layout. Iterate tiles in reverse so the
+            // lower-resolution base tile draws over the fovea, keeping sharpness matched between both eyes.
+            var corners: [Float] = []
+            var draws: [(eye: Int, picture: Int, first: Int)] = []
+            let across = plan.window.right - plan.window.left, tall = plan.window.up - plan.window.down
+            for (eye, view) in asked.frame.layout.views.enumerated() {
+                for tile in view.tiles.reversed() {
+                    guard views.indices.contains(tile.picture), views[tile.picture] != nil else { continue }
+                    var described = AHardwareBuffer_Desc()
+                    AHardwareBuffer_describe(asked.frame.pictures[tile.picture].buffer, &described)
+                    // Inset UVs by half a texel to prevent bilinear filtering from bleeding across atlas tile borders.
+                    let halfU = 0.5 / Float(max(1, described.width)), halfV = 0.5 / Float(max(1, described.height))
+                    func corner(_ x: Float, _ y: Float, _ u: Float, _ v: Float) {
+                        // Vulkan clip space has +Y pointing down, with row 0 at the top of the image.
+                        corners += [(x - plan.window.left) / across * 2 - 1, 1 - (y - plan.window.down) / tall * 2, 0, 1,
+                                    u, v, u, v, 0.5, 0.5, 1]
+                    }
+                    let f = tile.frustum
+                    let (left, right, top, bottom) = (tile.left + halfU, tile.right - halfU, tile.top + halfV, tile.bottom - halfV)
+                    draws.append((eye, tile.picture, corners.count / QuadMesh.floatsPerVertex))
+                    corner(f.left, f.up, left, top); corner(f.right, f.up, right, top); corner(f.left, f.down, left, bottom)
+                    corner(f.right, f.up, right, top); corner(f.right, f.down, right, bottom); corner(f.left, f.down, left, bottom)
+                }
+            }
+            guard !draws.isEmpty else {
+                asked.done(nil)
+                return
+            }
+            try reserve(&shrinkVertices, bytes: corners.count * MemoryLayout<Float>.size, usage: VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)
+            let bytes = plan.width * 2 * plan.height * 4
+            try reserve(&shrinkPixels, bytes: bytes, usage: VK_BUFFER_USAGE_TRANSFER_DST_BIT)
+            guard let mapped = shrinkVertices.mapped else {
+                asked.done(nil)
+                return
+            }
+            corners.withUnsafeBytes { mapped.copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+
+            var barrier = VkImageMemoryBarrier()
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+            barrier.srcAccessMask = 0
+            barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT.rawValue
+            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED       // discard previous contents
+            barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+            barrier.srcQueueFamilyIndex = UInt32.max            // VK_QUEUE_FAMILY_IGNORED
+            barrier.dstQueueFamilyIndex = UInt32.max
+            barrier.image = shrinkTarget.image
+            barrier.subresourceRange = Vulkan.wholeColor
+            vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT.rawValue,
+                                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT.rawValue, 0, 0, nil, 0, nil, 1, &barrier)
+
+            let size = VkExtent2D(width: UInt32(plan.width * 2), height: UInt32(plan.height))
+            var clear = VkClearValue(color: VkClearColorValue(float32: (0, 0, 0, 1)))
+            var pass = VkRenderPassBeginInfo()
+            pass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO
+            pass.renderPass = renderPass
+            pass.framebuffer = shrinkTarget.framebuffer
+            pass.renderArea.extent = size
+            pass.clearValueCount = 1
+            withUnsafePointer(to: &clear) {
+                pass.pClearValues = $0
+                vkCmdBeginRenderPass(commands, &pass, VK_SUBPASS_CONTENTS_INLINE)
+            }
+            vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, sampling.pipeline)
+            var vertexHandle = shrinkVertices.handle
+            var offset = VkDeviceSize(0)
+            vkCmdBindVertexBuffers(commands, 0, 1, &vertexHandle, &offset)
+            // Stereo matching only compares left and right luma, so skip gamma decoding and feathering.
+            var style = QuadStyle(feather: 0, hasAlpha: 0, gamma: 1, linearTarget: linearTarget ? 1 : 0, fill: [0, 0, 0, 0], key: nil)
+            vkCmdPushConstants(commands, sampling.layout, VK_SHADER_STAGE_FRAGMENT_BIT.rawValue, 0,
+                               UInt32(MemoryLayout<Float>.size * QuadStyle.floats), &style.values)
+            for draw in draws {
+                guard let color = views[draw.picture] else { continue }
+                let key = draw.picture << 8 | 0xFF
+                if sets[key] == nil { sets[key] = try? descriptors(sampling, color: color, alpha: color) }
+                var set: VkDescriptorSet? = sets[key] ?? nil
+                guard set != nil else { continue }
+                var viewport = VkViewport(x: Float(draw.eye * plan.width), y: 0, width: Float(plan.width), height: Float(plan.height),
+                                          minDepth: 0, maxDepth: 1)
+                var scissor = VkRect2D(offset: VkOffset2D(x: Int32(draw.eye * plan.width), y: 0),
+                                       extent: VkExtent2D(width: UInt32(plan.width), height: UInt32(plan.height)))
+                vkCmdSetViewport(commands, 0, 1, &viewport)
+                vkCmdSetScissor(commands, 0, 1, &scissor)
+                vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, sampling.layout, 0, 1, &set, 0, nil)
+                vkCmdDraw(commands, 6, 1, UInt32(draw.first), 0)
+            }
+            vkCmdEndRenderPass(commands)
+
+            barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT.rawValue
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT.rawValue
+            barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+            vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT.rawValue,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT.rawValue, 0, 0, nil, 0, nil, 1, &barrier)
+            var region = VkBufferImageCopy()
+            region.imageSubresource = VkImageSubresourceLayers(aspectMask: VK_IMAGE_ASPECT_COLOR_BIT.rawValue, mipLevel: 0,
+                                                               baseArrayLayer: 0, layerCount: 1)
+            region.imageExtent = VkExtent3D(width: size.width, height: size.height, depth: 1)
+            vkCmdCopyImageToBuffer(commands, shrinkTarget.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, shrinkPixels.handle, 1, &region)
+            shrinkDrawn = (asked.frame, plan, asked.done)
+        } catch {
+            if !shrinkComplained {
+                shrinkComplained = true
+                log("vulkan: stereo depth downsample failed: \(error)")
+            }
+            asked.done(nil)
+        }
+    }
+
+    /// Converts the completed `shrinkPixels` readback buffer into a `StereoPair` of Rec. 709 luma images and
+    /// invokes its completion handler.
+    private func finishShrink() {
+        guard let drawn = shrinkDrawn else { return }
+        shrinkDrawn = nil
+        guard let mapped = shrinkPixels.mapped else {
+            drawn.done(nil)
+            return
+        }
+        let width = drawn.plan.width, height = drawn.plan.height
+        let bytes = mapped.assumingMemoryBound(to: UInt8.self)
+        // Compute Rec. 709 luma, swapping R and B weights for BGRA vs RGBA target formats.
+        let blueFirst = targetFormat == VK_FORMAT_B8G8R8A8_SRGB || targetFormat == VK_FORMAT_B8G8R8A8_UNORM
+        let (first, last) = blueFirst ? (18, 54) : (54, 18)
+        var eyes = [LumaPicture(width: width, height: height), LumaPicture(width: width, height: height)]
+        for eye in 0..<2 {
+            eyes[eye].pixels.withUnsafeMutableBufferPointer { out in
+                for row in 0..<height {
+                    var at = (row * width * 2 + eye * width) * 4
+                    for column in 0..<width {
+                        out[row * width + column] = UInt8((Int(bytes[at]) * first + Int(bytes[at + 1]) * 183 + Int(bytes[at + 2]) * last) >> 8)
+                        at += 4
+                    }
+                }
+            }
+        }
+        drawn.done(drawn.plan.pair(left: eyes[0], right: eyes[1]))
     }
 
     // MARK: Panel
@@ -763,6 +1072,7 @@ public final class VulkanXRGraphics: XRGraphics {
         }
         retired.forEach(destroy)
         retired = []
+        finishShrink()
         drawing = frame
         frameCount += 1
 
@@ -795,6 +1105,7 @@ public final class VulkanXRGraphics: XRGraphics {
         try reserve(&indexBuffer, bytes: indexCount * MemoryLayout<UInt16>.size, usage: VK_BUFFER_USAGE_INDEX_BUFFER_BIT)
         if let sampling { vkResetDescriptorPool(device, sampling.descriptors, 0) }
         var sets: [Int: VkDescriptorSet?] = [:]
+        recordShrink(&sets)
 
         var vertexBase = 0, indexBase = 0
         for (eye, mesh) in zip(eyes, meshes) {
@@ -819,7 +1130,8 @@ public final class VulkanXRGraphics: XRGraphics {
             var scissor = VkRect2D(offset: VkOffset2D(x: 0, y: 0), extent: size)
             vkCmdSetViewport(commands, 0, 1, &viewport)
             vkCmdSetScissor(commands, 0, 1, &scissor)
-            vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, sampling.pipeline)
+            let keying = sampling.keyedPipeline == nil ? nil : chromaKey
+            vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, keying == nil ? sampling.pipeline : sampling.keyedPipeline)
             var vertexHandle = vertexBuffer.handle
             var offset = VkDeviceSize(vertexBase * MemoryLayout<Float>.size)
             vkCmdBindVertexBuffers(commands, 0, 1, &vertexHandle, &offset)
@@ -837,7 +1149,7 @@ public final class VulkanXRGraphics: XRGraphics {
                 var set = sets[key] ?? nil
                 vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, sampling.layout, 0, 1, &set, 0, nil)
                 var style = QuadStyle(feather: draw.feather, hasAlpha: alpha != nil && !filled ? 1 : 0, gamma: frame?.layout.encodingGamma ?? 1,
-                                      linearTarget: linearTarget ? 1 : 0, fill: draw.fill ?? [0, 0, 0, 0])
+                                      linearTarget: linearTarget ? 1 : 0, fill: draw.fill ?? [0, 0, 0, 0], key: keying)
                 vkCmdPushConstants(commands, sampling.layout, VK_SHADER_STAGE_FRAGMENT_BIT.rawValue, 0,
                                    UInt32(MemoryLayout<Float>.size * QuadStyle.floats), &style.values)
                 vkCmdDrawIndexed(commands, UInt32(draw.indexCount), 1, UInt32(draw.firstIndex), Int32(draw.firstVertex), 0)
@@ -846,6 +1158,7 @@ public final class VulkanXRGraphics: XRGraphics {
             indexBase += mesh.indices.count
         }
 
+        releasePictures()
         try Vulkan.check(vkEndCommandBuffer(commands), "vkEndCommandBuffer")
         var submit = VkSubmitInfo()
         submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO
@@ -855,6 +1168,11 @@ public final class VulkanXRGraphics: XRGraphics {
             try Vulkan.check(vkQueueSubmit(queue, 1, &submit, fence), "vkQueueSubmit")
         }
         submitted = true
+        if quirks.waitForGPU {
+            // Wait for rendering to finish before the caller releases the swapchain images to the OpenXR runtime.
+            var waiting = fence
+            vkWaitForFences(device, 1, &waiting, 1, UInt64.max)
+        }
     }
 
     private func descriptors(_ sampling: Sampling, color: VkImageView, alpha: VkImageView) throws -> VkDescriptorSet? {
@@ -889,11 +1207,11 @@ public final class VulkanXRGraphics: XRGraphics {
 
 /// Push-constant block matching `Style` in `quad.frag` (keep layout synchronized with the shader).
 private struct QuadStyle {
-    static let floats = 8
+    static let floats = 14
     var values: [Float]
 
-    init(feather: Float, hasAlpha: Float, gamma: Float, linearTarget: Float, fill: [Float]) {
-        values = [feather, hasAlpha, gamma, linearTarget] + fill
+    init(feather: Float, hasAlpha: Float, gamma: Float, linearTarget: Float, fill: [Float], key: ChromaKey?) {
+        values = [feather, hasAlpha, gamma, linearTarget] + fill + (key.map { $0.color + [1, $0.near, $0.far] } ?? [0, 0, 0, 0, 0, 0])
     }
 }
 

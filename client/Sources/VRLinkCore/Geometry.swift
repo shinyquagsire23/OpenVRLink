@@ -190,6 +190,16 @@ public struct TrackedPose {
         pose.right * angularVelocity.x + pose.up * angularVelocity.y + pose.forward * -angularVelocity.z
     }
 
+    /// Transforms `child` from this pose's local frame into world space (see `Pose.placing`), propagating linear
+    /// and angular velocity (including tangential velocity from rotation across the offset).
+    public func placing(_ child: Pose) -> TrackedPose {
+        var out = TrackedPose(pose: pose.placing(child))
+        let turning = worldAngularVelocity
+        out.linearVelocity = linearVelocity + turning.cross(out.pose.position - pose.position)
+        out.angularVelocity = Vec3(turning.dot(out.pose.right), turning.dot(out.pose.up), -turning.dot(out.pose.forward))
+        return out
+    }
+
     /// Extrapolates the pose `seconds` into the future assuming constant linear and angular velocity.
     public func predicted(seconds: Float) -> TrackedPose {
         var out = self

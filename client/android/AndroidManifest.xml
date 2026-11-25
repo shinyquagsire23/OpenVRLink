@@ -28,6 +28,10 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Requested at runtime when the immersive activity starts on Android XR. -->
     <uses-permission android:name="android.permission.HAND_TRACKING" />
+    <!-- Requested at runtime on Android XR before OpenXR exposes eye gaze and face tracking. -->
+    <uses-permission android:name="android.permission.EYE_TRACKING_FINE" />
+    <uses-feature android:name="android.hardware.xr.input.eye_tracking" android:required="false" />
+    <uses-permission android:name="android.permission.FACE_TRACKING" />
     <!-- Granted at install time for hand tracking on Quest. -->
     <uses-permission android:name="com.oculus.permission.HAND_TRACKING" />
     <uses-feature android:name="oculus.software.handtracking" android:required="false" />

@@ -4,6 +4,14 @@
 
 import Foundation
 
+/// Platform hook for binding POSIX sockets to a specific network interface when `IP_BOUND_IF` is unavailable.
+public enum NetworkInterfaces {
+    /// Binds `descriptor` to the named network interface, returning `true` on success. On Android this calls
+    /// `android_setsocknetwork` so sockets can use wired Ethernet or USB interfaces that lack internet access
+    /// and therefore never become the system default network. Configured once at startup.
+    nonisolated(unsafe) public static var bind: ((Int32, String) -> Bool)?
+}
+
 /// Blocking IPv4 UDP socket built on standard POSIX socket calls.
 public final class UDPSocket {
     let descriptor: Int32
@@ -26,8 +34,10 @@ public final class UDPSocket {
                 return nil
             }
             #else
-            close(descriptor)
-            return nil      // interface binding is not implemented on this platform
+            guard let bind = NetworkInterfaces.bind, bind(descriptor, interface) else {
+                close(descriptor)
+                return nil  // interface binding is unsupported or failed
+            }
             #endif
         }
         if let localPort {

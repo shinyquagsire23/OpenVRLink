@@ -21,6 +21,11 @@ public struct XRPlatform {
     public var startMicrophone: (any MicrophoneSink) -> Void = { _ in }
     public var stopMicrophone: () -> Void = {}
     public var power: () -> PowerState? = { nil }
+    /// Polls a platform system button not exposed through OpenXR (such as Android's back button), mapped to the
+    /// left menu input.
+    public var systemButton: (() -> Bool)?
+    /// Per-headset controller grip pose offset (`HeadsetQuirks.gripOffset`).
+    public var gripOffset: HeadsetQuirks.GripOffset?
 
     public init(device: DeviceIdentity) {
         self.device = device
@@ -44,6 +49,8 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
     /// Latest display profile delivered by `XRDisplay.onReady`, or `nil` while the session is paused.
     private var measured: DeviceProfile?
     private var panelPinned = false
+    /// Play-space origin set by the most recent host-initiated recenter during this session, in tracking space.
+    private var recentered: FloorFrame?
 
     /// - Parameters:
     ///   - model, panel: Shared model and panel instances (which the shell may also render in a 2D launcher
@@ -57,11 +64,17 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
         let layer = XRPanelLayer(width: panel.width, height: panel.height)
         display = try XRDisplay(applicationName: applicationName, graphics: graphics, frames: link.frames, panel: layer,
                                 process: process, log: log)
+        if let offset = platform.gripOffset, !offset.isNone { display.input.gripOffsets = Side.allCases.map { offset.pose(for: $0) } }
+        display.input.systemButton = platform.systemButton
         panel.showsPointer = true
-        panel.hint = "Hold the menu button to show or hide this panel while streaming."
+        let hint = "Hold the menu button to show or hide this panel while streaming."
+        panel.hint = hint
 
-        layer.update = { [panel] pointer in
+        layer.update = { [panel, weak self] pointer in
             panel.pointer = pointer
+            // Prompt the user when face tracking is inactive because system face calibration hasn't been run.
+            let uncalibrated = self?.display.faceNeedsCalibration ?? false
+            panel.hint = hint + (uncalibrated ? "\nFace tracking requires calibration in the headset's system settings." : "")
             // Upload the initial image if the swapchain has never been written, even if ImGui's draw hash didn't change.
             return panel.update() || !layer.hasPicture ? panel.picture.pixels : nil
         }
@@ -91,7 +104,18 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
         model.stopStream = { [link] leaving in link.stop(leaving: leaving) }
 
         display.streamingSession = { [link] in link.session }
-        display.chromaKey = { [model, link] in model.settings.chromaKeying(inGame: link.session?.sceneApplicationRunning ?? false) }
+        if display.graphics.supportsChromaKey, display.canShowRoom {
+            panel.features.insert(.chromaKey)
+            display.chromaKey = { [model, link] in model.settings.chromaKeying(inGame: link.session?.sceneApplicationRunning ?? false) }
+        } else {
+            panel.features.remove(.chromaKey)
+        }
+        if display.graphics.supportsDepth {
+            panel.features.insert(.depthFromPicture)
+            display.depthFromPicture = { [model] in (model.settings.depthFromPicture, model.settings.showDepth) }
+        } else {
+            panel.features.remove(.depthFromPicture)
+        }
         display.onPaused = { [weak self] in
             guard let self else { return }
             lock.lock()
@@ -105,12 +129,36 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
             lock.lock()
             measured = profile
             lock.unlock()
-            // Forward the OpenXR stage bounds to the host as the room boundary when available.
-            link.playSpace = PlaySpace(origin: PlaySpace.trackingSpace.origin, boundary: display.boundary())
+            updatePlaySpace()
             // Reconnect to the active host after a session pause, or connect to a host selected before the session was ready.
             if let target = model.state.target { start(target) }
         }
+        // Re-query the OpenXR boundary whenever the runtime updates its reference space.
+        display.onSpaceChanged = { [weak self] in
+            guard let self else { return }
+            lock.lock()
+            // Clear any host recenter offset if a non-stage tracking origin itself shifted.
+            if display.origin != .stage { recentered = nil }
+            lock.unlock()
+            updatePlaySpace()
+        }
+        link.onRecenterRequested = { [weak self] in
+            guard let self, let head = display.input.head()?.pose else { return }
+            lock.lock()
+            recentered = FloorFrame(position: Vec3(head.position.x, 0, head.position.z), yaw: FloorFrame.heading(of: head))
+            lock.unlock()
+            updatePlaySpace()
+        }
         model.search()
+    }
+
+    /// Updates `link.playSpace` using either the latest host-requested recenter frame or the tracking origin,
+    /// transforming the OpenXR stage boundary so it remains fixed in physical space.
+    private func updatePlaySpace() {
+        lock.lock()
+        let frame = recentered ?? FloorFrame(position: Vec3(0, 0, 0), yaw: 0)
+        lock.unlock()
+        link.playSpace = PlaySpace(origin: frame.pose, boundary: display.boundary().map { frame.local(Vec3($0.x, 0, $0.z)) })
     }
 
     /// Starts connecting to `target` immediately if the OpenXR session is ready; otherwise `onReady` will
@@ -119,11 +167,13 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
         lock.lock()
         let measured = self.measured
         panelPinned = false
+        recentered = nil
         lock.unlock()
         guard var profile = measured else {
             model.show("Waiting for the headset")
             return
         }
+        updatePlaySpace()
         let settings = model.settings
         profile.systemName = platform.device.systemName
         profile.clientVersion = platform.device.clientVersion
@@ -135,6 +185,12 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
         connector.askPin = { [model, link] in model.askPin { !link.isWanted } }
         var inputs = StreamLink<Decoder>.Inputs(head: { [display] in display.input.head() }, hands: { [display] in display.input.hands() })
         inputs.haptic = { [display] in display.input.vibrate($0) }
+        if display.input.tracksGaze {
+            profile.tracksGaze = true
+            inputs.gaze = { [display] in display.input.gaze() }
+        }
+        if display.tracksFace { inputs.face = { [display] in display.faceExpressions() } }
+        profile.tracksEyesOrFace = display.input.tracksGaze || display.tracksFace
         inputs.refreshRateRequested = { [display] in display.requestRefreshRate($0) }
         inputs.power = platform.power
         link.start(target.kind, address: target.address, port: target.port, profile: profile, connector: connector, inputs: inputs)

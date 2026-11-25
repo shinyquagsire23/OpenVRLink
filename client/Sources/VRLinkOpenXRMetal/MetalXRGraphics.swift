@@ -26,6 +26,18 @@ public final class MetalXRGraphics: XRGraphics {
     /// Metal textures for each eye's swapchain images.
     private var textures: [[MTLTexture]] = []
 
+    public let supportsChromaKey = true
+    public let supportsDepth = true
+    /// Metal stereo downsampler and matcher shared with the visionOS compositor.
+    private var stereo: StereoShrink?
+    public var measure: DepthEstimator.Measure? {
+        stereo.map { stereo in { stereo.measure($0, interests: $1, done: $2) } }
+    }
+
+    /// CPU fallback that extracts downsampled luma pairs when GPU matching is unavailable.
+    public func shrink(_ frame: DecodedFrame, width: Int, done: @escaping (StereoPair?) -> Void) {
+        done(DepthEstimator.pair(from: frame, width: width))
+    }
     public var chromaKey: ChromaKey? {
         didSet { renderer?.chromaKey = chromaKey }
     }
@@ -72,6 +84,7 @@ public final class MetalXRGraphics: XRGraphics {
         guard let device, let first = swapchains.first, let format = MTLPixelFormat(rawValue: UInt(first.format))
         else { throw XRFailure.unsupported("a Metal device") }
         textures = try swapchains.map { try images(of: $0, instance: instance) }
+        stereo = StereoShrink(device: device)
         let linear = format != .bgra8Unorm && format != .rgba8Unorm
         guard let renderer = QuadRenderer(device: device, colorFormat: format, linearOutput: linear)
         else { throw XRFailure.unsupported("Metal quad shaders") }

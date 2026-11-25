@@ -28,7 +28,7 @@ Android app for OpenXR headsets (see `android/build.sh` for toolchain and SDK re
 ```
 cd android && ./build.sh             # build the APK
 cd android && ./build.sh --install   # build and install via adb
-cd android && ./build.sh --flat      # open a 2D launcher window first and enter XR after selecting a host
+cd android && ./build.sh --flat      # open a 2D launcher window first and enter XR after selecting a host (not supported on Android XR)
 ```
 
 You can override per-headset quirks (such as swapchain color encoding and decoder setup) over adb without rebuilding;
@@ -106,6 +106,6 @@ and "Experiments". The experiments (off by default, on their own tab in the
 visionOS app) are a RealityKit renderer, face and eye tracking read off the
 wearer's Spatial Persona, and the two calibrations those need.
 
-## Licence
+## License
 
 [Mozilla Public License 2.0](../LICENSE) except where headers say specifically otherwise.

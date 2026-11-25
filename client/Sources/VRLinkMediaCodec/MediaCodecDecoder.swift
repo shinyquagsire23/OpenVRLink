@@ -107,7 +107,10 @@ final class PictureCodec {
 
     private let lock = NSLock()
     /// In-flight frame metadata keyed by synthetic input presentation timestamp (in microseconds).
-    private var pending: [Int64: (frameID: UInt16, layout: FrameLayout)] = [:]
+    private var pending: [Int64: (frameID: UInt16, layout: FrameLayout, queued: UInt64)] = [:]
+    /// Rolling throughput and latency counters since the last periodic log report (guarded by `lock`).
+    private var pace = (since: UInt64(0), queued: 0, bytes: 0, refused: 0, decoded: 0, time: UInt64(0), longest: UInt64(0))
+    private static let paceEvery = 5.0
     private var sequence: Int64 = 0
     /// Incremented on `stop()` and `start()` so previous drain threads exit cleanly.
     private var generation = 0
@@ -250,6 +253,9 @@ final class PictureCodec {
               let source = bytes.baseAddress
         else {
             Log.note("decoder: no input buffer available for frame \(frame.frameID) (\(bytes.count) bytes)")
+            lock.lock()
+            pace.refused += 1
+            lock.unlock()
             onFailure?(frame.frameID)
             return
         }
@@ -257,7 +263,9 @@ final class PictureCodec {
         lock.lock()
         sequence += 1
         let stamp = sequence
-        pending[stamp] = (frame.frameID, frame.layout)
+        pending[stamp] = (frame.frameID, frame.layout, Uptime.nanoseconds)
+        pace.queued += 1
+        pace.bytes += bytes.count
         // Bound the pending map in case the hardware decoder drops frames without emitting output.
         if pending.count > 64 { pending = pending.filter { $0.key > stamp - 32 } }
         lock.unlock()
@@ -310,7 +318,25 @@ final class PictureCodec {
         // AMediaCodec input timestamps are in microseconds, while AImage timestamps are reported in nanoseconds.
         lock.lock()
         let frame = pending.removeValue(forKey: nanoseconds / 1000)
+        // Periodically log decoder throughput, decode latency, and queue depth.
+        var line: String?
+        let now = Uptime.nanoseconds
+        if let frame {
+            pace.decoded += 1
+            pace.time += now - frame.queued
+            pace.longest = max(pace.longest, now - frame.queued)
+        }
+        if pace.since == 0 { pace.since = now }
+        let seconds = Double(now - pace.since) / 1e9
+        if seconds >= PictureCodec.paceEvery {
+            line = String(format: "decoder: %.0f pictures/s in (%.1f Mbit/s), %.0f out, each taking %.1f ms (longest %.1f); %d refused, %d waiting",
+                          Double(pace.queued) / seconds, Double(pace.bytes) * 8 / seconds / 1e6, Double(pace.decoded) / seconds,
+                          pace.decoded > 0 ? Double(pace.time) / Double(pace.decoded) / 1e6 : 0, Double(pace.longest) / 1e6,
+                          pace.refused, pending.count)
+            pace = (now, 0, 0, 0, 0, 0, 0)
+        }
         lock.unlock()
+        if let line { Log.note(line) }
         guard let frame else { return }
         onPicture?(frame.frameID, decoded, frame.layout)
     }

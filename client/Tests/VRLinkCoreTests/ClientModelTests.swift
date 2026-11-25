@@ -245,6 +245,37 @@ final class HeadsetQuirksTests: XCTestCase {
         XCTAssertEqual(quirks.decoderWidth, 1920)
         XCTAssertEqual(quirks.decoderHeight, 2048)        // out of range, ignored
         XCTAssertFalse(quirks.decoderLowLatency)
+    }
+
+    func testGripOffsetTakesAHeadsetsGripToAQuests() {
+        XCTAssertTrue(HeadsetQuirks(.quest3).gripOffset.isNone)
+        // ALVR pitches Quest's grip -15 deg and leaves Galaxy XR's unrotated (+5.5 cm in Z), so mapping Galaxy XR
+        // to Quest pitches +15 deg and shifts +5.5 cm along Z.
+        let offset = HeadsetQuirks(.galaxyXR).gripOffset
+        XCTAssertEqual(offset.pitch, 15, accuracy: 0.01)
+        XCTAssertEqual(offset.yaw, 0, accuracy: 0.01)
+        XCTAssertEqual(offset.roll, 0, accuracy: 0.01)
+        let left = offset.pose(for: .left), right = offset.pose(for: .right)
+        XCTAssertEqual(left.position.x, -right.position.x, accuracy: 1e-6)
+        XCTAssertEqual(left.position.z, right.position.z, accuracy: 1e-6)
+        XCTAssertGreaterThan(left.position.z, 0.05)
+        // Composing with ALVR's Quest offset recovers ALVR's common pose for Galaxy XR.
+        let quest = HeadsetQuirks.GripOffset(x: -0.005, y: -0.005, pitch: -15).pose(for: .left)
+        let common = left.placing(quest)
+        XCTAssertEqual(common.position.x, 0, accuracy: 1e-5)
+        XCTAssertEqual(common.position.y, 0, accuracy: 1e-5)
+        XCTAssertEqual(common.position.z, 0.055, accuracy: 1e-5)
+        XCTAssertEqual(common.forward.z, -1, accuracy: 1e-5)
+
+        var quirks = HeadsetQuirks(.quest3)
+        quirks.apply { $0 == "grip_offset" ? "0.01, 0, -0.02, 5, 0, 0" : nil }
+        XCTAssertEqual(quirks.gripOffset, HeadsetQuirks.GripOffset(x: 0.01, z: -0.02, pitch: 5))
+        // Rotating around +Y produces tangential linear velocity for an offset child pose.
+        var tracked = TrackedPose(pose: Pose(position: Vec3(0, 0, 0), right: Vec3(1, 0, 0), up: Vec3(0, 1, 0), forward: Vec3(0, 0, -1)))
+        tracked.angularVelocity = Vec3(0, 1, 0)
+        let moved = tracked.placing(Pose(position: Vec3(0, 0, 0.1), right: Vec3(1, 0, 0), up: Vec3(0, 1, 0), forward: Vec3(0, 0, -1)))
+        XCTAssertEqual(moved.linearVelocity.x, 0.1, accuracy: 1e-5)
+        XCTAssertEqual(moved.angularVelocity.y, 1, accuracy: 1e-5)
         quirks.apply { $0 == "video_range" ? "auto" : nil }
         XCTAssertNil(quirks.videoRange)
         XCTAssertTrue(quirks.summary.contains("quest3"))

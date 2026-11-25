@@ -25,8 +25,10 @@ public final class TCPSocket {
                 return nil
             }
             #else
-            close(descriptor)
-            return nil      // interface binding is not implemented on this platform
+            guard let bind = NetworkInterfaces.bind, bind(descriptor, interface) else {
+                close(descriptor)
+                return nil  // interface binding is unsupported or failed
+            }
             #endif
         }
         var target = sockaddr_in()

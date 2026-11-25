@@ -3,7 +3,8 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-# Compiles quad.vert and quad.frag to SPIR-V and writes the bytecode into ../QuadShaders.swift.
+# Compiles quad.vert and quad.frag (standard and chroma-keyed variants) to SPIR-V and writes the bytecode into
+# ../QuadShaders.swift.
 # Checking in QuadShaders.swift avoids requiring glslc during normal Swift builds; re-run this script
 # after modifying either shader.
 #
@@ -21,6 +22,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 "$glslc" -O "$here/quad.vert" -o "$work/vertex.spv"
 "$glslc" -O "$here/quad.frag" -o "$work/fragment.spv"
+"$glslc" -O -DKEYED "$here/quad.frag" -o "$work/keyed.spv"
 
 words() {
     od -An -v -t x4 "$1" | tr -s ' \n' '\n' | sed '/^$/d' | awk '
@@ -43,6 +45,9 @@ HEADER
     words "$work/vertex.spv"
     printf '    ]\n\n    static let fragment: [UInt32] = [\n'
     words "$work/fragment.spv"
+    printf '    ]\n\n    /// Chroma-keyed fragment shader variant using dual-source blending.\n'
+    printf '    static let keyedFragment: [UInt32] = [\n'
+    words "$work/keyed.spv"
     printf '    ]\n}\n'
 } > "$here/../QuadShaders.swift"
 echo "wrote $here/../QuadShaders.swift"
