@@ -84,7 +84,10 @@ public final class VulkanXRGraphics: XRGraphics {
         var capacity = 0
     }
 
-    public init(log: @escaping (String) -> Void) {
+    private let quirks: HeadsetQuirks
+
+    public init(quirks: HeadsetQuirks = HeadsetQuirks(), log: @escaping (String) -> Void) {
+        self.quirks = quirks
         self.log = log
     }
 
@@ -193,7 +196,8 @@ public final class VulkanXRGraphics: XRGraphics {
     private static let formats = [VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM]
 
     public func chooseFormat(among offered: [Int64]) -> Int64? {
-        VulkanXRGraphics.formats.map { Int64($0.rawValue) }.first { offered.contains($0) }
+        let wanted = (quirks.floatTarget ? [VK_FORMAT_R16G16B16A16_SFLOAT] : []) + VulkanXRGraphics.formats
+        return wanted.map { Int64($0.rawValue) }.first { offered.contains($0) }
     }
 
     // MARK: Targets
@@ -201,7 +205,14 @@ public final class VulkanXRGraphics: XRGraphics {
     public func adopt(_ swapchains: [XRSwapchain], instance xr: XRInstance) throws {
         guard let first = swapchains.first else { return }
         let format = VkFormat(rawValue: UInt32(first.format))
-        linearTarget = format == VK_FORMAT_R8G8B8A8_SRGB || format == VK_FORMAT_B8G8R8A8_SRGB
+        // sRGB attachments encode linear output automatically on write. Float swapchain encoding is left
+        // unspecified by OpenXR and varies across headsets (`HeadsetQuirks.floatTargetIsEncoded`).
+        if format == VK_FORMAT_R16G16B16A16_SFLOAT {
+            linearTarget = !quirks.floatTargetIsEncoded
+        } else {
+            linearTarget = format == VK_FORMAT_R8G8B8A8_SRGB || format == VK_FORMAT_B8G8R8A8_SRGB
+        }
+        log("vulkan: swapchain format \(format.rawValue), written as \(linearTarget ? "linear light" : "sRGB-encoded")")
 
         // OpenXR acquires and releases swapchain images in VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL.
         var attachment = VkAttachmentDescription()
@@ -303,7 +314,14 @@ public final class VulkanXRGraphics: XRGraphics {
         conversion.pNext = UnsafeRawPointer(arena.keep(external))
         conversion.format = format.format
         conversion.ycbcrModel = format.suggestedYcbcrModel
-        conversion.ycbcrRange = format.suggestedYcbcrRange
+        switch quirks.videoRange {
+        case .narrow: conversion.ycbcrRange = VK_SAMPLER_YCBCR_RANGE_ITU_NARROW
+        case .full: conversion.ycbcrRange = VK_SAMPLER_YCBCR_RANGE_ITU_FULL
+        case nil: conversion.ycbcrRange = format.suggestedYcbcrRange
+        }
+        log("vulkan: decoded pictures are format \(format.format.rawValue) (external \(format.externalFormat)), model "
+            + "\(format.suggestedYcbcrModel.rawValue), range \(format.suggestedYcbcrRange.rawValue) suggested and "
+            + "\(conversion.ycbcrRange.rawValue) used")
         conversion.components = format.samplerYcbcrConversionComponents
         conversion.xChromaOffset = format.suggestedXChromaOffset
         conversion.yChromaOffset = format.suggestedYChromaOffset
@@ -496,8 +514,10 @@ public final class VulkanXRGraphics: XRGraphics {
 
     /// Returns a `VkImageView` for `picture`, importing its `AHardwareBuffer` on first use.
     private func view(of picture: HardwarePicture, with commands: VkCommandBuffer?) throws -> VkImageView? {
-        var id: UInt64 = 0
-        AHardwareBuffer_getId(picture.buffer, &id)
+        // Android < 12 (API 31) lacks `AHardwareBuffer_getId`, so fall back to the buffer pointer address,
+        // which stays stable while pooled by `AImageReader`.
+        var id = UInt64(UInt(bitPattern: Int(bitPattern: picture.buffer)))
+        if #available(Android 31, *) { AHardwareBuffer_getId(picture.buffer, &id) }
         if imports[id] != nil {
             imports[id]?.lastUsed = frameCount
             return imports[id]?.view
@@ -624,6 +644,105 @@ public final class VulkanXRGraphics: XRGraphics {
         try Vulkan.check(vkBindBufferMemory(device, buffer.handle, buffer.memory, 0), "vkBindBufferMemory")
         try Vulkan.check(vkMapMemory(device, buffer.memory, 0, Vulkan.wholeSize, 0, &buffer.mapped), "vkMapMemory")
         buffer.capacity = capacity
+    }
+
+    // MARK: Panel
+
+    private var panelImages: [VkImage?] = []
+    private var panelSize = VkExtent2D()
+    private var panelSwapsRedAndBlue = false
+    private var panelBuffer = Buffer()
+    private var panelCommands: VkCommandBuffer?
+    private var panelFence: VkFence?
+
+    public func choosePanelFormat(among offered: [Int64]) -> Int64? {
+        VulkanXRGraphics.formats.map { Int64($0.rawValue) }.first { offered.contains($0) }
+    }
+
+    public func adoptPanel(_ swapchain: XRSwapchain, instance xr: XRInstance) throws {
+        let enumerate = try xr.function("xrEnumerateSwapchainImages", as: PFN_xrEnumerateSwapchainImages.self)
+        var count: UInt32 = 0
+        try XRFailure.check(enumerate(swapchain.handle, 0, &count, nil), "xrEnumerateSwapchainImages")
+        var blank = XrSwapchainImageVulkan2KHR()
+        blank.type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR
+        var images = [XrSwapchainImageVulkan2KHR](repeating: blank, count: Int(count))
+        try XRFailure.check(images.withUnsafeMutableBytes { all in
+            enumerate(swapchain.handle, count, &count, all.baseAddress?.assumingMemoryBound(to: XrSwapchainImageBaseHeader.self))
+        }, "xrEnumerateSwapchainImages")
+        panelImages = images.map(\.image)
+        panelSize = VkExtent2D(width: UInt32(swapchain.width), height: UInt32(swapchain.height))
+        let format = VkFormat(rawValue: UInt32(swapchain.format))
+        panelSwapsRedAndBlue = format == VK_FORMAT_B8G8R8A8_SRGB || format == VK_FORMAT_B8G8R8A8_UNORM
+        var allocate = VkCommandBufferAllocateInfo()
+        allocate.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+        allocate.commandPool = pool
+        allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY
+        allocate.commandBufferCount = 1
+        try Vulkan.check(vkAllocateCommandBuffers(device, &allocate, &panelCommands), "vkAllocateCommandBuffers")
+        var fenceInfo = VkFenceCreateInfo()
+        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+        try Vulkan.check(vkCreateFence(device, &fenceInfo, nil, &panelFence), "vkCreateFence")
+    }
+
+    public func drawPanel(_ pixels: [UInt8], image: Int) {
+        do {
+            try copyPanel(pixels, image: image)
+        } catch {
+            log("vulkan: panel: \(error)")
+        }
+    }
+
+    /// Uploads the panel RGBA buffer into `image` via a staging buffer and waits on a fence so the swapchain
+    /// image can be released and the staging buffer reused on return.
+    private func copyPanel(_ pixels: [UInt8], image: Int) throws {
+        guard panelImages.indices.contains(image), pixels.count == Int(panelSize.width * panelSize.height) * 4 else { return }
+        try reserve(&panelBuffer, bytes: pixels.count, usage: VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
+        guard let mapped = panelBuffer.mapped else { return }
+        pixels.withUnsafeBytes { mapped.copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+        if panelSwapsRedAndBlue {
+            let bytes = mapped.assumingMemoryBound(to: UInt8.self)
+            for at in stride(from: 0, to: pixels.count, by: 4) { (bytes[at], bytes[at + 2]) = (bytes[at + 2], bytes[at]) }
+        }
+        try Vulkan.check(vkResetCommandBuffer(panelCommands, 0), "vkResetCommandBuffer")
+        var begin = VkCommandBufferBeginInfo()
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT.rawValue
+        try Vulkan.check(vkBeginCommandBuffer(panelCommands, &begin), "vkBeginCommandBuffer")
+        // OpenXR acquires and releases swapchain images in VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL.
+        var barrier = VkImageMemoryBarrier()
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+        barrier.srcAccessMask = 0
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT.rawValue
+        barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+        barrier.srcQueueFamilyIndex = UInt32.max        // VK_QUEUE_FAMILY_IGNORED
+        barrier.dstQueueFamilyIndex = UInt32.max
+        barrier.image = panelImages[image]
+        barrier.subresourceRange = Vulkan.wholeColor
+        vkCmdPipelineBarrier(panelCommands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT.rawValue, VK_PIPELINE_STAGE_TRANSFER_BIT.rawValue,
+                             0, 0, nil, 0, nil, 1, &barrier)
+        var region = VkBufferImageCopy()
+        region.imageSubresource = VkImageSubresourceLayers(aspectMask: VK_IMAGE_ASPECT_COLOR_BIT.rawValue, mipLevel: 0,
+                                                           baseArrayLayer: 0, layerCount: 1)
+        region.imageExtent = VkExtent3D(width: panelSize.width, height: panelSize.height, depth: 1)
+        vkCmdCopyBufferToImage(panelCommands, panelBuffer.handle, panelImages[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region)
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT.rawValue
+        barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT.rawValue
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+        barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+        vkCmdPipelineBarrier(panelCommands, VK_PIPELINE_STAGE_TRANSFER_BIT.rawValue,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT.rawValue, 0, 0, nil, 0, nil, 1, &barrier)
+        try Vulkan.check(vkEndCommandBuffer(panelCommands), "vkEndCommandBuffer")
+        var submit = VkSubmitInfo()
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO
+        submit.commandBufferCount = 1
+        try withUnsafePointer(to: &panelCommands) {
+            submit.pCommandBuffers = $0
+            try Vulkan.check(vkQueueSubmit(queue, 1, &submit, panelFence), "vkQueueSubmit")
+        }
+        var waiting = panelFence
+        vkWaitForFences(device, 1, &waiting, 1, UInt64.max)
+        vkResetFences(device, 1, &waiting)
     }
 
     public func draw(_ eyes: [XREyeDraw], frame: HardwareFrame?, transparent: Bool) {

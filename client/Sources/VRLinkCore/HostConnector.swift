@@ -5,7 +5,7 @@
 import Foundation
 
 /// The streaming protocol used by a host.
-public enum HostKind: String {
+public enum HostKind: String, Codable {
     case steam, wivrn
 }
 
@@ -48,6 +48,10 @@ public struct HostConnector {
         self.systemVersion = systemVersion
     }
 
+    public init(_ device: DeviceIdentity) {
+        self.init(deviceName: HostConnector.name(of: device.name), deviceModel: device.model, systemVersion: device.systemVersion)
+    }
+
     /// Formats a user-assigned device name with the app suffix, e.g. "Max's Mac (OpenVRLink)".
     public static func name(of device: String) -> String { device + " (" + DataDirectory.name + ")" }
 
@@ -84,9 +88,13 @@ public struct HostConnector {
             show("Asking \(host.hostname) for a session")
             args = try Broadcast.requestSession(socket, host: host, identity: identity, deviceVersion: deviceVersion)
         } catch BroadcastError.notPaired {
-            try Broadcast.pair(socket, host: host, identity: identity, deviceName: deviceName, deviceModel: deviceModel) { pin in
+            let paired = try Broadcast.pair(socket, host: host, identity: identity, deviceName: deviceName, deviceModel: deviceModel,
+                                            cancelled: cancelled, showBusy: {
+                show("\(host.hostname) is still showing an earlier PIN prompt; close it in Steam there")
+            }, showPIN: { pin in
                 show("Enter PIN \(pin) in Steam on \(host.hostname)")
-            }
+            })
+            if !paired { return nil }
             show("Paired; asking \(host.hostname) for a session")
             args = try Broadcast.requestSession(socket, host: host, identity: identity, deviceVersion: deviceVersion)
         }
@@ -135,5 +143,28 @@ public struct HostConnector {
                 Thread.sleep(forTimeInterval: 1)
             }
         }
+    }
+}
+
+/// Device metadata reported to the host during pairing and session setup. Platform shells populate this from
+/// system APIs (`SystemVersion.device` on Apple platforms, system properties and JNI on Android).
+public struct DeviceIdentity {
+    /// User-assigned device name, or the hardware model name when unavailable.
+    public var name: String
+    /// Hardware model, such as "Apple Vision Pro".
+    public var model: String
+    /// Operating system name, such as "visionOS" (`DeviceProfile.systemName`).
+    public var systemName: String
+    /// Operating system name and version, such as "visionOS 27.0".
+    public var systemVersion: String
+    /// Client name and version, such as "OpenVRLink 0.2.0-2" (`DeviceProfile.clientVersion`).
+    public var clientVersion: String
+
+    public init(name: String, model: String, systemName: String, systemVersion: String, clientVersion: String = DataDirectory.name) {
+        self.name = name
+        self.model = model
+        self.systemName = systemName
+        self.systemVersion = systemVersion
+        self.clientVersion = clientVersion
     }
 }

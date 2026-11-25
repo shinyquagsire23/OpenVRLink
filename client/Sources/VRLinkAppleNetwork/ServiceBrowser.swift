@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import Foundation
+import VRLinkCore
 import dnssd
 
 /// Discovers Bonjour (mDNS) services on the local network and resolves their
@@ -16,14 +17,8 @@ import dnssd
 /// Uses the system DNS-SD daemon (`dnssd`) to resolve hostnames passively. On
 /// non-macOS Apple platforms, the browsed service type must be declared under
 /// `NSBonjourServices` in `Info.plist`.
-public final class ServiceBrowser {
-    public struct Service: Equatable {
-        /// Advertised service instance name (for WiVRn, the host's computer name).
-        public let name: String
-        /// Resolved mDNS hostname (typically ending in `.local`).
-        public let host: String
-        public let port: UInt16
-    }
+public final class ServiceBrowser: ServiceFinder {
+    public typealias Service = FoundService
 
     private let type: String
     private let queue = DispatchQueue(label: "service-browser")

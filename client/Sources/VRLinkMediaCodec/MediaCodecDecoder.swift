@@ -64,8 +64,11 @@ public final class MediaCodecDecoder: StreamDecoder {
 
     private var decoders: [PictureCodec] = []
     private let assembler = PictureAssembler<HardwarePicture>()
+    private let quirks: HeadsetQuirks
 
-    public init() {}
+    public init(quirks: HeadsetQuirks = HeadsetQuirks()) {
+        self.quirks = quirks
+    }
 
     public func reset() {
         decoders.forEach { $0.stop() }
@@ -76,7 +79,7 @@ public final class MediaCodecDecoder: StreamDecoder {
     public func decode(_ frame: EncodedFrame) {
         while decoders.count <= frame.picture {
             let picture = decoders.count
-            let decoder = PictureCodec(picture: picture)
+            let decoder = PictureCodec(picture: picture, quirks: quirks)
             decoder.onPicture = { [weak self] frameID, decoded, layout in
                 guard let self, let whole = assembler.add(decoded, index: picture, frameID: frameID, of: layout.pictures) else { return }
                 onImage?(HardwareFrame(frameID: frameID, pictures: whole, layout: layout))
@@ -114,8 +117,11 @@ final class PictureCodec {
     /// Timeout in microseconds when dequeuing an input buffer before dropping the frame.
     private static let inputWait: Int64 = 20_000
 
-    init(picture: Int) {
+    private let quirks: HeadsetQuirks
+
+    init(picture: Int, quirks: HeadsetQuirks) {
         self.picture = picture
+        self.quirks = quirks
     }
 
     deinit { stop() }
@@ -142,14 +148,47 @@ final class PictureCodec {
         }
     }
 
-    /// Configures and starts an `AMediaCodec` decoder for `kind`. Because SPS/PPS/VPS parameter sets arrive
-    /// in-band, initial dimensions use a 2048x2048 placeholder alongside `MAX_WIDTH`/`MAX_HEIGHT` until the
-    /// codec parses the bitstream.
-    ///
-    /// TODO: Parse coded dimensions from the H.264/HEVC SPS or AV1 sequence header in `VRLinkCore` for
-    /// devices whose decoders require exact initial dimensions.
-    private func start(_ kind: VideoCodec) -> Bool {
-        let (width, height): (Int32, Int32) = (2048, 2048)
+    /// Creates, configures, and starts a decoder drawing into `window`, or returns `nil` (after logging) if the
+    /// device refuses the configuration. `operatingRate` of 0 leaves the rate unset.
+    private func make(_ kind: VideoCodec, width: Int32, height: Int32, operatingRate: Int, window: OpaquePointer) -> OpaquePointer? {
+        guard let made = AMediaCodec_createDecoderByType(PictureCodec.mime(kind)) else {
+            Log.note("decoder: no hardware decoder available for \(kind.rawValue)")
+            return nil
+        }
+        let format = AMediaFormat_new()
+        defer { AMediaFormat_delete(format) }
+        AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, PictureCodec.mime(kind))
+        AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, width)
+        AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, height)
+        AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_MAX_WIDTH, 8192)
+        AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_MAX_HEIGHT, 8192)
+        // Realtime priority, and a rate to be ready for: without one, Qualcomm decoders assume 30 frames a
+        // second and fall behind a 90 Hz stream.
+        AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_PRIORITY, 0)
+        if operatingRate > 0 { AMediaFormat_setInt32(format, "operating-rate", Int32(operatingRate)) }
+        // Request low-latency output so frames are emitted immediately without B-frame reordering buffering.
+        if quirks.decoderLowLatency {
+            AMediaFormat_setInt32(format, "low-latency", 1)
+            AMediaFormat_setInt32(format, "vendor.qti-ext-dec-low-latency.enable", 1)
+        }
+        var status = AMediaCodec_configure(made, format, window, nil, 0)
+        if status == AMEDIA_OK { status = AMediaCodec_start(made) }
+        guard status == AMEDIA_OK else {
+            Log.note("decoder: failed to start \(kind.rawValue) decoder (status \(status.rawValue), operating rate \(operatingRate))")
+            AMediaCodec_delete(made)
+            return nil
+        }
+        return made
+    }
+
+    /// Configures and starts an `AMediaCodec` decoder for `kind` using the dimensions parsed from the keyframe's
+    /// sequence parameter set (`PictureSize`). When dimensions cannot be parsed beforehand (currently AV1),
+    /// falls back to `HeadsetQuirks.decoderWidth` and `decoderHeight` alongside `MAX_WIDTH`/`MAX_HEIGHT` so the
+    /// decoder can update its output size from the bitstream.
+    private func start(_ kind: VideoCodec, keyframe: UnsafeBufferPointer<UInt8>) -> Bool {
+        let read = PictureSize.of(keyframe: keyframe, codec: kind)
+        let (width, height) = (Int32(read?.width ?? quirks.decoderWidth), Int32(read?.height ?? quirks.decoderHeight))
+        Log.note("decoder: configuring \(kind.rawValue) at \(width) x \(height)" + (read == nil ? " (placeholder)" : ""))
         guard let reader = ImageReader(width: width, height: height, pictures: PictureCodec.picturesOut) else {
             Log.note("decoder: failed to create AImageReader")
             return false
@@ -162,28 +201,15 @@ final class PictureCodec {
         var window: OpaquePointer?
         guard AImageReader_getWindow(reader.handle, &window) == AMEDIA_OK, let window else { return false }
 
-        guard let made = AMediaCodec_createDecoderByType(PictureCodec.mime(kind)) else {
-            Log.note("decoder: no hardware decoder available for \(kind.rawValue)")
-            return false
+        // A decoder that turns down the operating rate is made again without it.
+        var chosen: OpaquePointer?
+        for rate in Set([quirks.decoderOperatingRate, 0]).sorted(by: >) {
+            if let made = make(kind, width: width, height: height, operatingRate: rate, window: window) {
+                chosen = made
+                break
+            }
         }
-        let format = AMediaFormat_new()
-        defer { AMediaFormat_delete(format) }
-        AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, PictureCodec.mime(kind))
-        AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, width)
-        AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, height)
-        AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_MAX_WIDTH, 8192)
-        AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_MAX_HEIGHT, 8192)
-        // Request low-latency output so frames are emitted immediately without B-frame reordering buffering.
-        AMediaFormat_setInt32(format, "low-latency", 1)
-        AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_PRIORITY, 0)
-        AMediaFormat_setInt32(format, "vendor.qti-ext-dec-low-latency.enable", 1)
-        var status = AMediaCodec_configure(made, format, window, nil, 0)
-        if status == AMEDIA_OK { status = AMediaCodec_start(made) }
-        guard status == AMEDIA_OK else {
-            Log.note("decoder: failed to start \(kind.rawValue) decoder (status \(status.rawValue))")
-            AMediaCodec_delete(made)
-            return false
-        }
+        guard let made = chosen else { return false }
         lock.lock()
         codec = made
         self.reader = reader
@@ -204,7 +230,7 @@ final class PictureCodec {
         if let seen = AnnexB.keyframeCodec(bytes), seen != kind {
             Log.note(kind == nil ? "decoder: starting \(seen.rawValue) stream" : "decoder: switching codec to \(seen.rawValue)")
             stop()
-            guard start(seen) else {
+            guard start(seen, keyframe: bytes) else {
                 onFailure?(frame.frameID)
                 return
             }

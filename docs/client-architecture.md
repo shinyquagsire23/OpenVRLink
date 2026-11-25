@@ -63,10 +63,11 @@ a separate mDNS/Bonjour discovery path alongside UDP subnet probing).
 | graphics | drawing quads through eye views from a decoded frame | Metal *or* Vulkan | `VRLinkMetal`, `VRLinkOpenXRMetal`, `VRLinkVulkan` |
 | decoder | access units in, decoded frames out | VideoToolbox *or* a platform decoder | `VRLinkVideoToolbox`, `VRLinkMediaCodec` |
 | audio | PCM out, microphone in | CoreAudio *or* a platform API | `VRLinkAppleAudio`, `VRLinkAndroidAudio` |
-| session glue | host discovery, pairing, starting and stopping a session with its decoder and audio, live settings updates | platform-specific backends | `VRLinkAppleSession`, `StreamLink` (in `VRLinkCore`) |
+| session glue | host discovery, pairing, starting and stopping a session with its decoder and audio, live settings updates | `VRLinkCore` (`HostFinder`, `StreamLink`, `ClientModel`) plus injected platform backends | `VRLinkCore`, `VRLinkAppleSession` (SwiftUI), `VRLinkXRClient` (OpenXR) |
+| UI | presenting `ClientModel` and forwarding user actions | SwiftUI *or* Dear ImGui *or* a platform toolkit | `client/visionOS`, `VRLinkPanel` (+ `CImGui`) |
 | rooms | room selection for streaming sessions and the Room Setup immersive space | ARKit + RealityKit | `VRLinkVisionRooms` |
 | experiments | experimental features isolated so core targets do not depend on them | platform frameworks as needed | `VRLinkVisionExperiments`, `VRLinkAppleFace` |
-| app shells | wiring, window or immersive space, settings UI | the platform's app framework | `OpenVRLink` (macOS viewer), `client/visionOS`, `OpenVRLinkXR` (macOS OpenXR), `OpenVRLinkAndroid` + `client/android` (Android XR) |
+| app shells | wiring, window or immersive space, settings UI | the platform's app framework | `OpenVRLink` (macOS viewer), `client/visionOS`, `OpenVRLinkXR` (macOS OpenXR), `OpenVRLinkAndroid` + `client/android` (Android) |
 
 Apple-specific frameworks are avoided outside Apple-specific targets, and
 platform differences are isolated via `#if` conditionals or separate target
@@ -252,6 +253,8 @@ video decoder.
 | Session management, frame loop, swapchains, display metrics, and timing reports | `XRDisplay.swift` |
 | Action bindings, `ControllerState` mapping, hand tracking, and haptics | `XRInput.swift` |
 | Graphics backend protocol for OpenXR swapchains | `XRGraphics.swift` |
+| Quad layer for a 2D panel, with controller and hand pointer rays | `XRPanelLayer.swift` |
+| Platform-independent OpenXR client (display, link, panel, and model wired together) | `VRLinkXRClient` |
 | Metal graphics backend (`XR_KHR_metal_enable`) using `QuadRenderer` | `VRLinkOpenXRMetal` |
 | Vulkan graphics backend (`XR_KHR_vulkan_enable2`) sampling `AHardwareBuffer` | `VRLinkVulkan` |
 
@@ -279,14 +282,17 @@ so the runtime performs late-stage reprojection, matching visionOS. When
 the monotonic clock used by `Uptime` for `frameShown` and `displayRefreshes`
 telemetry; otherwise, the display time is estimated as one refresh period ahead.
 
-Stream connections follow the OpenXR session state. Once the runtime begins the
-session and reports valid eye views, `XRDisplay.onReady` delivers a
-`DeviceProfile` populated from `xrLocateViews` in view space, the recommended
-swapchain dimensions, and the refresh rate from `XR_FB_display_refresh_rate` (or
-the predicted frame period), allowing the app to connect without a separate
-measurement pass. When the runtime stops the session (for example, when the
-headset is removed or another app takes focus), the stream disconnects and
-automatically reconnects when the session resumes.
+Once the OpenXR runtime begins the session and reports valid eye views,
+`XRDisplay.onReady` builds a `DeviceProfile` from `xrLocateViews` in view space,
+the recommended swapchain dimensions, and the refresh rate from
+`XR_FB_display_refresh_rate` (or the predicted frame period), so the app does
+not need a separate measurement pass. `XRClient` starts connecting as soon as
+both the session is running and the user has picked a host
+(`ClientModel.state.target`). If the runtime stops the session (for example,
+when you take off the headset or switch to another app), `XRClient` disconnects
+the stream, keeps the selected host, and reconnects when the session resumes.
+Pressing Stop in the panel clears the selected host and sends a disconnect
+notice so the host closes the session.
 
 ### Reference spaces and input
 
@@ -303,110 +309,248 @@ already match the joint ordering and axis convention of `TrackedHand`.
 Transparent or chroma-keyed streams request `XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND`
 when the headset supports passthrough blending.
 
+### In-headset panel
+
+OpenXR targets do not have a system window manager for a host picker, so the UI
+is rendered into an RGBA pixel buffer and shown as a quad layer inside the VR
+session. `VRLinkPanel.Panel` draws `ClientModel` (see [UI model](#ui-model))
+with Dear ImGui, including discovered hosts, an on-screen keypad for manual IP
+entry, connection status, the WiVRn PIN prompt, and settings from
+`SettingsForm`.
+
+Rather than maintaining separate ImGui GPU backends for Metal and Vulkan,
+`PanelRasterizer` rasterizes ImGui's triangle lists on the CPU into a
+premultiplied RGBA buffer. The same pixel buffer can back an OpenXR quad layer
+or a 2D launcher window, and unit tests can check the rendered output directly.
+`Panel` hashes ImGui's draw lists each frame and only re-rasterizes when they
+change. Graphics backends copy that buffer into an 8-bit sRGB swapchain image
+through a staging buffer (`choosePanelFormat`, `adoptPanel`, and `drawPanel` on
+`XRGraphics`).
+
+`XRPanelLayer` places the panel as an `XrCompositionLayerQuad` 1.6 m in front of
+you each time it appears and intersects pointer rays with the quad to get panel
+pixel coordinates. Those rays use dedicated `point` and `press` actions bound to
+controller aim and trigger, or to hand aim and pinch through
+`XR_EXT_hand_interaction`. Keeping them separate from the stream's `aim` and
+`trigger` actions prevents a hand-interaction profile from making a tracked hand
+look like a controller to the host.
+
+The panel stays up until the first video frame is decoded. Holding the menu
+button for 0.8 s shows or hides the panel during an active stream, while short
+presses still go to SteamVR. Hand tracking does not have a gesture to reopen the
+panel yet, so without controllers it only reappears after the stream ends.
+
+Dear ImGui (`CImGui`, v1.91.9b) is vendored with build flags at the bottom of
+`imconfig.h` and wrapped in a plain C header (`CImGui.h`). Swift can import
+`imgui.h` directly through C++ interop, but enabling C++ interop on a Swift
+target forces every downstream target to enable it too, which would compile the
+app targets and their OpenXR, Vulkan, and Android NDK headers as C++.
+
 ### macOS OpenXR client
 
-`OpenVRLinkXR` runs OpenVRLink as a macOS OpenXR application, combining
+`OpenVRLinkXR` runs OpenVRLink as a macOS OpenXR application, pairing
 VideoToolbox decoding, `QuadRenderer`, and CoreAudio with an `XRDisplay` session
-instead of an AppKit window. It can be tested against
+instead of an AppKit window. You can test it against
 [OXRSys](https://github.com/demonixis/oxrsys), a macOS OpenXR runtime that
 forwards frames to a Quest, Pico, or Vision Pro headset:
 
 ```
-XR_RUNTIME_JSON=<oxrsys>/build/runtime/oxrsys-runtime.json swift run OpenVRLinkXR [host address]
+XR_RUNTIME_JSON=<oxrsys>/build/runtime/oxrsys-runtime.json swift run OpenVRLinkXR [host]
 ```
 
-In headless desktop runs against OXRSys 1.3.0 (without a physical headset
-attached), the session ran at 72 Hz, streamed from a Steam host at 72 fps, and
-rendered the SteamVR dashboard cleanly in swapchain captures saved via
-`--pictures`. Controller input, hand tracking, haptics, and on-headset display
-output have not been verified yet.
+Running without a host argument opens the in-headset panel with hosts found on
+the local network; passing `address`, `steam://address`, or
+`wivrn://address[:port]` connects right away. `main.swift` sets up VideoToolbox,
+CoreAudio, microphone capture, and Bonjour discovery, and hands session
+management off to `XRClient`. Pass `--pictures <folder>` to save periodic
+left-eye swapchain captures and redrawn panel images as PNGs for headless
+debugging. Controller input, hand tracking, pointer rays, haptics, and physical
+headset output via OXRSys still need testing on hardware.
 
-### Android XR
+### Android
 
-`client/android/build.sh` cross-compiles `libOpenVRLinkAndroid.so` using the
-Swift SDK for Android and packages it into a signed APK using the Android SDK
-command-line tools (`aapt2`, `zipalign`, and `apksigner`), without Gradle, Java,
-or Kotlin sources. Android's built-in `NativeActivity` loads the native library
-and calls `ANativeActivity_onCreate` in `OpenVRLinkAndroid/Activity.swift`,
-which attaches a background thread to the JVM and starts the OpenXR session.
+`client/android/build.sh` cross-compiles `libOpenVRLinkAndroid.so` with the
+Swift SDK for Android and packages a signed APK using the Android SDK
+command-line tools (`aapt2`, `zipalign`, and `apksigner`), with no Gradle, Java,
+or Kotlin code. Android's built-in `NativeActivity` loads the native library and
+calls `ANativeActivity_onCreate` in `OpenVRLinkAndroid/Activity.swift`. The
+manifest includes metadata for Android XR, Quest, and Pico, targeting Android 10
+(API 29) and later.
 
 | component | Android implementation | location |
 |---|---|---|
 | decoder | `AMediaCodec` decoding into `AImageReader` surfaces (`AHardwareBuffer` frames, one codec per video stream) | `VRLinkMediaCodec/MediaCodecDecoder.swift` |
 | graphics | Vulkan renderer importing `AHardwareBuffer` images with `VkSamplerYcbcrConversion` | `VRLinkVulkan/VulkanXRGraphics.swift`, `Shaders/` |
-| audio | Low-latency PCM output via AAudio | `VRLinkAndroidAudio/AudioOutput.swift` |
+| audio | Low-latency PCM output and microphone capture via AAudio | `VRLinkAndroidAudio` |
+| WiVRn discovery | `MulticastDNS` (in `VRLinkCore`), a UDP mDNS/DNS-SD browser | `VRLinkCore/MulticastDNS.swift` |
+| platform APIs | JNI calls into Android framework classes for runtime permissions, activity launches, and device name lookup | `OpenVRLinkAndroid/Java.swift` |
 | NDK bindings | C module exposing NativeActivity, MediaCodec, AAudio, and Vulkan headers | `CAndroidNDK` |
 
 The Vulkan shaders are written in GLSL under `VRLinkVulkan/Shaders` and
-precompiled to SPIR-V into `QuadShaders.swift` by `compile.sh`.
+precompiled to SPIR-V into `QuadShaders.swift` by `compile.sh`. The signed APK
+is roughly 70 MB, about 40 MB of which is Swift Foundation's ICU data. The
+Android build has not been tested on a headset yet.
 
-**The Android build has not run on a device yet.** With Swift 6.4.3 and Android
-NDK r27d (API 34), all targets cross-compile cleanly for
-`aarch64-unknown-linux-android34`, and `build.sh` produces a signed 69 MB APK
-(roughly 40 MB of which is Foundation's ICU data) with a verified manifest and
-exported `ANativeActivity_onCreate` symbol.
+#### Launch modes
+
+Some standalone headsets launch VR apps directly into an immersive OpenXR
+session, while others expect a 2D launcher window first. `AndroidManifest.xml`
+declares an entry point for each, and `build.sh --flat` selects which one gets
+the `LAUNCHER` intent category:
+
+- `android.app.NativeActivity` starts directly in an immersive session
+  (`XR_ACTIVITY_START_MODE_FULL_SPACE_UNMANAGED`) and runs `XRClient` with the
+  panel shown as a quad layer.
+- `.Panel` is an `<activity-alias>` without the immersive XR metadata, so
+  Android opens it as a 2D window. `Activity.swift` copies the panel's RGBA
+  buffer into the window with `ANativeWindow_lock` and forwards touch events
+  from `AInputQueue` to the panel. Selecting a host launches the immersive
+  activity to start the stream.
+
+We use an `<activity-alias>` so the APK does not need a custom Java `Activity`
+subclass; native code checks the component name on the launch intent to tell
+which entry point started it. Both activities run in the same process and share
+one `ClientModel` and `Panel` behind a lock, since Dear ImGui uses a single
+global context.
+
+#### Permissions
+
+Runtime permissions are requested over JNI with `Activity.requestPermissions`.
+Receiving `onRequestPermissionsResult` would require a custom Java `Activity`
+subclass, so native code waits for the activity to pause and resume around the
+system permission dialog and then re-checks the permission state.
+
+- `android.permission.HAND_TRACKING` (Android XR) is requested when the
+  immersive activity starts, before the session creates hand trackers. Devices
+  that do not define that permission skip the prompt (Quest grants
+  `com.oculus.permission.HAND_TRACKING` at install time).
+- `android.permission.RECORD_AUDIO` is requested when a stream starts with
+  "Send my microphone" enabled.
+
+#### Headset quirks
+
+`HeadsetQuirks` (in `VRLinkCore`) identifies the headset from Android's `Build`
+properties and stores per-device workarounds for behavior that OpenXR and
+MediaCodec do not report. Defaults follow ALVR's OpenXR client:
+
+| quirk | default | description |
+|---|---|---|
+| `floatTarget` | off | Render to `R16G16B16A16_SFLOAT` swapchains when offered. Off by default because the video stream is 8-bit and 8-bit sRGB swapchains behave consistently across runtimes. |
+| `floatTargetIsEncoded` | on for Pico and Galaxy XR | Whether the compositor treats a float swapchain as sRGB-encoded rather than linear, which OpenXR leaves unspecified. |
+| `videoRange` | as reported by decoder | Overrides narrow or full YCbCr range conversion for decoders that misreport color range. |
+| `decoderWidth`, `decoderHeight` | 2048 x 2048 | Initial decoder dimensions used when parameter sets are not parsed beforehand (currently AV1). `PictureSize` parses H.264 and HEVC dimensions from the SPS. |
+| `decoderLowLatency` | on | Enables the Android 11 `low-latency` key and Qualcomm's vendor low-latency extension. |
+| `decoderOperatingRate` | 32767 | `operating-rate` given to the decoder (0 leaves it unset). Qualcomm decoders clock themselves from it and assume 30 frames a second without it; 32767 is ALVR's "as fast as possible". If the decoder refuses to start with it, it is started again without. |
+
+You can override any of these without rebuilding by setting
+`debug.openvrlink.*` system properties before launching the app. Active values
+are logged at startup along with the chosen swapchain format and the decoder's
+reported YCbCr model and range:
+
+```
+adb shell setprop debug.openvrlink.float_target 1
+adb shell setprop debug.openvrlink.float_encoded 0
+adb shell setprop debug.openvrlink.video_range full      # narrow, full, or auto
+adb logcat -s OpenVRLink
+```
+
+To connect without using the panel during testing, write a target host
+(`steam://address`, `wivrn://address[:port]`, or a plain address) to `host.txt`
+in the app's internal files directory, and the immersive activity will connect
+to it on launch.
 
 Current limitations on Android:
 
-- There is no in-headset UI yet. The app reads the target host from `host.txt`
-  in its internal data directory (or falls back to UDP Steam discovery) and logs
-  connection status and pairing PINs to `logcat`.
-- WiVRn mDNS discovery (`ServiceBrowser` currently uses Apple's Network
-  framework), microphone capture, battery reporting, and wired-interface
-  detection are not implemented.
-- Runtime permission prompts for `android.permission.HAND_TRACKING` are not
-  requested via JNI yet (grant manually via `adb shell pm grant`).
-- Vulkan chroma keying (requires dual-source blending), depth-buffer submission,
-  and parsing initial coded dimensions from H.264/HEVC/AV1 parameter sets before
-  configuring `AMediaCodec` are not implemented yet.
-- AAudio stream recovery after audio output device changes is not handled yet.
+- Vulkan chroma keying (which needs dual-source blending) and depth-buffer
+  submission are not implemented, so chroma key settings are hidden.
+- Battery reporting and wired-interface detection are not implemented.
+- AV1 streams configure the decoder with placeholder initial dimensions.
+- AAudio streams do not recover after audio output device changes yet.
+- Hand tracking has no gesture to reopen the panel during a stream.
+
+### UI model
+
+`ClientModel` (in `VRLinkCore`) holds the client's UI state and user actions
+without depending on a UI framework. `ClientModel.State` tracks the connection
+phase (`choosing`, `connecting`, or `streaming`), status text, discovered hosts,
+whether a WiVRn PIN prompt is up, and the selected target host. Whenever state,
+settings, or the last manually entered address change, `ClientModel` fires
+`onChange` and saves updated settings or addresses in the background.
+
+UI code calls `connect(to:)`, `connectToTyped()`, `stop()`, and `answerPin(_:)`,
+and reads or writes `settings` and `remembered`. On the other side, the app
+shell provides `startStream` and `stopStream` closures and reports session
+events back through `show`, `streamStarted`, `streamPaused`, and `streamEnded`.
+When a WiVRn host asks to pair, `askPin` blocks the connection thread until the
+user enters a PIN or cancels.
+
+`SettingsForm` describes the user-facing settings as sections of toggles,
+sliders, and color pickers bound to `Settings` key paths. Filtering by a
+platform's `Features` gives any UI toolkit the list of controls to draw without
+duplicating the form layout.
+
+| UI | how it uses `ClientModel` |
+|---|---|
+| visionOS (SwiftUI) | `Connection` republishes the model's hosts, status, and PIN prompt as `@Published` properties. The views manage opening immersive spaces directly, and their settings forms are written in SwiftUI because they mix in visionOS-only controls (Room Setup and calibrations). |
+| OpenXR shells (Dear ImGui) | `Panel` reads `state` each frame and invokes the action methods; `XRClient` wires up the shell callbacks. |
+| Win32, Android views, or other toolkits | Observe `state` via `onChange`, invoke the same action methods, and generate settings controls from `SettingsForm`. |
 
 ### Cross-platform refactoring
 
-Adding the OpenXR and Android backends moved several shared abstractions into
-`VRLinkCore`:
+Several shared types in `VRLinkCore` keep session, UI, discovery, and rendering
+logic out of the platform backends:
 
 - `StreamFrame` and `StreamDecoder` (`VRLinkCore/StreamLink.swift`) make
   `DisplayQueue`, `XRDisplay`, and session management generic over platform
   frame and decoder types.
 - `StreamLink` manages host connection, pairing, decoder wiring, and `PlaySpace`
   transforms without depending on SwiftUI or platform session frameworks.
+  `VRLinkAppleSession.Connection` wraps it as a SwiftUI `ObservableObject`.
+- `HostFinder` maintains a combined list of Steam hosts (found via UDP
+  broadcast) and WiVRn hosts (found via `ServiceFinder`, backed by Bonjour's
+  `ServiceBrowser` on Apple platforms and `MulticastDNS` elsewhere).
+- `ClientModel` and `SettingsForm` hold shared UI state and settings definitions
+  (see [UI model](#ui-model)).
+- `DeviceIdentity` bundles the device name, hardware model, OS version, and
+  client version sent to hosts during pairing and session setup.
+  `SystemVersion.device(named:)` builds it on Apple platforms, while Android
+  reads system properties and JNI.
 - `PictureAssembler` groups decoded images from multi-stream frames (such as
-  WiVRn stereo and alpha streams) into complete frames.
+  WiVRn stereo and alpha streams) into complete frames for `VideoDecoder` and
+  `MediaCodecDecoder`.
+- `PictureSize` parses coded display dimensions from H.264 and HEVC sequence
+  parameter sets.
+- `HeadsetQuirks` stores per-headset workarounds for behavior that runtimes do
+  not report.
 - `QuadMesh` projects world-space quads into clip-space triangle meshes for
   per-eye rendering.
-- `Log.write` lets platforms redirect log output (for example, to Android
-  `logcat`).
+- `Log.write` redirects log output (for example, to Android `logcat`).
 - `SystemCalls.swift` re-exports platform C libraries (`Android` or `Glibc` on
   non-Apple platforms) and wraps POSIX socket calls and flags whose types differ
   on Linux and Android.
 
+`MulticastDNS` sends one-shot mDNS queries from an ephemeral port. Responders
+answer unicast to queries from non-5353 ports (RFC 6762 section 6.7), so the
+client does not need to bind port 5353 or acquire an Android Wi-Fi multicast
+lock. It returns IPv4 addresses directly because Android's system resolver does
+not resolve `.local` hostnames.
+
 Remaining platform coupling to clean up:
 
-- `VRLinkAppleSession.Connection`, `VideoDecoder`, and `QuadRenderer` still
-  maintain separate implementations of session management, multi-picture
-  assembly, and vertex packing (for visionOS single-pass stereo) rather than
-  sharing `StreamLink`, `PictureAssembler`, and `QuadMesh`.
-- Host discovery (combining Steam UDP probing and WiVRn mDNS browsing) is
-  duplicated between `Connection` and the CLI targets; moving it into
-  `VRLinkCore` behind an mDNS browser protocol would let Android and desktop
-  targets share it.
-- `SystemVersion` lives in `VRLinkAppleNetwork` with Apple-only `#if` branches,
-  and `DeviceProfile.ownModel` checks for `"visionOS"` by string.
-- Video parameter-set parsing (SPS/PPS/VPS via CoreMedia and the AV1
-  sequence-header parser) lives in `VRLinkVideoToolbox`, whereas
-  `MediaCodecDecoder` also needs coded dimensions before configuring
-  `AMediaCodec`.
+- `QuadRenderer` packs vertices separately instead of using `QuadMesh`. Its
+  vertex layout interleaves both eyes for visionOS single-pass layered rendering
+  with reversed-Z depth, while `QuadMesh` builds one mesh per eye; unifying them
+  requires updating the Metal shaders' vertex layout.
+- The AV1 sequence-header parser lives in `VRLinkVideoToolbox`, so `PictureSize`
+  does not support AV1 yet.
+- `DeviceProfile.ownModel` checks for `"visionOS"` by string.
 - Room selection, recentering, and spatial anchors (`RoomTracker` and Room
-  Setup) are currently tied to ARKit and RealityKit, though the room data model
-  and polygon math already live in `VRLinkCore`.
-- OpenXR targets need an in-session overlay layer for host selection, pairing
-  PINs, connection status, and settings (visionOS uses SwiftUI windows).
-- Stream settings (`fovScale`, chroma key, and microphone toggle) are applied
-  separately in each app target.
-- `DeviceProfile.handValues` currently selects between Oculus Touch and PSVR2
-  Sense controller models rather than using the active OpenXR interaction
-  profile.
+  Setup) are tied to ARKit and RealityKit, though the room data model and
+  polygon math live in `VRLinkCore`.
+- `DeviceProfile.handValues` picks between Oculus Touch and PSVR2 Sense
+  controller models rather than reading the active OpenXR interaction profile.
+- The visionOS settings views build their forms in SwiftUI instead of using
+  `SettingsForm`.
 
 ## Rooms
 
@@ -770,6 +914,12 @@ with a 50 ms time constant.
   verifying both paths. Pairing uses X25519, SHA-256, AES-CBC, single-block
   AES-ECB (for the encrypted IV), and RSA-OAEP with SHA-1
   (`_RSA.Encryption.Padding.PKCS1_OAEP`), all included in swift-crypto 3.x.
+- **Dear ImGui** (MIT, vendored in `client/Sources/CImGui` at v1.91.9b): Draws
+  the in-headset panel for OpenXR targets. Only the core library is included,
+  with no platform or renderer backends, and the visionOS app does not link it.
+- **Khronos OpenXR loader** (Apache 2.0): Downloaded from Maven Central by
+  `client/android/build.sh` and bundled into the Android APK. Other platforms do
+  not use it.
 - **Protobuf**: Serialized by hand (`VRLinkCore/Protobuf.swift`) rather than
   adding a protobuf dependency, since only four broadcast message flows are
   needed.
@@ -780,9 +930,9 @@ with a 50 ms time constant.
 2. **Windows helper**: install PSVR2 assets and optionally patch
    `driver_vrlink` for additional features (such as improved transport
    encoding).
-3. **Android XR**: test the initial build on hardware (see [OpenXR](#openxr)),
-   add an in-headset UI, and finish sharing the remaining session and discovery
-   code with `VRLinkCore`.
+3. **Android**: test the build on hardware (Quest, Galaxy XR, Lynx; see
+   [OpenXR](#openxr)), settle the per-headset quirks and which launch mode each
+   headset needs, then add Vulkan chroma keying and depth submission.
 4. **Windows**: pair `VRLinkOpenXR` with a Vulkan or Direct3D graphics backend,
    a platform video decoder, and audio output (primarily as a desktop debugging
    target rather than an end-user build).

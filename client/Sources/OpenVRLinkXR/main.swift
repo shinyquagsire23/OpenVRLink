@@ -8,138 +8,93 @@ import VRLinkAppleNetwork
 import VRLinkCore
 import VRLinkOpenXR
 import VRLinkOpenXRMetal
+import VRLinkPanel
 import VRLinkVideoToolbox
+import VRLinkXRClient
 
-/// Runs OpenVRLink as a macOS OpenXR application:
-///
-///     swift run OpenVRLinkXR [host address] [--wivrn] [--pin <digits>] [--mic] [--pictures <folder>]
-///
-/// Connects to a Steam or WiVRn host and renders into the active macOS OpenXR runtime (such as OXRSys).
-/// Set `XR_RUNTIME_JSON` to override the active runtime manifest. Streaming starts when the OpenXR
-/// session begins and stops when the session ends.
+// macOS OpenXR client executable:
+//
+//     swift run OpenVRLinkXR [host] [--wivrn] [--pin <digits>] [--pictures <folder>]
+//
+// OpenVRLinkXR renders into the active macOS OpenXR runtime (such as OXRSys); set `XR_RUNTIME_JSON` to point at a
+// specific runtime manifest. Running without a host argument shows an in-headset panel of Steam and WiVRn hosts
+// found on the local network, while passing a host (`address`, `steam://address`, or `wivrn://address[:port]`)
+// connects right away. VideoToolbox, CoreAudio, microphone capture, and Bonjour discovery are wired into
+// `XRClient` here.
 
 setvbuf(stdout, nil, _IOLBF, 0)
 
-var hostAddress: String?
+var named: String?
 var wivrn = false
 var wivrnPin: String?
-var useMicrophone = false
 var picturesFolder: String?
 var arguments = CommandLine.arguments.dropFirst()
 while let argument = arguments.popFirst() {
     if argument == "--wivrn" {
         wivrn = true
-    } else if argument == "--mic" {
-        useMicrophone = true
     } else if argument == "--pictures", let folder = arguments.popFirst() {
         picturesFolder = folder
     } else if argument == "--pin", let digits = arguments.popFirst() {
         wivrnPin = digits
-    } else if hostAddress == nil, !argument.hasPrefix("-") {
-        hostAddress = argument
+    } else if named == nil, !argument.hasPrefix("-") {
+        named = argument
     } else {
-        print("usage: OpenVRLinkXR [host address] [--wivrn] [--pin <digits>] [--mic] [--pictures <folder>]")
+        print("usage: OpenVRLinkXR [host] [--wivrn] [--pin <digits>] [--pictures <folder>]")
         exit(2)
     }
 }
 
-/// Discovers Steam hosts on the local network that offer VR Link, preferring a previously paired host.
-func findSteamHost() -> String? {
-    print("looking for Steam hosts")
-    let identity = Identity()
-    guard let searcher = UDPSocket() else { return nil }
-    let usable = Broadcast.discover(searcher, deviceID: identity.deviceID).filter(\.offersVRLink)
-    for found in usable { print("  \(found.hostname) at \(found.address)") }
-    return (usable.first { identity.isPaired(withHost: $0.clientID) } ?? usable.first)?.address
-}
-
-/// Browses mDNS for up to 5 seconds and returns the first discovered WiVRn host.
-func findWiVRnHost() -> String? {
-    print("looking for WiVRn hosts")
-    var address: String?
-    let browser = ServiceBrowser(type: WiVRn.serviceType)
-    let found = DispatchSemaphore(value: 0)
-    browser.start { services in
-        guard let first = services.first, address == nil else { return }
-        address = first.host
-        found.signal()
-    }
-    _ = withExtendedLifetime(browser) { found.wait(timeout: .now() + 5) }
-    return address
-}
-
-let settings = Settings.load()
-let link = StreamLink(decoder: VideoDecoder())
-link.onStatus = { print($0) }
+let model = ClientModel(finder: HostFinder(services: ServiceBrowser(type: WiVRn.serviceType)))
+let panel = Panel(model: model, features: [.microphone, .chromaKey])
+panel.caption = SystemVersion.named
 
 var audio: AudioOutput?
 let microphone = MicrophoneInput()
-link.onStarted = { session in
+var platform = XRPlatform(device: SystemVersion.device(named: Host.current().localizedName ?? "Mac"))
+platform.preferredInterfaces = { WiredInterfaces.names() }
+platform.startAudio = { session in
+    DispatchQueue.main.async { audio = AudioOutput(buffer: session.audio) }
+}
+platform.stopAudio = {
+    DispatchQueue.main.async { audio = nil }
+}
+platform.startMicrophone = { sink in
     DispatchQueue.main.async {
-        audio = AudioOutput(buffer: session.audio)
-        guard useMicrophone else { return }
         MicrophoneInput.requestPermission { allowed in
-            let started = allowed && microphone.start(into: session.microphoneSink)
+            let started = allowed && microphone.start(into: sink)
             print(started ? "microphone: sending to the host" : "microphone: not available or not permitted")
         }
     }
 }
-link.onStopped = {
-    DispatchQueue.main.async {
-        microphone.stop()
-        audio = nil
-    }
+platform.stopMicrophone = {
+    DispatchQueue.main.async { microphone.stop() }
 }
 
 let graphics = MetalXRGraphics()
 graphics.picturesFolder = picturesFolder.map { URL(fileURLWithPath: $0, isDirectory: true) }
-let display: XRDisplay<MetalXRGraphics>
+let client: XRClient<MetalXRGraphics, VideoDecoder>
 do {
-    display = try XRDisplay(applicationName: "OpenVRLink", graphics: graphics, frames: link.frames) { Log.note($0) }
+    client = try XRClient(applicationName: "OpenVRLink", graphics: graphics, decoder: VideoDecoder(), model: model, panel: panel,
+                          platform: platform) { Log.note($0) }
 } catch {
     print("could not start OpenXR: \(error)")
     exit(1)
 }
-display.streamingSession = { link.session }
-display.chromaKey = { settings.chromaKeying(inGame: link.session?.sceneApplicationRunning ?? false) }
-display.onPaused = { link.stop() }
-display.onReady = { measured in
-    var profile = measured
-    profile.systemName = SystemVersion.name
-    profile.clientVersion = SystemVersion.client
-    profile.eyeFrusta = profile.eyeFrusta.map {
-        $0.scaled(horizontal: settings.fovScaleHorizontal, vertical: settings.fovScaleVertical)
-    }
-    // Forward the OpenXR stage bounds to the host as the room chaperone boundary when available.
-    link.playSpace = PlaySpace(origin: PlaySpace.trackingSpace.origin, boundary: display.boundary())
 
-    var address = hostAddress ?? (wivrn ? findWiVRnHost() : findSteamHost())
-    // Parse an optional ":port" suffix when connecting to a WiVRn host on a non-default port.
-    var port: UInt16?
-    if wivrn, let whole = address, let colon = whole.lastIndex(of: ":"), let given = UInt16(whole[whole.index(after: colon)...]) {
-        port = given
-        address = String(whole[..<colon])
+// Automatically submit `--pin` when connecting to an unpaired WiVRn host in headless runs.
+if let wivrnPin {
+    let answer = model.onChange
+    model.onChange = {
+        answer?()
+        if model.state.askingForPin { model.answerPin(wivrnPin) }
     }
-    guard let address else {
-        print("no host found; pass a host address on the command line")
-        display.quit()
-        return
+}
+if let named {
+    guard let target = ClientModel.Target(parsing: named, kind: wivrn ? .wivrn : .steam) else {
+        print("not a host address: \(named)")
+        exit(2)
     }
-    var connector = HostConnector(deviceName: HostConnector.name(of: Host.current().localizedName ?? "Mac"),
-                                  deviceModel: display.instance.systemName(), systemVersion: SystemVersion.named)
-    connector.microphone = useMicrophone
-    connector.preferredInterfaces = { WiredInterfaces.names() }
-    connector.keepLooking = false
-    connector.log = { Log.note($0) }
-    connector.askPin = {
-        if let wivrnPin { return wivrnPin }
-        print("Type the PIN shown on the host: ", terminator: "")
-        return readLine()?.trimmingCharacters(in: .whitespaces)
-    }
-    var inputs = StreamLink<VideoDecoder>.Inputs(head: { display.input.head() }, hands: { display.input.hands() })
-    inputs.haptic = { display.input.vibrate($0) }
-    inputs.refreshRateRequested = { display.requestRefreshRate($0) }
-    link.start(wivrn ? .wivrn : .steam, address: address, port: port, profile: profile, connector: connector, inputs: inputs)
+    model.connect(to: target)
 }
 
 // Shut down the OpenXR session cleanly on SIGINT/SIGTERM so the host receives a disconnect notice.
@@ -147,18 +102,17 @@ signal(SIGTERM, SIG_IGN)
 signal(SIGINT, SIG_IGN)
 let quitSignals = [SIGTERM, SIGINT].map { number -> DispatchSourceSignal in
     let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
-    source.setEventHandler { display.quit() }
+    source.setEventHandler { client.quit() }
     source.resume()
     return source
 }
 
 let frameThread = Thread {
     do {
-        try display.run()
+        try client.run()
     } catch {
         print("OpenXR session failed: \(error)")
     }
-    link.stop(leaving: true)
     // Allow the session thread time to send its disconnect packet before exiting.
     Thread.sleep(forTimeInterval: 0.6)
     exit(0)

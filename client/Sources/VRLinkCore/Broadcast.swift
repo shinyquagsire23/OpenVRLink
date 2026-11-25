@@ -66,7 +66,7 @@ public enum Broadcast {
     static let streamingRequest: UInt64 = 5, streamingResponse: UInt64 = 6
     static let proofRequest: UInt64 = 7, proofResponse: UInt64 = 8
     static let authorizationRequest: UInt64 = 3, authorizationResponse: UInt64 = 4
-    static let authorizationConfirmed: UInt64 = 14
+    static let authorizationConfirmed: UInt64 = 14, authorizationCancel: UInt64 = 9
 
     static func datagram(deviceID: UInt64, type: UInt64, body: Bytes) -> Bytes {
         var header = ProtoWriter()
@@ -155,8 +155,15 @@ public enum Broadcast {
     /// 4-digit PIN for the user to enter in Steam on the host, and saves the resulting
     /// shared secret in `identity`. `deviceName` and `deviceModel` identify this client
     /// to the host (up to 64 characters each).
+    ///
+    /// Returns false if `cancelled` became true first, after telling the host so that it takes its PIN
+    /// prompt down. A host still showing a prompt from an earlier attempt answers `Busy`; that prompt is
+    /// asked to close and the request repeated, with `showBusy` called so the user can close it by hand
+    /// if the host keeps it up.
+    @discardableResult
     public static func pair(_ socket: UDPSocket, host: SteamHost, identity: Identity, deviceName: String,
-                            deviceModel: String, showPIN: (String) -> Void) throws {
+                            deviceModel: String, cancelled: () -> Bool = { false }, showBusy: () -> Void = {},
+                            showPIN: (String) -> Void) throws -> Bool {
         let pin = String(format: "%04d", Int.random(in: 1...9999))
         let exchange = SteamCrypto.KeyExchange()
         let requestID = UInt64(UInt32.random(in: 1...UInt32.max))
@@ -186,25 +193,45 @@ public enum Broadcast {
         request.bytes(4, exchange.maskedPublicKey(pin: pin))
         request.varint(5, requestID)
 
+        func cancel() {
+            socket.send(datagram(deviceID: identity.deviceID, type: authorizationCancel, body: []), host: host.address, port: port)
+        }
         showPIN(pin)
+        var busy = false
         let deadline = Date().addingTimeInterval(300)
         while Date() < deadline {
             socket.send(datagram(deviceID: identity.deviceID, type: authorizationRequest, body: request.bytes),
                         host: host.address, port: port)
             let resendAt = Date().addingTimeInterval(3)      // vrlink repeats every 3 s
             while Date() < resendAt {
-                guard let reply = socket.receive(timeout: resendAt.timeIntervalSinceNow),
+                if cancelled() {
+                    cancel()
+                    return false
+                }
+                guard let reply = socket.receive(timeout: min(0.25, max(0, resendAt.timeIntervalSinceNow))),
                       let message = parse(reply), message.clientID == host.clientID,
                       message.type == authorizationResponse
                 else { continue }
                 let result = message.body.varint(1) ?? 7
-                if result == 5 { continue }                  // in progress: waiting for the PIN
+                if result == 5 {                             // in progress: waiting for the PIN
+                    if busy { showPIN(pin) }
+                    busy = false
+                    continue
+                }
+                if result == 4 {                             // busy: still showing an earlier attempt's prompt
+                    if !busy {
+                        cancel()
+                        showBusy()
+                    }
+                    busy = true
+                    continue
+                }
                 guard result == 0 else { throw BroadcastError.pairingRefused("host answered result \(result)") }
                 guard let hostKey = message.body.bytes(3) else {
                     // Legacy pairing path where Steam's servers decrypted the ticket,
                     // making unpairedSecret the shared secret.
                     identity.setSecret(unpairedSecret, forHost: host.clientID)
-                    return
+                    return true
                 }
                 // The host proves it derived the same secret by encrypting our device id with it.
                 guard let secret = exchange.sharedSecret(maskedPeerKey: hostKey, pin: pin),
@@ -216,10 +243,11 @@ public enum Broadcast {
                 confirmed.varint(1, 0)
                 socket.send(datagram(deviceID: identity.deviceID, type: authorizationConfirmed, body: confirmed.bytes),
                             host: host.address, port: port)
-                return
+                return true
             }
         }
-        throw BroadcastError.pairingRefused("nobody entered the PIN on the host")
+        cancel()
+        throw BroadcastError.pairingRefused(busy ? "the host stayed busy with an earlier PIN prompt" : "nobody entered the PIN on the host")
     }
 
     /// Asks the host to start SteamVR streaming.

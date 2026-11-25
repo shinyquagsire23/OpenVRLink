@@ -32,8 +32,8 @@ public protocol StreamDecoder: AnyObject {
 /// transforming poses and frame layouts through `playSpace`, feeding `decoder`, and pushing decoded frames
 /// to `frames`.
 ///
-/// Note: `VRLinkAppleSession.Connection` predates `StreamLink` and still combines session management with
-/// host discovery and SwiftUI observable state.
+/// `VRLinkAppleSession.Connection` wraps `StreamLink` for SwiftUI, while OpenXR targets pair it with
+/// `ClientModel` via `XRClient`.
 public final class StreamLink<Decoder: StreamDecoder> {
     /// Pose providers and feedback callbacks for an active stream. Input poses are supplied in raw tracking
     /// space and transformed into `playSpace` by `StreamLink`.
@@ -60,6 +60,8 @@ public final class StreamLink<Decoder: StreamDecoder> {
     public var onStarted: ((any StreamingSession) -> Void)?
     /// Called after the session stops so audio and microphone resources can be released.
     public var onStopped: (() -> Void)?
+    /// Called with the reason when a connection attempt fails or the host ends the stream (after `onStatus`).
+    public var onFailed: ((String) -> Void)?
     /// Called on the session thread when the host requests a play-space recenter.
     public var onRecenterRequested: (() -> Void)?
 
@@ -70,6 +72,8 @@ public final class StreamLink<Decoder: StreamDecoder> {
     /// Cleared by `stop` to cancel an in-flight connection attempt.
     private var wanted = false
     private var space = PlaySpace.trackingSpace
+    private var startedWith: DeviceProfile?
+    private var pictureArrived = false
 
     public init(decoder: Decoder) {
         self.decoder = decoder
@@ -78,7 +82,32 @@ public final class StreamLink<Decoder: StreamDecoder> {
             guard let self, let session else { return }
             for picture in 0..<frame.pictureCount { session.frameDecoded(frame.frameID, picture: picture) }
             frames.push(frame)
+            lock.lock()
+            pictureArrived = current != nil
+            lock.unlock()
         }
+    }
+
+    /// Returns `false` before `start` or after `stop` has been called, allowing blocking steps such as PIN
+    /// prompts to abort a canceled connection attempt. Thread-safe.
+    public var isWanted: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return wanted
+    }
+
+    /// The device profile given to the host for the active or starting stream. Thread-safe.
+    public var profile: DeviceProfile? {
+        lock.lock()
+        defer { lock.unlock() }
+        return startedWith
+    }
+
+    /// Whether this stream has had a frame decoded yet. Thread-safe.
+    public var hasPicture: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return pictureArrived
     }
 
     /// Currently active streaming session, or `nil` when idle. Thread-safe.
@@ -121,6 +150,10 @@ public final class StreamLink<Decoder: StreamDecoder> {
         let busy = starting || current != nil
         starting = !busy
         wanted = true
+        if !busy {
+            startedWith = profile
+            pictureArrived = false
+        }
         lock.unlock()
         if busy { return }
         Thread.detachNewThread { [self] in
@@ -149,7 +182,8 @@ public final class StreamLink<Decoder: StreamDecoder> {
                 session.onEnded = { [weak self, weak session] reason in
                     guard let self, let session, self.session === session else { return }
                     stop()
-                    onStatus("Stream ended: \(reason)")
+                    onStatus("The stream ended: \(reason)")
+                    onFailed?("The stream ended: \(reason)")
                 }
                 session.headProvider = { [weak self] in
                     guard let head = inputs.head(), let self else { return nil }
@@ -184,9 +218,10 @@ public final class StreamLink<Decoder: StreamDecoder> {
                 }
                 onStarted?(session)
                 // WiVRn hosts do not send video frames until an OpenXR app starts on the PC.
-                onStatus(kind == .steam ? "Streaming from \(hostName)" : "Connected to \(hostName); waiting for an OpenXR app on the host")
+                onStatus(kind == .steam ? "Streaming from \(hostName)" : "Connected to \(hostName); waiting for an application there")
             } catch {
                 onStatus("Could not connect: \(error)")
+                onFailed?("Could not connect: \(error)")
             }
         }
     }
@@ -198,6 +233,8 @@ public final class StreamLink<Decoder: StreamDecoder> {
         let session = current
         current = nil
         wanted = false
+        startedWith = nil
+        pictureArrived = false
         lock.unlock()
         frames.clear()
         guard let session else { return }

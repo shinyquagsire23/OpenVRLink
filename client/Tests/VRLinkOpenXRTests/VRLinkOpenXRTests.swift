@@ -80,6 +80,11 @@ final class VRLinkOpenXRTests: XCTestCase {
     func testControllerProfilesBindPosesTriggerAndHaptics() {
         for profile in XRInput.profiles {
             for hand in [profile.left, profile.right] {
+                // Every profile can work the panel; the hand profile binds nothing else, so that tracked hands
+                // keep streaming as hands.
+                XCTAssertNotNil(hand[.point], profile.path)
+                XCTAssertNotNil(hand[.press], profile.path)
+                if profile.path.hasSuffix("hand_interaction_ext") { continue }
                 XCTAssertNotNil(hand[.grip], profile.path)
                 XCTAssertNotNil(hand[.aim], profile.path)
                 XCTAssertNotNil(hand[.trigger], profile.path)

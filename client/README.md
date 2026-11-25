@@ -16,15 +16,24 @@ space for the pretend controller's trigger. Pass `--boundary` to send a test roo
 macOS OpenXR client (requires an OpenXR runtime such as [OXRSys](https://github.com/demonixis/oxrsys); set `XR_RUNTIME_JSON` to override the active runtime):
 
 ```
-swift run -c release OpenVRLinkXR [host address] [--wivrn] [--pictures <folder>]
+swift run -c release OpenVRLinkXR [host] [--pictures <folder>]
 ```
 
-Android XR app (see `android/build.sh` for toolchain and SDK requirements):
+When you run without a host argument, an in-headset panel lists discovered Steam and WiVRn hosts that you can select
+with a controller trigger or a hand pinch. Pass a host on the command line (`address`, `steam://address`, or
+`wivrn://address[:port]`) to connect right away. Hold the menu button to show or hide the panel while streaming.
+
+Android app for OpenXR headsets (see `android/build.sh` for toolchain and SDK requirements):
 
 ```
 cd android && ./build.sh             # build the APK
 cd android && ./build.sh --install   # build and install via adb
+cd android && ./build.sh --flat      # open a 2D launcher window first and enter XR after selecting a host
 ```
+
+You can override per-headset quirks (such as swapchain color encoding and decoder setup) over adb without rebuilding;
+see "Headset quirks" in [docs/client-architecture.md](../docs/client-architecture.md). Run `adb logcat -s OpenVRLink`
+to view logs.
 
 visionOS app (Xcode with the visionOS 26 SDK or later). The headset needs to be already paired with the Mac for development:
 
@@ -51,7 +60,7 @@ Everything compiles into one Swift package.
 
 | target | what's there | platform-specific frameworks |
 |---|---|---|
-| `VRLinkCore` | The Big One: the protocol, pairing, the session, FEC and retransmission, timing, geometry, where the picture stands in the world, hands, gestures, settings, the gaze and face calibration maths | none (Foundation, sockets, swift-crypto) |
+| `VRLinkCore` | protocol, pairing, session management, FEC and retransmission, timing, geometry, quad placement, hand and gesture tracking, settings, gaze and face calibration math, host discovery, and the UI state model | none (Foundation, sockets, swift-crypto) |
 | `VRLinkVideoToolbox` | decoder: HEVC, H.264, AV1 | VideoToolbox |
 | `VRLinkMetal` | graphics: draws the core's quads from a decoded frame | Metal |
 | `VRLinkAppleAudio` | audio out, microphone in | AVFAudio |
@@ -66,10 +75,12 @@ Everything compiles into one Swift package.
 | `VRLinkOpenXRMetal` | Metal graphics backend for OpenXR | Metal |
 | `VRLinkMediaCodec` | Android video decoding into hardware buffers | MediaCodec (`CAndroidNDK`) |
 | `VRLinkVulkan` | Vulkan graphics backend for OpenXR on Android | Vulkan |
-| `VRLinkAndroidAudio` | Android audio playback | AAudio |
+| `VRLinkAndroidAudio` | Android audio playback and microphone capture | AAudio |
+| `VRLinkPanel`, `CImGui` | host picker and settings UI rendered into an RGBA buffer | Dear ImGui (vendored), CPU rasterizer |
+| `VRLinkXRClient` | shared OpenXR client connecting `XRDisplay`, `StreamLink`, `Panel`, and `ClientModel` | (`VRLinkOpenXR`, `VRLinkPanel`) |
 | `OpenVRLink` | the macOS viewer | AppKit, MetalKit |
 | `OpenVRLinkXR` | macOS OpenXR client executable | |
-| `OpenVRLinkAndroid`, `android/` | Android XR `NativeActivity` library and APK build scripts | NDK |
+| `OpenVRLinkAndroid`, `android/` | Android `NativeActivity` library (immersive or 2D launcher window) and APK build scripts | NDK, JNI |
 | `visionOS/` | the visionOS app: scenes, wiring, settings views | SwiftUI |
 
 ## On the PC

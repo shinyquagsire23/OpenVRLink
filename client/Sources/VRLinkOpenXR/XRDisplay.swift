@@ -42,6 +42,8 @@ public final class XRDisplay<Graphics: XRGraphics> {
         case local
     }
     public let origin: Origin
+    /// The in-headset panel, when the shell has one.
+    public let panel: XRPanelLayer?
 
     private let frames: DisplayQueue<Graphics.Frame>
     private let log: (String) -> Void
@@ -61,9 +63,10 @@ public final class XRDisplay<Graphics: XRGraphics> {
     private var described = false
     private var latestDisplayTime: XrTime = 0
 
-    public init(applicationName: String, graphics: Graphics, frames: DisplayQueue<Graphics.Frame>,
+    public init(applicationName: String, graphics: Graphics, frames: DisplayQueue<Graphics.Frame>, panel: XRPanelLayer? = nil,
                 process: XRProcess = XRProcess(), log: @escaping (String) -> Void) throws {
         self.graphics = graphics
+        self.panel = panel
         self.frames = frames
         self.log = log
         let instance = try XRInstance(applicationName: applicationName, required: Graphics.extensions, process: process, log: log)
@@ -139,6 +142,29 @@ public final class XRDisplay<Graphics: XRGraphics> {
             swapchains.append(XRSwapchain(handle: swapchain, format: format, width: Int(info.width), height: Int(info.height)))
         }
         try graphics.adopt(swapchains, instance: instance)
+        if let panel {
+            if let panelFormat = graphics.choosePanelFormat(among: formats) {
+                var info = XrSwapchainCreateInfo()
+                info.type = XR_TYPE_SWAPCHAIN_CREATE_INFO
+                info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT
+                    | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT
+                info.format = panelFormat
+                info.sampleCount = 1
+                info.width = UInt32(panel.width)
+                info.height = UInt32(panel.height)
+                info.faceCount = 1
+                info.arraySize = 1
+                info.mipCount = 1
+                var swapchain: XrSwapchain?
+                try check(calls.createSwapchain(made, &info, &swapchain), "xrCreateSwapchain(panel)")
+                guard let swapchain else { throw XRFailure.call("xrCreateSwapchain(panel)", XR_ERROR_RUNTIME_FAILURE) }
+                let wrapped = XRSwapchain(handle: swapchain, format: panelFormat, width: panel.width, height: panel.height)
+                try graphics.adoptPanel(wrapped, instance: instance)
+                panel.swapchain = wrapped
+            } else {
+                log("openxr: no swapchain format for the panel (offered: \(formats)); it will not be shown")
+            }
+        }
         log("openxr: drawing \(recommended.width) x \(recommended.height) per eye in format \(format)")
 
         try check(calls.enumerateEnvironmentBlendModes(instance.handle, instance.system, stereo, 0, &count, nil),
@@ -156,7 +182,7 @@ public final class XRDisplay<Graphics: XRGraphics> {
 
     deinit {
         let calls = instance.calls
-        for swapchain in swapchains { _ = calls.destroySwapchain(swapchain.handle) }
+        for swapchain in swapchains + [panel?.swapchain].compactMap({ $0 }) { _ = calls.destroySwapchain(swapchain.handle) }
         for space in [space, headSpace] { if let space { _ = calls.destroySpace(space) } }
         _ = calls.destroySession(session)
     }
@@ -345,6 +371,8 @@ public final class XRDisplay<Graphics: XRGraphics> {
         end.type = XR_TYPE_FRAME_END_INFO
         end.displayTime = time
         end.environmentBlendMode = blend
+        let panelShown = try panelLayer()
+        var quad = panelShown ?? XrCompositionLayerQuad()
         guard timing.shouldRender != 0, let views = locateViews(at: time, in: space) else {
             try check(calls.endFrame(session, &end), "xrEndFrame")
             return
@@ -392,13 +420,71 @@ public final class XRDisplay<Graphics: XRGraphics> {
             layer.viewCount = UInt32(views.count)
             layer.views = views.baseAddress
             try withUnsafeBytes(of: &layer) { bytes in
-                let layers = [bytes.baseAddress?.assumingMemoryBound(to: XrCompositionLayerBaseHeader.self)]
-                try layers.withUnsafeBufferPointer {
-                    end.layerCount = 1
-                    end.layers = $0.baseAddress
-                    _ = try check(calls.endFrame(session, &end), "xrEndFrame")
+                try withUnsafeBytes(of: &quad) { quadBytes in
+                    var layers = [bytes.baseAddress?.assumingMemoryBound(to: XrCompositionLayerBaseHeader.self)]
+                    // Composite the panel quad in front of the projection layer.
+                    if panelShown != nil { layers.append(quadBytes.baseAddress?.assumingMemoryBound(to: XrCompositionLayerBaseHeader.self)) }
+                    try layers.withUnsafeBufferPointer {
+                        end.layerCount = UInt32($0.count)
+                        end.layers = $0.baseAddress
+                        _ = try check(calls.endFrame(session, &end), "xrEndFrame")
+                    }
                 }
             }
         }
+    }
+
+    /// Updates the panel for this frame (positioning, pointer input, and swapchain upload) and returns its
+    /// composition layer, or `nil` when hidden or before the first image is uploaded.
+    private func panelLayer() throws -> XrCompositionLayerQuad? {
+        guard let panel, let swapchain = panel.swapchain else { return nil }
+        let calls = instance.calls
+        // Fire `onMenuHeld` once when the menu button has been held for `holdSeconds`.
+        let menu = input.hands().contains { hand in
+            if case .controller(let state)? = hand { return state.menuButton }
+            return false
+        }
+        if !menu {
+            panel.menuHeldSince = nil
+            panel.menuReported = false
+        } else if let since = panel.menuHeldSince {
+            if !panel.menuReported, Double(Uptime.nanoseconds &- since) / 1e9 >= XRPanelLayer.holdSeconds {
+                panel.menuReported = true
+                panel.onMenuHeld?()
+            }
+        } else {
+            panel.menuHeldSince = Uptime.nanoseconds
+        }
+        guard panel.isWanted?() ?? panel.visible else {
+            panel.pose = nil
+            return nil
+        }
+        if panel.pose == nil {
+            guard let head = input.head() else { return nil }
+            panel.pose = XRPanelLayer.placed(before: head.pose, metersAway: panel.metersAway)
+        }
+        if let pixels = panel.update?(panel.pointer(from: input.pointers())) {
+            var image: UInt32 = 0
+            try check(calls.acquireSwapchainImage(swapchain.handle, nil, &image), "xrAcquireSwapchainImage(panel)")
+            var wait = XrSwapchainImageWaitInfo()
+            wait.type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO
+            wait.timeout = XR_INFINITE_DURATION
+            try check(calls.waitSwapchainImage(swapchain.handle, &wait), "xrWaitSwapchainImage(panel)")
+            graphics.drawPanel(pixels, image: Int(image))
+            try check(calls.releaseSwapchainImage(swapchain.handle, nil), "xrReleaseSwapchainImage(panel)")
+            panel.hasPicture = true
+        }
+        guard panel.hasPicture, let pose = panel.pose else { return nil }
+        var quad = XrCompositionLayerQuad()
+        quad.type = XR_TYPE_COMPOSITION_LAYER_QUAD
+        quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
+        quad.space = space
+        quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH
+        quad.subImage.swapchain = swapchain.handle
+        quad.subImage.imageRect.extent = XrExtent2Di(width: Int32(swapchain.width), height: Int32(swapchain.height))
+        // `Pose.forward` corresponds to -Z in `XrPosef`, so the quad's +Z front face points toward the user.
+        quad.pose = pose.xr
+        quad.size = XrExtent2Df(width: panel.metersWide, height: panel.metersWide * Float(panel.height) / Float(panel.width))
+        return quad
     }
 }

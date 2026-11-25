@@ -9,7 +9,7 @@ import VRLinkCore
 
 /// Plays 48 kHz stereo PCM audio on Android using an AAudio low-latency output callback.
 ///
-/// Audio device disconnect recovery and microphone capture are not implemented yet.
+/// Audio device disconnect recovery is not implemented yet.
 public final class AudioOutput {
     private let buffer: PlaybackBuffer
     private var stream: OpaquePointer?

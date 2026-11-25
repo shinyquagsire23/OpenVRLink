@@ -8,7 +8,10 @@
 #
 # Usage:
 #   ./build.sh              Build build/OpenVRLink.apk
-#   ./build.sh --install    Build and install onto a connected Android XR device via adb
+#   ./build.sh --install    Build and install onto a connected headset via adb
+#   ./build.sh --flat       Start in a 2D launcher window and enter XR after selecting a host. By default
+#                           the launcher goes straight into XR with the panel floating there, which is
+#                           what Android XR needs (it gives this app's 2D window no pointer).
 #
 # Prerequisites:
 #   - An open-source swift.org toolchain (Xcode's bundled toolchain does not support Swift SDKs) paired
@@ -26,7 +29,18 @@ here=$(cd "$(dirname "$0")" && pwd)
 client=$(dirname "$here")
 out="$here/build"
 
-api=${OPENVRLINK_ANDROID_API:-34}
+install=""
+flat=""
+for argument in "$@"; do
+    case "$argument" in
+        --install) install=1 ;;
+        --flat) flat=1 ;;
+        *) echo "usage: build.sh [--install] [--flat]" >&2; exit 2 ;;
+    esac
+done
+
+# Target Android 10 (API 29) by default to support Quest, Pico, Lynx, and Android XR.
+api=${OPENVRLINK_ANDROID_API:-29}
 triple="aarch64-unknown-linux-android$api"
 abi=arm64-v8a
 package=${OPENVRLINK_PACKAGE:-org.openvrlink.client}
@@ -103,14 +117,19 @@ fi
 unzip -q -o -j "$loader" "jni/$abi/libopenxr_loader.so" -d "$libs"
 
 min_sdk=$api
+launcher='<category android:name="android.intent.category.LAUNCHER" \/>'
+if [ -n "$flat" ]; then immersive_launcher=""; drop_flat=""; else immersive_launcher=$launcher; drop_flat='/@FLAT_ONLY_BEGIN@/,/@FLAT_ONLY_END@/d'; fi
 sed -e "s/@PACKAGE@/$package/g" -e "s/@VERSION@/$version/g" -e "s/@BUILD@/$build/g" -e "s/@MIN_SDK@/$min_sdk/g" \
+    -e "s/@IMMERSIVE_LAUNCHER@/$immersive_launcher/" -e "$drop_flat" \
     "$here/AndroidManifest.xml" > "$out/AndroidManifest.xml"
 
 echo "== packaging"
 unsigned="$out/unsigned.apk"
 aligned="$out/aligned.apk"
 rm -f "$unsigned" "$aligned" "$out/OpenVRLink.apk"
-"$tools/aapt2" link -o "$unsigned" --manifest "$out/AndroidManifest.xml" -I "$platform/android.jar"
+rm -f "$out/resources.zip"
+"$tools/aapt2" compile --dir "$here/res" -o "$out/resources.zip"
+"$tools/aapt2" link -o "$unsigned" --manifest "$out/AndroidManifest.xml" -I "$platform/android.jar" "$out/resources.zip"
 # Store native libraries uncompressed (-0) so Android can mmap them directly from page-aligned offsets.
 (cd "$out/apk" && zip -q -r -0 "$unsigned" lib)
 "$tools/zipalign" -p 4 "$unsigned" "$aligned"
@@ -122,8 +141,10 @@ rm -f "$unsigned" "$aligned" "$out/OpenVRLink.apk.idsig"
 echo "== $out/OpenVRLink.apk ($(du -h "$out/OpenVRLink.apk" | cut -f1)): $package $version-$build"
 for library in "$libs"/*.so; do printf '   %9d %s\n' "$(wc -c < "$library")" "$(basename "$library")"; done
 
-if [ "${1:-}" = "--install" ]; then
+if [ -n "$install" ]; then
     "$sdk/platform-tools/adb" install -r "$out/OpenVRLink.apk"
-    echo "launch from the headset or run: adb shell am start -n $package/android.app.NativeActivity"
+    echo "launch from the headset, or:"
+    echo "  adb shell am start -n $package/android.app.NativeActivity     (immersive)"
+    echo "  adb shell am start -n $package/.Panel                         (flat panel)"
     echo "log: adb logcat -s OpenVRLink"
 fi

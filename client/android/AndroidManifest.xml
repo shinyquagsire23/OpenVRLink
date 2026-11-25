@@ -3,9 +3,11 @@
      License, v. 2.0. If a copy of the MPL was not distributed with this
      file, You can obtain one at https://mozilla.org/MPL/2.0/. -->
 
-<!-- Android XR manifest for OpenVRLink. Android's built-in NativeActivity loads libOpenVRLinkAndroid.so
-     (Sources/OpenVRLinkAndroid) without custom Java or Kotlin code. build.sh substitutes @PACKAGE@,
-     @VERSION@, @BUILD@, and @MIN_SDK@ at build time. -->
+<!-- Android manifest for OpenVRLink on OpenXR headsets (Android XR, Quest, Pico, Lynx). Android's built-in
+     NativeActivity loads libOpenVRLinkAndroid.so (Sources/OpenVRLinkAndroid) without custom Java or Kotlin code.
+     build.sh substitutes @PACKAGE@, @VERSION@, @BUILD@, and @MIN_SDK@, and puts the launcher category on
+     the immersive activity by default; with its "flat" option it instead keeps the flat panel alias and makes
+     that the launcher entry. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="@PACKAGE@"
     android:versionCode="@BUILD@"
@@ -13,15 +15,22 @@
 
     <uses-sdk android:minSdkVersion="@MIN_SDK@" android:targetSdkVersion="34" />
 
-    <!-- Requires OpenXR 1.0 and Vulkan 1.1. -->
-    <uses-feature android:name="android.software.xr.api.openxr" android:version="0x00010000" android:required="true" />
+    <!-- Request Vulkan 1.1 and OpenXR 1.0. The OpenXR feature is marked optional because non-Android XR headsets
+         provide an OpenXR runtime without declaring android.software.xr.api.openxr. -->
+    <uses-feature android:name="android.software.xr.api.openxr" android:version="0x00010000" android:required="false" />
     <uses-feature android:name="android.hardware.vulkan.version" android:version="0x00401000" android:required="true" />
+    <uses-feature android:name="android.hardware.vr.headtracking" android:version="1" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <!-- Required for hand tracking on Android XR. Because runtime permission prompts are not requested via
-         JNI yet, grant it manually with: adb shell pm grant @PACKAGE@ android.permission.HAND_TRACKING -->
+    <!-- Requested at runtime when starting a stream with "Send my microphone" enabled. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Requested at runtime when the immersive activity starts on Android XR. -->
     <uses-permission android:name="android.permission.HAND_TRACKING" />
+    <!-- Granted at install time for hand tracking on Quest. -->
+    <uses-permission android:name="com.oculus.permission.HAND_TRACKING" />
+    <uses-feature android:name="oculus.software.handtracking" android:required="false" />
 
     <!-- Permissions and package-visibility queries required by the Khronos OpenXR Android loader. -->
     <uses-permission android:name="org.khronos.openxr.permission.OPENXR" />
@@ -36,11 +45,19 @@
         </intent>
     </queries>
 
-    <application android:label="OpenVRLink" android:hasCode="false" android:extractNativeLibs="true">
+    <application android:label="OpenVRLink" android:icon="@mipmap/icon" android:hasCode="false" android:extractNativeLibs="true">
+        <!-- Android XR's OpenXR runtime is a system library that apps can only load after naming it here. -->
+        <uses-native-library android:name="libopenxr.google.so" android:required="false" />
+        <meta-data android:name="com.oculus.supportedDevices" android:value="all" />
+        <meta-data android:name="com.oculus.intent.category.VR" android:value="vr_only" />
+        <meta-data android:name="pvr.app.type" android:value="vr" />
+
+        <!-- Immersive activity that runs the OpenXR session with the panel rendered as a quad layer. -->
         <activity android:name="android.app.NativeActivity"
             android:exported="true"
             android:launchMode="singleTask"
             android:screenOrientation="landscape"
+            android:excludeFromRecents="false"
             android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|uiMode">
             <meta-data android:name="android.app.lib_name" android:value="OpenVRLinkAndroid" />
             <!-- Launch directly into unmanaged full-space OpenXR rendering rather than 2D system panels. -->
@@ -48,9 +65,29 @@
                 android:value="XR_ACTIVITY_START_MODE_FULL_SPACE_UNMANAGED" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
+                @IMMERSIVE_LAUNCHER@
                 <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
+                <category android:name="com.oculus.intent.category.VR" />
             </intent-filter>
         </activity>
+
+        <!-- @FLAT_ONLY_BEGIN@ build.sh leaves everything up to the matching end marker out unless run with its flat option:
+             on Galaxy XR the home screen opened this entry even without the launcher category. -->
+        <!-- 2D panel window that launches the immersive activity once the user selects a host. We use an
+             activity-alias because the APK has no custom Java subclasses, and native code checks the launched
+             component name to distinguish between the 2D window and the immersive activity.
+             Android XR (tested on Galaxy XR) puts this alias in unmanaged full space like its target, whatever
+             start-mode property the alias carries, and a 2D window there gets no pointer; use the immersive
+             launcher on that system. -->
+        <activity-alias android:name=".Panel"
+            android:targetActivity="android.app.NativeActivity"
+            android:exported="true">
+            <meta-data android:name="android.app.lib_name" android:value="OpenVRLinkAndroid" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <!-- @FLAT_ONLY_END@ -->
     </application>
 </manifest>

@@ -54,6 +54,17 @@ public protocol XRGraphics: AnyObject {
     /// release the swapchain images. When `transparent` is `true`, clears alpha to 0 for passthrough.
     func draw(_ eyes: [XREyeDraw], frame: Frame?, transparent: Bool)
 
+    /// Selects an 8-bit RGBA swapchain format for the panel layer (preferring sRGB when available), or `nil`
+    /// if none of the offered formats are supported.
+    func choosePanelFormat(among offered: [Int64]) -> Int64?
+
+    /// Wraps the native textures or images of the panel swapchain.
+    func adoptPanel(_ swapchain: XRSwapchain, instance: XRInstance) throws
+
+    /// Uploads a panel RGBA buffer (`XRPanelLayer.update`) into swapchain image `image`, submitting GPU work
+    /// before returning.
+    func drawPanel(_ pixels: [UInt8], image: Int)
+
     /// Optional chroma-key filter applied during quad rendering.
     var chromaKey: ChromaKey? { get set }
 }

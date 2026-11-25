@@ -110,6 +110,12 @@ After confirming `Success`, the client immediately calls
 If the user cancels pairing, the client sends `DeviceAuthorizationCancelRequest`
 (9) with an empty body.
 
+A host that still has a PIN prompt open from an earlier attempt (for example, from
+a client that exited without cancelling) answers each new request with `Busy` (4)
+until that prompt is closed. OpenVRLink sends the cancel request once on the first
+`Busy` and keeps repeating its request rather than giving up; whether the cancel
+alone closes a stale prompt has not been verified.
+
 ## Cloud pairing channel
 
 `CRemoteClientSession` in `libshell` (`StartPairing`, `SetPairingInfo`,

@@ -17,12 +17,16 @@ public final class XRInput {
         case lowerTouch = "lower_touch", upperTouch = "upper_touch", triggerTouch = "trigger_touch"
         case stickTouch = "stick_touch", restTouch = "rest_touch"
         case trigger, squeeze, stick, grip, aim, haptic
+        /// Aim ray and press strength used to interact with an in-headset panel (controller aim + trigger, or
+        /// hand aim + pinch). Kept separate from `aim` and `trigger` so binding `XR_EXT_hand_interaction` does
+        /// not report a tracked hand as a controller to the host.
+        case point, press
 
         var type: XrActionType {
             switch self {
-            case .trigger, .squeeze: return XR_ACTION_TYPE_FLOAT_INPUT
+            case .trigger, .squeeze, .press: return XR_ACTION_TYPE_FLOAT_INPUT
             case .stick: return XR_ACTION_TYPE_VECTOR2F_INPUT
-            case .grip, .aim: return XR_ACTION_TYPE_POSE_INPUT
+            case .grip, .aim, .point: return XR_ACTION_TYPE_POSE_INPUT
             case .haptic: return XR_ACTION_TYPE_VIBRATION_OUTPUT
             default: return XR_ACTION_TYPE_BOOLEAN_INPUT
             }
@@ -52,7 +56,7 @@ public final class XRInput {
     private static let touch: [Control: String] = poses.merging([
         .stickClick: "input/thumbstick/click", .stickTouch: "input/thumbstick/touch", .stick: "input/thumbstick",
         .trigger: "input/trigger/value", .triggerTouch: "input/trigger/touch", .squeeze: "input/squeeze/value",
-        .restTouch: "input/thumbrest/touch",
+        .restTouch: "input/thumbrest/touch", .point: "input/aim/pose", .press: "input/trigger/value",
     ]) { $1 }
     private static let touchLeft: [Control: String] = [
         .lower: "input/x/click", .upper: "input/y/click", .lowerTouch: "input/x/touch", .upperTouch: "input/y/touch",
@@ -74,9 +78,14 @@ public final class XRInput {
             .lower: "input/a/click", .upper: "input/b/click", .lowerTouch: "input/a/touch", .upperTouch: "input/b/touch",
             .stickClick: "input/thumbstick/click", .stickTouch: "input/thumbstick/touch", .stick: "input/thumbstick",
             .trigger: "input/trigger/value", .triggerTouch: "input/trigger/touch", .squeeze: "input/squeeze/value",
+            .point: "input/aim/pose", .press: "input/trigger/value",
         ]) { $1 }),
+        // Bind hand aim and pinch only to panel pointer actions (omitting grip so tracked hand joints still stream).
+        Profile("/interaction_profiles/ext/hand_interaction_ext", needs: "XR_EXT_hand_interaction", both: [
+            .point: "input/aim/pose", .press: "input/pinch_ext/value",
+        ]),
         Profile("/interaction_profiles/khr/simple_controller", both: poses.merging([
-            .trigger: "input/select/click", .menu: "input/menu/click",
+            .trigger: "input/select/click", .menu: "input/menu/click", .point: "input/aim/pose", .press: "input/select/click",
         ]) { $1 }),
     ]
 
@@ -86,13 +95,20 @@ public final class XRInput {
     private var actionSet: XrActionSet?
     private var actions: [Control: XrAction] = [:]
     private var sides: [XrPath] = []
-    private var grips: [XrSpace?] = [nil, nil], aims: [XrSpace?] = [nil, nil]
+    private var grips: [XrSpace?] = [nil, nil], aims: [XrSpace?] = [nil, nil], points: [XrSpace?] = [nil, nil]
     private var trackers: [XrHandTrackerEXT?] = [nil, nil]
     private var headSpace: XrSpace?
 
     private let lock = NSLock()
     private var latestHead: TrackedPose?
     private var latestHands: [HandInput?] = [nil, nil]
+    private var latestPointers: [Pointer?] = [nil, nil]
+
+    /// Pointer ray and analog press value (`0` to `1`) for interacting with a panel.
+    public struct Pointer {
+        public var ray: Pose
+        public var press: Float
+    }
     private var noted: [String] = ["", ""]
 
     init(instance: XRInstance, session: XrSession, log: @escaping (String) -> Void) throws {
@@ -154,6 +170,7 @@ public final class XRInput {
         for side in Side.allCases {
             grips[side.rawValue] = try actionSpace(.grip, side)
             aims[side.rawValue] = try actionSpace(.aim, side)
+            points[side.rawValue] = try actionSpace(.point, side)
         }
 
         var view = XrReferenceSpaceCreateInfo()
@@ -179,7 +196,7 @@ public final class XRInput {
     deinit {
         let calls = instance.calls
         for tracker in trackers { if let tracker { _ = calls.destroyHandTracker?(tracker) } }
-        for space in grips + aims + [headSpace] { if let space { _ = calls.destroySpace(space) } }
+        for space in grips + aims + points + [headSpace] { if let space { _ = calls.destroySpace(space) } }
     }
 
     private func actionSpace(_ control: Control, _ side: Side) throws -> XrSpace? {
@@ -206,6 +223,13 @@ public final class XRInput {
         lock.lock()
         defer { lock.unlock() }
         return latestHands
+    }
+
+    /// Returns `[left, right]` pointer rays in tracking space, or `nil` for inactive hands/controllers.
+    public func pointers() -> [Pointer?] {
+        lock.lock()
+        defer { lock.unlock() }
+        return latestPointers
     }
 
     public func vibrate(_ pulse: HapticPulse) {
@@ -331,9 +355,22 @@ public final class XRInput {
             if let held = controller(side, in: base, at: time) { return .controller(held) }
             return hand(side, in: base, at: time).map { .hand($0) }
         }
+        let pointers = Side.allCases.map { side -> Pointer? in
+            var which = XrActionStateGetInfo()
+            which.type = XR_TYPE_ACTION_STATE_GET_INFO
+            which.action = actions[.point]
+            which.subactionPath = sides[side.rawValue]
+            var held = XrActionStatePose()
+            held.type = XR_TYPE_ACTION_STATE_POSE
+            guard calls.getActionStatePose(session, &which, &held).rawValue >= 0, held.isActive != 0,
+                  let ray = locate(points[side.rawValue], in: base, at: time)
+            else { return nil }
+            return Pointer(ray: ray.pose, press: amount(.press, side))
+        }
         lock.lock()
         latestHead = head
         latestHands = hands
+        latestPointers = pointers
         lock.unlock()
     }
 

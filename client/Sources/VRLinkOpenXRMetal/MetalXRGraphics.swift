@@ -13,12 +13,6 @@ import VRLinkMetal
 import VRLinkOpenXR
 import VRLinkVideoToolbox
 
-extension DecodedFrame: StreamFrame {
-    public var pictureCount: Int { images.count }
-}
-
-extension VideoDecoder: StreamDecoder {}
-
 /// Renders OpenXR swapchains using Metal (`XR_KHR_metal_enable`), sharing `QuadRenderer` and VideoToolbox
 /// `DecodedFrame` textures with the visionOS compositor and macOS viewer.
 public final class MetalXRGraphics: XRGraphics {
@@ -36,7 +30,8 @@ public final class MetalXRGraphics: XRGraphics {
         didSet { renderer?.chromaKey = chromaKey }
     }
 
-    /// Optional directory where a PNG of the left eye's swapchain texture is saved every 2 seconds for debugging.
+    /// Optional directory for debug captures (saves the left-eye swapchain every 2 seconds and the panel
+    /// swapchain whenever it is redrawn).
     public var picturesFolder: URL?
     private var lastPicture = Date.distantPast
     private var picturesSaved = 0
@@ -76,30 +71,74 @@ public final class MetalXRGraphics: XRGraphics {
     public func adopt(_ swapchains: [XRSwapchain], instance: XRInstance) throws {
         guard let device, let first = swapchains.first, let format = MTLPixelFormat(rawValue: UInt(first.format))
         else { throw XRFailure.unsupported("a Metal device") }
-        let enumerate = try instance.function("xrEnumerateSwapchainImages", as: PFN_xrEnumerateSwapchainImages.self)
-        textures = try swapchains.map { swapchain in
-            var count: UInt32 = 0
-            var result = enumerate(swapchain.handle, 0, &count, nil)
-            guard result.rawValue >= 0 else { throw XRFailure.call("xrEnumerateSwapchainImages", result) }
-            var blank = XrSwapchainImageMetalKHR()
-            blank.type = XR_TYPE_SWAPCHAIN_IMAGE_METAL_KHR
-            var images = [XrSwapchainImageMetalKHR](repeating: blank, count: Int(count))
-            // xrEnumerateSwapchainImages populates the array of XrSwapchainImageMetalKHR via its base header pointer.
-            result = images.withUnsafeMutableBytes { all in
-                enumerate(swapchain.handle, count, &count, all.baseAddress?.assumingMemoryBound(to: XrSwapchainImageBaseHeader.self))
-            }
-            guard result.rawValue >= 0 else { throw XRFailure.call("xrEnumerateSwapchainImages", result) }
-            return try images.map { image in
-                guard let pointer = image.texture, let texture = Unmanaged<AnyObject>.fromOpaque(pointer).takeUnretainedValue() as? MTLTexture
-                else { throw XRFailure.unsupported("Metal swapchain images") }
-                return texture
-            }
-        }
+        textures = try swapchains.map { try images(of: $0, instance: instance) }
         let linear = format != .bgra8Unorm && format != .rgba8Unorm
         guard let renderer = QuadRenderer(device: device, colorFormat: format, linearOutput: linear)
         else { throw XRFailure.unsupported("Metal quad shaders") }
         renderer.chromaKey = chromaKey
         self.renderer = renderer
+    }
+
+    private var panelTextures: [MTLTexture] = []
+    private var panelStaging: MTLBuffer?
+    private var panelsSaved = 0
+
+    /// Supported 8-bit swapchain formats for the panel, preferring sRGB formats first.
+    private static let panelFormats: [MTLPixelFormat] = [.rgba8Unorm_srgb, .bgra8Unorm_srgb, .rgba8Unorm, .bgra8Unorm]
+
+    public func choosePanelFormat(among offered: [Int64]) -> Int64? {
+        MetalXRGraphics.panelFormats.map { Int64($0.rawValue) }.first { offered.contains($0) }
+    }
+
+    /// Enumerates the Metal textures behind `swapchain`.
+    private func images(of swapchain: XRSwapchain, instance: XRInstance) throws -> [MTLTexture] {
+        let enumerate = try instance.function("xrEnumerateSwapchainImages", as: PFN_xrEnumerateSwapchainImages.self)
+        var count: UInt32 = 0
+        var result = enumerate(swapchain.handle, 0, &count, nil)
+        guard result.rawValue >= 0 else { throw XRFailure.call("xrEnumerateSwapchainImages", result) }
+        var blank = XrSwapchainImageMetalKHR()
+        blank.type = XR_TYPE_SWAPCHAIN_IMAGE_METAL_KHR
+        var images = [XrSwapchainImageMetalKHR](repeating: blank, count: Int(count))
+        // xrEnumerateSwapchainImages populates the array of XrSwapchainImageMetalKHR via its base header pointer.
+        result = images.withUnsafeMutableBytes { all in
+            enumerate(swapchain.handle, count, &count, all.baseAddress?.assumingMemoryBound(to: XrSwapchainImageBaseHeader.self))
+        }
+        guard result.rawValue >= 0 else { throw XRFailure.call("xrEnumerateSwapchainImages", result) }
+        return try images.map { image in
+            guard let pointer = image.texture, let texture = Unmanaged<AnyObject>.fromOpaque(pointer).takeUnretainedValue() as? MTLTexture
+            else { throw XRFailure.unsupported("Metal swapchain images") }
+            return texture
+        }
+    }
+
+    public func adoptPanel(_ swapchain: XRSwapchain, instance: XRInstance) throws {
+        panelTextures = try images(of: swapchain, instance: instance)
+        panelStaging = device?.makeBuffer(length: swapchain.width * swapchain.height * 4, options: .storageModeShared)
+    }
+
+    public func drawPanel(_ pixels: [UInt8], image: Int) {
+        guard let queue, let staging = panelStaging, panelTextures.indices.contains(image), pixels.count <= staging.length,
+              let commands = queue.makeCommandBuffer(), let copy = commands.makeBlitCommandEncoder()
+        else { return }
+        let texture = panelTextures[image]
+        pixels.withUnsafeBytes { staging.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+        if texture.pixelFormat == .bgra8Unorm || texture.pixelFormat == .bgra8Unorm_srgb {
+            // The picture is RGBA; swap red and blue in place for a BGRA swapchain.
+            let bytes = staging.contents().assumingMemoryBound(to: UInt8.self)
+            for at in stride(from: 0, to: pixels.count, by: 4) { (bytes[at], bytes[at + 2]) = (bytes[at + 2], bytes[at]) }
+        }
+        // Blit through a shared staging buffer because swapchain textures usually use private GPU storage.
+        copy.copy(from: staging, sourceOffset: 0, sourceBytesPerRow: texture.width * 4, sourceBytesPerImage: texture.width * texture.height * 4,
+                  sourceSize: MTLSize(width: texture.width, height: texture.height, depth: 1), to: texture, destinationSlice: 0,
+                  destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+        copy.endEncoding()
+        if let picturesFolder {
+            panelsSaved += 1
+            save(texture, to: picturesFolder.appendingPathComponent("panel-\(panelsSaved).png"), with: commands)
+        }
+        commands.commit()
+        // Wait until scheduled so the shared staging buffer can be safely overwritten on the next update.
+        commands.waitUntilScheduled()
     }
 
     public func draw(_ eyes: [XREyeDraw], frame: DecodedFrame?, transparent: Bool) {

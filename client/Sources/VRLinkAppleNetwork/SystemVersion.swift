@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import Foundation
+import VRLinkCore
 
 /// Platform, device model, and client version strings reported to the host
 /// during pairing and session setup.
@@ -23,7 +24,6 @@ public enum SystemVersion {
     private static let product = "OpenVRLink"
 
     /// Hardware model string sent to the host during pairing.
-    /// TODO: on Android, report `Build.MODEL` instead of a hardcoded string.
     public static var model: String {
         #if os(visionOS)
         return "Apple Vision Pro"
@@ -52,5 +52,10 @@ public enum SystemVersion {
         var numbers = "\(version.majorVersion).\(version.minorVersion)"
         if version.patchVersion != 0 { numbers += ".\(version.patchVersion)" }
         return name + " " + numbers
+    }
+
+    /// Builds a `DeviceIdentity` for this Apple device using `name` as the user-assigned device name.
+    public static func device(named name: String) -> DeviceIdentity {
+        DeviceIdentity(name: name, model: model, systemName: self.name, systemVersion: named, clientVersion: client)
     }
 }

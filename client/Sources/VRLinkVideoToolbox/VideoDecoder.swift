@@ -48,18 +48,12 @@ public final class VideoDecoder {
     /// silently drop frames without producing output.
     public func reset() {
         decoders = []
-        lock.lock()
-        waiting = []
-        lock.unlock()
+        assembler.reset()
     }
 
     private var decoders: [PictureDecoder] = []
-    private let lock = NSLock()
-    /// Partially decoded multi-picture frames awaiting remaining pictures, oldest first.
-    private var waiting: [(frameID: UInt16, images: [Int: CVPixelBuffer])] = []
-    /// Maximum number of in-flight partial frames to keep before dropping the
-    /// oldest incomplete frame as lost.
-    static let framesWaiting = 4
+    /// Gathers the pictures of multi-picture frames; incomplete frames are dropped as lost.
+    private let assembler = PictureAssembler<CVPixelBuffer>()
 
     public func decode(_ frame: EncodedFrame) {
         while decoders.count <= frame.picture {
@@ -76,29 +70,17 @@ public final class VideoDecoder {
     }
 
     private func decoded(_ frameID: UInt16, picture: Int, _ image: CVPixelBuffer, _ layout: FrameLayout) {
-        if layout.pictures <= 1 {
-            onImage?(DecodedFrame(frameID: frameID, images: [image], layout: layout))
-            return
-        }
-        lock.lock()
-        let index = waiting.firstIndex { $0.frameID == frameID } ?? waiting.count
-        if index == waiting.count { waiting.append((frameID, [:])) }
-        waiting[index].images[picture] = image
-        var whole: [CVPixelBuffer]?
-        if waiting[index].images.count == layout.pictures {
-            whole = (0..<layout.pictures).compactMap { waiting[index].images[$0] }
-            waiting.removeFirst(index + 1)            // drop any older incomplete frames as well
-        } else if waiting.count > VideoDecoder.framesWaiting {
-            waiting.removeFirst()
-        }
-        lock.unlock()
-        if let whole, whole.count == layout.pictures {
-            onImage?(DecodedFrame(frameID: frameID, images: whole, layout: layout))
-        }
+        guard let whole = assembler.add(image, index: picture, frameID: frameID, of: layout.pictures) else { return }
+        onImage?(DecodedFrame(frameID: frameID, images: whole, layout: layout))
     }
 }
 
-/// VideoToolbox decoder for a single picture stream.
+extension DecodedFrame: StreamFrame {
+    public var pictureCount: Int { images.count }
+}
+
+extension VideoDecoder: StreamDecoder {}
+
 final class PictureDecoder {
     var onImage: ((UInt16, CVPixelBuffer, FrameLayout) -> Void)?
     var onFailure: ((UInt16) -> Void)?

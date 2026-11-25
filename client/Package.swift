@@ -39,7 +39,7 @@ let package = Package(
         .target(name: "VRLinkMetal", dependencies: ["VRLinkCore", "VRLinkVideoToolbox"],    // Metal quad renderer for decoded frames
                 resources: [.copy("Quad.metal"), .copy("Shrink.metal")]),
         .target(name: "VRLinkAppleAudio", dependencies: ["VRLinkCore"]),              // audio playback and mic capture
-        .target(name: "VRLinkAppleNetwork"),                                          // Bonjour discovery, Ethernet detection, OS version
+        .target(name: "VRLinkAppleNetwork", dependencies: ["VRLinkCore"]),                                          // Bonjour discovery, Ethernet detection, OS version
         .target(name: "VRLinkAppleFace", dependencies: ["VRLinkCore"]),               // camera-based face and eye tracking
         // Head, hand, and controller tracking via ARKit, GameController, and
         // spatial events on visionOS (empty on other platforms).
@@ -73,6 +73,7 @@ let package = Package(
         // macOS OpenXR client executable for testing against desktop runtimes such as OXRSys.
         .executableTarget(name: "OpenVRLinkXR", dependencies: [
             "VRLinkCore", "VRLinkOpenXR", "VRLinkOpenXRMetal", "VRLinkVideoToolbox", "VRLinkAppleAudio", "VRLinkAppleNetwork",
+            "VRLinkPanel", "VRLinkXRClient",
         ]),
         // C module exposing Android NDK headers for NativeActivity, MediaCodec, AAudio, and Vulkan (empty on other platforms).
         .target(name: "CAndroidNDK", linkerSettings: ["android", "log", "mediandk", "aaudio", "vulkan"].map {
@@ -87,14 +88,23 @@ let package = Package(
         // Android XR NativeActivity entry point, packaged into an APK by client/android/build.sh.
         .target(name: "OpenVRLinkAndroid", dependencies: [
             "VRLinkCore", "CAndroidNDK", "VRLinkOpenXR", "VRLinkVulkan", "VRLinkMediaCodec", "VRLinkAndroidAudio",
+            "VRLinkPanel", "VRLinkXRClient",
         ]),
+        // Vendored Dear ImGui 1.91.9b exposed through a plain C header (CImGui.h) so Swift targets do not need C++ interop.
+        .target(name: "CImGui", exclude: ["LICENSE.txt"]),
+        // Renders the host picker and settings UI with Dear ImGui and rasterizes it on the CPU into an RGBA buffer.
+        .target(name: "VRLinkPanel", dependencies: ["VRLinkCore", "CImGui"]),
+        // Shared OpenXR client that connects `XRDisplay`, `StreamLink`, `Panel`, and `ClientModel`.
+        .target(name: "VRLinkXRClient", dependencies: ["VRLinkCore", "VRLinkOpenXR", "VRLinkPanel"]),
         // Standalone macOS test viewer that renders the VR stream in a window.
         .executableTarget(name: "OpenVRLink", dependencies: [
             "VRLinkCore", "VRLinkVideoToolbox", "VRLinkMetal", "VRLinkAppleAudio", "VRLinkAppleNetwork", "VRLinkAppleFace",
         ]),
         .testTarget(name: "VRLinkCoreTests", dependencies: ["VRLinkCore"]),
+        .testTarget(name: "VRLinkPanelTests", dependencies: ["VRLinkCore", "VRLinkPanel"]),
         .testTarget(name: "VRLinkOpenXRTests", dependencies: ["VRLinkCore", "VRLinkOpenXR"]),
         .testTarget(name: "VRLinkVideoToolboxTests", dependencies: ["VRLinkCore", "VRLinkVideoToolbox"]),
         .testTarget(name: "VRLinkMetalTests", dependencies: ["VRLinkCore", "VRLinkVideoToolbox", "VRLinkMetal"]),
-    ]
+    ],
+    cxxLanguageStandard: .cxx17
 )

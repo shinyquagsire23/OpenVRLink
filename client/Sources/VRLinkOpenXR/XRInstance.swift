@@ -67,6 +67,7 @@ public final class XRInstance {
     static let optional = [
         "XR_KHR_convert_timespec_time",      // display times on the client's clock
         "XR_EXT_hand_tracking",
+        "XR_EXT_hand_interaction",           // hand aim ray and pinch actions for panel UI
         "XR_FB_display_refresh_rate",
         "XR_EXT_local_floor",
         "XR_META_touch_controller_plus",
