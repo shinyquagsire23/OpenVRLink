@@ -201,7 +201,24 @@ final class InstallTests: XCTestCase {
         }
         XCTAssertEqual(defaults["vrlink_Apple Vision Pro (OpenVRLink)"]?["modelNumber"], .string("Apple Vision Pro (OpenVRLink)"))
         XCTAssertTrue(Steam.isFile(driver.appendingPathComponent("resources/settings/settingsschema.vrsettings")))
+        // Installing the driver writes the Play For Dream controller models and enables playForDreamModels in defaults.
+        XCTAssertEqual(defaults[Install.section]?[PlayForDreamModel.settingsKey], .bool(true))
+        XCTAssertTrue(PlayForDreamModel.isPresent(inDriver: driver))
+        for model in PlayForDreamModel.models {
+            let folder = driver.appendingPathComponent("resources/rendermodels").appendingPathComponent(model)
+            let parts = try JSON(parsing: String(contentsOf: folder.appendingPathComponent("\(model).json"), encoding: .utf8))
+            // Verify every component mesh referenced in the model JSON and the shared joystick texture exist on disk.
+            guard case .object(let components)? = parts["components"] else { return XCTFail("\(model): no components") }
+            for (name, component) in components {
+                if let file = component["filename"]?.string { XCTAssertTrue(Steam.isFile(folder.appendingPathComponent(file)), "\(model) \(name)") }
+            }
+            XCTAssertTrue(Steam.isFile(folder.appendingPathComponent("\(model).obj")), model)
+            XCTAssertTrue(Steam.isFile(folder.appendingPathComponent("pfd_mr_controller_joystick.tga")), model)
+        }
+        try FileManager.default.removeItem(at: driver.appendingPathComponent("resources/rendermodels/pfd_mr_controller_left/pfd_mr_controller_joystick.tga"))
+        XCTAssertFalse(PlayForDreamModel.isPresent(inDriver: driver))
         try Install.writeDriver(to: driver, library: Data("library".utf8), windows: true, ownTab: false)
+        XCTAssertTrue(PlayForDreamModel.isPresent(inDriver: driver))
         XCTAssertTrue(Steam.isFile(driver.appendingPathComponent("bin/win64/driver_openvrlink.dll")))
         XCTAssertFalse(Steam.isFile(driver.appendingPathComponent("resources/settings/settingsschema.vrsettings")))
     }

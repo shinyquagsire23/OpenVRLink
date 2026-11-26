@@ -68,10 +68,12 @@ public struct FrameMetadata {
         let views = Eye.allCases.map { eye -> FrameLayout.View in
             let base = profile.eyeFrusta[eye.rawValue]
             // Compute the world-space eye pose the host rendered from by applying the eye-in-head offset to `renderPose`.
+            let fovea = foveaFrustum(eye: eye.rawValue, base: base)
             return FrameLayout.View(eye: renderPose.placing(profile.eyesInHead[eye.rawValue]), tiles: [
                 tile(eye.rawValue * 2 + 1, base, feather: 0),
-                tile(eye.rawValue * 2, foveaFrustum(eye: eye.rawValue, base: base), feather: FrameMetadata.foveaFeather),
-            ])
+                tile(eye.rawValue * 2, fovea, feather: FrameMetadata.foveaFeather),
+            ], sharp: FrameLayout.Sharp(frustum: fovea, width: tileWidth, height: tileHeight, tile: 1,
+                                              rest: (tileWidth, tileHeight)))
         }
         return FrameLayout(views: views, eyePixels: (atlasWidth, tileHeight))
     }

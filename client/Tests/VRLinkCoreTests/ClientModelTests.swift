@@ -232,6 +232,30 @@ final class HeadsetQuirksTests: XCTestCase {
     func testDefaultsFollowTheHeadsetAndOverridesWin() {
         XCTAssertTrue(HeadsetQuirks(.galaxyXR).floatTargetIsEncoded)
         XCTAssertTrue(HeadsetQuirks(.pico).floatTargetIsEncoded)
+        // YVR and Play For Dream disable compositor layer placement and use XR_FB_passthrough.
+        for headset in [HeadsetQuirks.Headset.yvr, .playForDream] {
+            let quirks = HeadsetQuirks(headset)
+            XCTAssertFalse(quirks.compositorPlacesLayers)
+            XCTAssertTrue(quirks.passthroughLayer)
+            XCTAssertEqual(quirks.sharpLayerPixels, 0)
+        }
+        XCTAssertTrue(HeadsetQuirks(.galaxyXR).compositorPlacesLayers)
+        // Verify every panel option round-trips through `value(of:)` and `apply(_:)`.
+        let usual = HeadsetQuirks(.galaxyXR)
+        for option in HeadsetQuirks.options {
+            let value = try? XCTUnwrap(usual.value(of: option.key), option.key)
+            XCTAssertEqual(usual.overridden(by: [option.key: value ?? ""]), usual, option.key)
+            if case .flag = option.kind {
+                let flipped = usual.overridden(by: [option.key: value == "1" ? "0" : "1"])
+                XCTAssertEqual(flipped.value(of: option.key), value == "1" ? "0" : "1", option.key)
+            }
+        }
+        XCTAssertEqual(usual.overridden(by: ["video_range": "narrow", "sharp_layer": "0"]).videoRange, .narrow)
+        XCTAssertEqual(usual.overridden(by: ["sharp_layer": "0"]).sharpLayerPixels, 0)
+        var overridden = HeadsetQuirks(.playForDream)
+        overridden.apply { ["compositor_places_layers": "1", "passthrough_layer": "0"][$0] }
+        XCTAssertTrue(overridden.compositorPlacesLayers)
+        XCTAssertFalse(overridden.passthroughLayer)
         XCTAssertFalse(HeadsetQuirks(.quest3).floatTargetIsEncoded)
         XCTAssertFalse(HeadsetQuirks(.quest3).floatTarget)
 

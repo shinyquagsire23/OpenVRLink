@@ -155,6 +155,7 @@ public final class StreamSession: StreamingSession {
         self.link = link
         self.socket = socket
         self.profile = profile
+        if !profile.wantsEncodingGamma { extensions.wants.remove(.encodingGamma) }
         rate = RefreshRate(hz: profile.refreshHz)
         audioReceiver.onLog = { [weak self] in self?.onLog?($0) }
         for (id, value) in profile.startupValues() { values.publish(id, value) }
@@ -178,6 +179,8 @@ public final class StreamSession: StreamingSession {
     public var handsProvider: (() -> [HandInput?])?
     /// Tracks whether each hand was last advertised to the host as a controller (`true`) or a tracked hand (`false`).
     private var handIsController: [Side: Bool] = [:]
+    /// The kind of controller last described to the host for each hand.
+    private var handModel: [Side: ControllerModel] = [:]
 
     /// Polled once per second for the headset battery state; if nil, the host
     /// keeps the initial "full, not charging" state.
@@ -200,6 +203,19 @@ public final class StreamSession: StreamingSession {
     private var hapticPulses = 0
     /// Maximum interval between consecutive outgoing pose datagrams since the last 1-second log report.
     private var longestPoseGap: Double = 0
+    /// Maximum duration recorded for each named loop stage since the last 1-second log report.
+    private var slowest: [String: Double] = [:]
+    private var sendsRefused = 0
+    /// Thermal refresh-rate cap, if active (guarded by `lock`), and the last cap advertised to the host.
+    private var rateHeldTo: Float?
+    private var rateHeldTold: Float?
+    /// Uplink throttling level when outgoing datagrams fail with `EAGAIN` (minimum 1 when `DeviceProfile.leanUplink` is enabled).
+    private var uplinkLevel = 0
+    private var quietSeconds = 0
+    static let uplinkLevels = ["everything with every pose", "hands once a frame", "poses twice a frame", "poses once a frame"]
+    /// Maximum combined payload size (in bytes) when merging pose and hand elements into a single UDP packet.
+    static let largestMergedDatagram = 1300, elementOverhead = 16
+    private var localEndpoint: (address: Bytes, port: UInt16, prefixLength: UInt8)?
     private var lastPoseSent: Date?
     /// The host treats a tracked hand as a controller from this protocol version on.
     static let firstVersionWithHands: UInt32 = 7
@@ -325,6 +341,12 @@ public final class StreamSession: StreamingSession {
         frameDisplayed(frameID, displayTime: sessionTime(uptimeNanoseconds))
     }
 
+    public func holdRefreshRates(to hz: Float?) {
+        lock.lock()
+        rateHeldTo = hz
+        lock.unlock()
+    }
+
     public func displayRefreshes(at uptimeNanoseconds: UInt64, period: Double) {
         displayWillRefresh(at: sessionTime(uptimeNanoseconds), period: period)
     }
@@ -387,7 +409,8 @@ public final class StreamSession: StreamingSession {
             switch hands[side.rawValue] {
             case .controller(let controller):
                 inputBlocks.append(contentsOf: controller.inputBlock())
-                poses.append(contentsOf: packedPose(controller.gripForHost, offset: ControllerState.gripOffset(side, senseModel: profile.senseControllerModels)))
+                poses.append(contentsOf: packedPose(controller.gripForHost, offset: ControllerState.gripOffset(side, senseModel: profile.senseControllerModels,
+                                                                                                              playForDream: profile.playForDreamControllers, model: controller.model)))
             case .hand(let hand, let gestures, let aim):
                 let offset = TrackedHand.wristOffset(side)
                 inputBlocks.append(contentsOf: gestures.inputBlock())
@@ -473,7 +496,10 @@ public final class StreamSession: StreamingSession {
     /// version 14, the host recreates its socket every two seconds if it does not
     /// receive this list.
     private func addressList() -> SVLElement? {
-        guard let local = socket.localEndpoint() else { return nil }
+        // Cache the local endpoint once so we do not re-enumerate system network interfaces (which can block on
+        // a Wi-Fi driver lock) on every periodic address-list send.
+        if localEndpoint == nil { localEndpoint = socket.localEndpoint() }
+        guard let local = localEndpoint else { return nil }
         var out: Bytes = [1, 0, 19, UInt8(local.port >> 8), UInt8(local.port & 0xFF), local.prefixLength]
         out.append(contentsOf: local.address)
         out.append(zeros: 12)
@@ -481,8 +507,17 @@ public final class StreamSession: StreamingSession {
     }
 
     private func send(_ elements: [SVLElement]) {
-        socket.send(link.pack(sequence: sequence, elements: elements))
+        if !socket.send(link.pack(sequence: sequence, elements: elements)) { sendsRefused += 1 }
         sequence &+= 1
+    }
+
+    /// Executes `body` and records the peak duration for `name` since the last log report.
+    private func timed<Result>(_ name: String, _ body: () -> Result) -> Result {
+        let began = Uptime.nanoseconds
+        let result = body()
+        let took = Double(Uptime.nanoseconds &- began) / 1_000_000_000
+        if took > slowest[name, default: 0] { slowest[name] = took }
+        return result
     }
 
     // MARK: Receiving
@@ -663,11 +698,17 @@ public final class StreamSession: StreamingSession {
             lock.unlock()
             if !keepGoing { break }
 
-            if let datagram = socket.receive(timeout: nextTick.timeIntervalSinceNow) {
-                receive(datagram)
+            let wait = max(0, nextTick.timeIntervalSinceNow)
+            let began = Uptime.nanoseconds
+            let datagram = socket.receive(timeout: wait)
+            // Record only scheduling overshoot beyond the requested receive timeout.
+            let over = Double(Uptime.nanoseconds &- began) / 1_000_000_000 - wait
+            if over > slowest["waiting for a packet", default: 0] { slowest["waiting for a packet"] = over }
+            timed("handling a packet") {
+                if let datagram { receive(datagram) }
+                assembler.tick(now: now())
+                drainAssembler()
             }
-            assembler.tick(now: now())
-            drainAssembler()
             // Microphone packets go out as they come, one to a datagram,
             // once the host has started streaming.
             let captured = microphone.takePackets()
@@ -690,6 +731,19 @@ public final class StreamSession: StreamingSession {
                     lock.lock()
                     let refresh = nextRefresh, period = refreshPeriod
                     lock.unlock()
+                    // Restrict advertised refresh rates while a thermal cap is active, then restore the full list once cleared.
+                    lock.lock()
+                    let held = rateHeldTo
+                    lock.unlock()
+                    if held != rateHeldTold {
+                        rateHeldTold = held
+                        let all = ([profile.refreshHz] + profile.otherRefreshRates.filter { $0 != profile.refreshHz }).sorted()
+                        let within = held.map { limit in all.filter { $0 <= limit + 0.5 } } ?? all
+                        // When capped to half of the lowest native refresh rate, advertise that half-rate alone.
+                        let offered = within.isEmpty ? [held ?? profile.refreshHz] : within
+                        values.publish(DeviceProfile.ValueID.availableRates, profile.availableRates(offered), force: true)
+                        onLog?("rates offered to the host: " + offered.map { String(format: "%.0f", $0) }.joined(separator: ", "))
+                    }
                     if let period, let change = rate.follow(period) {
                         let hz = change.to
                         onLog?(change.note)
@@ -709,24 +763,32 @@ public final class StreamSession: StreamingSession {
                     frameDisplayTime = target
                 }
                 publishBoundary()
-                let head = headProvider?() ?? lastHead
+                let head = timed("reading the head pose") { headProvider?() ?? lastHead }
+                let tracked = timed("reading the hands") { handsProvider?() ?? [] }
                 // Only send tracked hands once the host reports a protocol version that supports them.
-                let resolved = handResolver.resolve(handsProvider?() ?? [], head: head.pose, seconds: Double(now()) / 1_000_000,
+                let resolved = handResolver.resolve(tracked, head: head.pose, seconds: Double(now()) / 1_000_000,
                                                     bareHands: hostVersion >= StreamSession.firstVersionWithHands)
                 for note in resolved.notes + resolved.gestureNotes { onLog?(note) }
                 let hands = resolved.hands
                 for side in Side.allCases {
-                    var isController: Bool?
+                    var isController: Bool?, model = handModel[side] ?? .touch
                     switch hands[side.rawValue] {
-                    case .controller: isController = true
+                    case .controller(let held):
+                        isController = true
+                        model = held.model
                     case .hand: isController = false
                     case nil: break
                     }
-                    if let isController, handIsController[side] != isController {
-                        // Hand input mode changed between controller and bare hand; republish its device properties.
+                    if let isController, handIsController[side] != isController || (isController && handModel[side] != model) {
+                        // Hand input mode changed between controller and bare hand, or to another kind of
+                        // controller; republish its device properties.
                         handIsController[side] = isController
+                        if isController {
+                            if handModel[side] != model { onLog?("\(side == .left ? "left" : "right") controller described to the host as \(model.rawValue)") }
+                            handModel[side] = model
+                        }
                         powerPublished[DeviceProfile.ValueID.powerController(side)] = nil
-                        for (id, value) in profile.handValues(side, isController: isController) {
+                        for (id, value) in profile.handValues(side, isController: isController, model: model) {
                             values.publish(id, value, force: true)
                         }
                     }
@@ -739,19 +801,33 @@ public final class StreamSession: StreamingSession {
                 let messages = poseMessages(subIndex: subIndex, head: head, hands: hands)
                 if let last = lastPoseSent { longestPoseGap = max(longestPoseGap, time.timeIntervalSince(last)) }
                 lastPoseSent = time
-                let eyes = EyesAndFace.message(gaze: gazeProvider?(), face: faceProvider?())
-                send([eyes, statistics(), frameReport(), messages.pose])
-                if !messages.hands.isEmpty { send(messages.hands) }
+                let eyes = timed("reading eyes and face") { EyesAndFace.message(gaze: gazeProvider?(), face: faceProvider?()) }
+                timed("sending") {
+                    // Coalesce pose and hand messages into a single datagram when they fit within a single MTU.
+                    // At uplinkLevel >= 1, send hand data once per video frame rather than with every pose.
+                    let first = [eyes, statistics(), frameReport(), messages.pose]
+                    let handsNow = uplinkLevel >= 1 && subIndex != 0 ? [] : messages.hands
+                    // At higher uplink throttling levels, send poses twice per frame (level 2) or once per frame (level 3).
+                    let skipped = (uplinkLevel == 2 && subIndex % 2 == 1) || (uplinkLevel >= 3 && subIndex != 0)
+                    if skipped { return }
+                    let bytes = (first + handsNow).reduce(0) { $0 + $1.value.count + StreamSession.elementOverhead }
+                    if bytes <= StreamSession.largestMergedDatagram {
+                        send(first + handsNow)
+                    } else {
+                        send(first)
+                        if !handsNow.isEmpty { send(handsNow) }
+                    }
+                }
                 subIndex = (subIndex + 1) % StreamSession.posesPerFrame
                 nextTick = max(nextTick.addingTimeInterval(framePeriod / Double(StreamSession.posesPerFrame)),
                                time.addingTimeInterval(-0.05))
             }
             if time >= nextAddressList {
-                if hostVersion != 0, let list = addressList() { send([list]) }
+                timed("sending the address list") { if hostVersion != 0, let list = addressList() { send([list]) } }
                 nextAddressList = time.addingTimeInterval(StreamSession.addressListInterval)
             }
             if time >= nextReport {
-                publishPower(headsetPowerProvider?(), as: DeviceProfile.ValueID.powerHMD)
+                timed("reading the battery") { publishPower(headsetPowerProvider?(), as: DeviceProfile.ValueID.powerHMD) }
                 lock.lock()
                 let decoded = self.decoded, displayed = self.displayed
                 lock.unlock()
@@ -765,8 +841,33 @@ public final class StreamSession: StreamingSession {
                        + "\(audio.underruns) underruns, \(audio.overflows) overflows")
                 // Poses are due every quarter frame; a long gap means this thread was held up.
                 if longestPoseGap > framePeriod {
-                    onLog?(String(format: "the session thread was held up: %.0f ms between two poses", longestPoseGap * 1000))
+                    // Log any measured stages over 20 ms; an empty list indicates OS scheduling delay or unmeasured work.
+                    let steps = slowest.filter { $0.value > 0.02 }.sorted { $0.value > $1.value }
+                        .map { String(format: "%@ %.0f ms", $0.key, $0.value * 1000) }.joined(separator: ", ")
+                    onLog?(String(format: "the session thread was held up: %.0f ms between two poses", longestPoseGap * 1000)
+                           + (steps.isEmpty ? "; no single step took long" : "; slowest steps: " + steps))
                 }
+                // Log outbound kernel socket queue buildup when buffered bytes exceed 32 KB or sends are rejected.
+                if let waiting = socket.bytesWaitingToSend, waiting > 32_768 || sendsRefused > 0 {
+                    onLog?("uplink: \(waiting / 1024) KB sent but still held by the system")
+                }
+                // Step down uplink rate after any second with rejected sends, and step back up after 10 clean seconds.
+                let floor = profile.leanUplink ? 1 : 0
+                if sendsRefused > 0 {
+                    quietSeconds = 0
+                    if uplinkLevel < 3 { uplinkLevel += 1; onLog?("uplink: pulling back to level \(uplinkLevel) of 3 (\(StreamSession.uplinkLevels[uplinkLevel]))") }
+                } else {
+                    quietSeconds += 1
+                    if quietSeconds >= 10, uplinkLevel > floor {
+                        quietSeconds = 0
+                        uplinkLevel -= 1
+                        onLog?("uplink: easing to level \(uplinkLevel) of 3 (\(StreamSession.uplinkLevels[uplinkLevel]))")
+                    }
+                }
+                uplinkLevel = max(uplinkLevel, floor)
+                if sendsRefused > 0 { onLog?("\(sendsRefused) datagrams not sent; the last: \(socket.lastSendErrorText)") }
+                sendsRefused = 0
+                slowest.removeAll(keepingCapacity: true)
                 longestPoseGap = 0
                 if hapticPulses > 0 { onLog?("\(hapticPulses) haptic pulses played in the last second") }
                 hapticPulses = 0

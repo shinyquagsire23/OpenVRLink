@@ -23,6 +23,19 @@ public struct XREyeDraw {
     /// Predicted eye pose and field of view in the same reference space as `quads`.
     public var view: EyeView
     public var quads: [Quad]
+    /// Top-left sub-rect of the swapchain image to render into, or `nil` to use the full image.
+    public var size: (width: Int, height: Int)?
+    /// Clears the attachment to transparent black regardless of the frame-level `transparent` flag.
+    public var clear = false
+
+    public init(eye: Int, image: Int, view: EyeView, quads: [Quad], size: (width: Int, height: Int)? = nil, clear: Bool = false) {
+        self.eye = eye
+        self.image = image
+        self.view = view
+        self.quads = quads
+        self.size = size
+        self.clear = clear
+    }
 }
 
 /// Graphics API backend for an `XRDisplay` OpenXR session (implemented with Metal on Apple platforms and
@@ -64,6 +77,9 @@ public protocol XRGraphics: AnyObject {
     /// Uploads a panel RGBA buffer (`XRPanelLayer.update`) into swapchain image `image`, submitting GPU work
     /// before returning.
     func drawPanel(_ pixels: [UInt8], image: Int)
+
+    /// Time spent waiting on the GPU fence during the most recent `draw` call, in nanoseconds.
+    var lastGPUWait: UInt64 { get }
 
     /// Optional chroma-key filter applied during quad rendering.
     var chromaKey: ChromaKey? { get set }

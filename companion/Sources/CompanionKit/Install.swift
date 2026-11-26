@@ -141,8 +141,10 @@ public enum Install {
         try manifest.text.write(to: driver.appendingPathComponent("driver.vrdrivermanifest"), atomically: true, encoding: .utf8)
         var defaults = JSON.object([section: .object([
             "enable": .bool(true), gammaOnKey: .bool(true), gammaValueKey: .of(defaultGamma), gammaAvailableKey: .bool(false),
-            statusKey: .string("not loaded"),
+            statusKey: .string("not loaded"), PlayForDreamModel.settingsKey: .bool(true),
         ])])
+        // Write the controller models before default.vrsettings advertises them.
+        try PlayForDreamModel.write(toDriver: driver)
         // SteamVR merges default.vrsettings across all active drivers, so driver_vrlink reads these vrlink_<model> sections too.
         for (model, manufacturer) in headsets { defaults["vrlink_\(model)"] = headsetSection(model: model, manufacturer: manufacturer) }
         try defaults.text.write(to: settings.appendingPathComponent("default.vrsettings"), atomically: true, encoding: .utf8)

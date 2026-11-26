@@ -154,15 +154,20 @@ public final class MetalXRGraphics: XRGraphics {
         commands.waitUntilScheduled()
     }
 
+    public var lastGPUWait: UInt64 { 0 }
+
     public func draw(_ eyes: [XREyeDraw], frame: DecodedFrame?, transparent: Bool) {
         guard let queue, let renderer, let commands = queue.makeCommandBuffer() else { return }
         for eye in eyes {
             let pass = MTLRenderPassDescriptor()
             pass.colorAttachments[0].texture = textures[eye.eye][eye.image]
             pass.colorAttachments[0].loadAction = .clear
-            pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: transparent ? 0 : 1)
+            pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: transparent || eye.clear ? 0 : 1)
             pass.colorAttachments[0].storeAction = .store
             guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { continue }
+            if let part = eye.size {
+                encoder.setViewport(MTLViewport(originX: 0, originY: 0, width: Double(part.width), height: Double(part.height), znear: 0, zfar: 1))
+            }
             renderer.draw(eyes: [(eye.quads, eye.view)], of: frame, near: 0.05, far: 100, with: encoder, commands: commands)
             encoder.endEncoding()
         }

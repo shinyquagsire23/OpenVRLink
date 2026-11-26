@@ -39,6 +39,10 @@ final class App: @unchecked Sendable {
     /// Required on Android XR for OpenXR eye gaze tracking.
     static let eyeTracking = "android.permission.EYE_TRACKING_FINE"
     static let faceTracking = "android.permission.FACE_TRACKING"
+    /// Required for OpenXR eye gaze on Quest Pro and on Pico headsets with eye tracking.
+    static let questEyeTracking = "com.oculus.permission.EYE_TRACKING"
+    static let questFaceTracking = "com.oculus.permission.FACE_TRACKING"
+    static let picoEyeTracking = "com.picovr.permission.EYE_TRACKING"
     static let recordAudio = "android.permission.RECORD_AUDIO"
 
     private var vm: UnsafeMutablePointer<JavaVM?>?
@@ -75,6 +79,8 @@ final class App: @unchecked Sendable {
     private var microphone = MicrophoneInput()
     private var microphoneWanted = 0
     private var audio: AudioOutput?
+    /// Low-latency `WifiManager.WifiLock` held while streaming. Guarded by `lock`.
+    private var wifiLock: jobject?
 
     private static func property(_ name: String) -> String {
         var value = [CChar](repeating: 0, count: 92)        // PROP_VALUE_MAX
@@ -100,11 +106,26 @@ final class App: @unchecked Sendable {
             setenv("TMPDIR", files, 1)
         }
         Log.write = { line in _ = __android_log_write(Int32(ANDROID_LOG_INFO.rawValue), "OpenVRLink", line) }
+        // `adb shell setprop debug.openvrlink.keep_stream 1` copies the start of each stream to the app's
+        // external files folder, which adb can read.
+        if App.property("debug.openvrlink.keep_stream") == "1" {
+            if let outside = activity.pointee.externalDataPath {
+                MediaCodecDecoder.keepStreamStartIn = String(cString: outside)
+                Log.note("the start of each stream will be kept in " + String(cString: outside))
+            } else {
+                Log.note("the start of each stream cannot be kept: the app has no external files folder")
+            }
+        }
 
         let named = App.property("ro.product.model")
         let modelName = named.isEmpty ? "Android XR headset" : named
         quirks = HeadsetQuirks(HeadsetQuirks.identify(manufacturer: App.property("ro.product.manufacturer"), model: named,
                                                       device: App.property("ro.product.device"), product: App.property("ro.product.name")))
+        // Apply headset defaults first, then saved panel overrides, and finally debug.openvrlink.* system properties.
+        let usualQuirks = quirks
+        let chosen = Settings.load().quirkOverrides
+        quirks = quirks.overridden(by: chosen)
+        if !chosen.isEmpty { Log.note("quirks changed in the panel: " + chosen.sorted { $0.key < $1.key }.map { "\($0.key) = \($0.value)" }.joined(separator: ", ")) }
         quirks.apply { name in
             let value = App.property("debug.openvrlink." + name)
             return value.isEmpty ? nil : value
@@ -119,6 +140,8 @@ final class App: @unchecked Sendable {
         self.model = model
         let panel = Panel(model: model, features: [.microphone])
         panel.caption = (version.map { "v" + $0 + "  " } ?? "") + modelName
+        panel.quirks = usualQuirks
+        panel.quirksInEffect = quirks
         self.panel = panel
         model.search()
 
@@ -225,14 +248,142 @@ final class App: @unchecked Sendable {
         }
     }
 
+    /// Acquires or releases the low-latency Wi-Fi lock when streaming starts or stops.
+    private func holdWifi(_ wanted: Bool, from activity: UnsafeMutablePointer<ANativeActivity>) {
+        lock.lock()
+        let held = wifiLock
+        if !wanted { wifiLock = nil }
+        lock.unlock()
+        if wanted, held == nil {
+            let taken = with(activity) { $0.holdWifiLock() } ?? nil
+            Log.note(taken == nil ? "wifi: could not take the low-latency lock" : "wifi: holding the low-latency lock")
+            lock.lock()
+            wifiLock = taken
+            lock.unlock()
+        } else if !wanted, let held {
+            _ = with(activity) { $0.drop(wifiLock: held) }
+            Log.note("wifi: dropped the low-latency lock")
+        }
+    }
+
+    /// Probes how this device's hardware decoder and Vulkan Y'CbCr sampler transform video colors, then
+    /// configures `graphics` with the corresponding inverse color matrix.
+    ///
+    /// Each `ColorProbe` clip (10-bit and 8-bit) is decoded with a dedicated `MediaCodecDecoder`, reading back
+    /// both the initial frame and a later frame (since some decoders handle the first frame differently from
+    /// steady-state frames) and applying the steady-state correction for that external buffer format. Each clip
+    /// is also run with `HeadsetQuirks.decoderColorKeys` inverted for diagnostic logging.
+    private func measureColors(with graphics: VulkanXRGraphics) {
+        var other = quirks
+        other.decoderColorKeys.toggle()
+        var runs: [(clip: ColorProbe.Clip, quirks: HeadsetQuirks, acting: Bool)] = []
+        for clip in ColorProbe.clips { runs += [(clip, other, false), (clip, quirks, true)] }
+        func next(_ index: Int) {
+            guard index < runs.count else { return }
+            let run = runs[index]
+            measureColors(of: run.clip, with: graphics, decoding: run.quirks, acting: run.acting) { next(index + 1) }
+        }
+        next(0)
+    }
+
+    private func measureColors(of clip: ColorProbe.Clip, with graphics: VulkanXRGraphics, decoding quirks: HeadsetQuirks, acting: Bool,
+                               then: @escaping () -> Void) {
+        let decoder = MediaCodecDecoder(quirks: quirks)
+        decoder.keepsStreamStart = false
+        let named = "\(clip.name), decoder \(quirks.decoderColorKeys ? "with color keys" : "without color keys")"
+        let held = NSLock()
+        var pictures: [HardwareFrame] = []
+        var finished = false
+        /// Reads `frames` back sequentially and applies the steady-state correction from the final frame.
+        func read(_ frames: [HardwareFrame], names: [String], found: [(finding: ColorProbe.Finding, format: UInt64)?] = []) {
+            guard found.count < frames.count else {
+                DispatchQueue.global().async {
+                    decoder.reset()
+                    then()
+                }
+                guard acting else { return }
+                if found.count == 2, let first = found[0], let later = found[1], first.finding.closest != later.finding.closest {
+                    Log.note("colors: \(clip.name): decoder treated the first frame differently from subsequent frames")
+                }
+                if let last = found.last ?? nil, let treatment = last.finding.treatment {
+                    graphics.correct(for: treatment, bits: clip.bits, format: last.format)
+                } else {
+                    Log.note("colors: \(clip.name): falling back to configured color quirks")
+                }
+                return
+            }
+            let index = found.count
+            graphics.probeColors(frames[index]) { result in
+                if let result, let finding = ColorProbe.analyze(result.colors, of: clip) {
+                    Log.note("colors: \(named): \(names[index]) frame (format \(String(result.format, radix: 16))) came through \(finding.description)")
+                    if finding.treatment == nil { for line in ColorProbe.table(result.colors, of: clip) { Log.note("colors:   " + line) } }
+                    read(frames, names: names, found: found + [(finding, result.format)])
+                } else {
+                    Log.note("colors: \(named): could not read back \(names[index]) frame")
+                    read(frames, names: names, found: found + [nil])
+                }
+            }
+        }
+        /// Evaluates the first and latest decoded frames once decoding finishes.
+        func finish() {
+            held.lock()
+            let chosen = pictures, already = finished
+            finished = true
+            held.unlock()
+            guard !already else { return }
+            guard let first = chosen.first, let last = chosen.last else {
+                Log.note("colors: \(named): decoder produced no frames")
+                decoder.reset()
+                then()
+                return
+            }
+            if chosen.count == 1 {
+                read([first], names: ["only"])
+            } else {
+                read([first, last], names: ["first", chosen.count == 6 ? "sixth" : "last"])
+            }
+        }
+        decoder.onImage = { frame in
+            held.lock()
+            if !finished, pictures.count < 6 { pictures.append(frame) }
+            let enough = pictures.count >= 6
+            held.unlock()
+            if enough { finish() }
+        }
+        DispatchQueue.global().async {
+            // Feed the clip access units repeatedly until 6 frames have been decoded.
+            for attempt in 0..<30 {
+                held.lock()
+                let stop = finished
+                held.unlock()
+                if stop { return }
+                decoder.decode(EncodedFrame(frameID: UInt16(attempt), data: FrameBuffer(copying: clip.units[attempt % clip.units.count]),
+                                            layout: ColorProbe.layout))
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            finish()
+        }
+    }
+
     private func runImmersive(_ activity: UnsafeMutablePointer<ANativeActivity>) {
         guard let model, let panel else { return }
         // Request hand, eye, and face tracking permissions before creating the OpenXR instance, since the runtime
         // checks granted permissions at instance creation.
-        ask(for: [App.handTracking, App.eyeTracking, App.faceTracking], from: activity)
+        ask(for: [App.handTracking, App.eyeTracking, App.faceTracking, App.questEyeTracking, App.questFaceTracking, App.picoEyeTracking], from: activity)
 
         var platform = XRPlatform(device: device)
         platform.gripOffset = quirks.gripOffset
+        platform.sharpLayerPixels = quirks.sharpLayerPixels
+        platform.eyeDetail = quirks.eyeDetail
+        platform.sustainedPerformance = quirks.sustainedPerformance
+        platform.leanUplink = quirks.leanUplink
+        platform.compositorPlacesLayers = quirks.compositorPlacesLayers
+        platform.passthroughLayer = quirks.passthroughLayer
+        platform.playForDreamControllers = quirks.headset == .playForDream
+        platform.headVelocityFromPoses = quirks.headVelocityFromPoses
+        platform.colorSpace = quirks.colorSpace
+        platform.encodingGamma = quirks.encodingGamma
+        platform.controllerVelocityFromPoses = quirks.controllerVelocityFromPoses
         platform.systemButton = { [weak self] in
             guard let self else { return false }
             lock.lock()
@@ -246,8 +397,14 @@ final class App: @unchecked Sendable {
             guard let handle = self?.with(activity, { $0.wiredNetworks().first { $0.name == name }?.handle }) ?? nil else { return false }
             return android_setsocknetwork(net_handle_t(bitPattern: handle), descriptor) == 0
         }
-        platform.startAudio = { [weak self] session in self?.audio = AudioOutput(buffer: session.audio) }
-        platform.stopAudio = { [weak self] in self?.audio = nil }
+        platform.startAudio = { [weak self] session in
+            self?.audio = AudioOutput(buffer: session.audio)
+            self?.holdWifi(true, from: activity)
+        }
+        platform.stopAudio = { [weak self] in
+            self?.audio = nil
+            self?.holdWifi(false, from: activity)
+        }
         platform.startMicrophone = { [weak self] sink in self?.startMicrophone(into: sink, from: activity) }
         platform.stopMicrophone = { [weak self] in
             guard let self else { return }
@@ -288,6 +445,7 @@ final class App: @unchecked Sendable {
             model.show("Could not start OpenXR: \(error)")
             return
         }
+        if quirks.measureColors { measureColors(with: client.display.graphics) }
         lock.lock()
         quitImmersive = { client.quit() }
         let gone = immersive != activity

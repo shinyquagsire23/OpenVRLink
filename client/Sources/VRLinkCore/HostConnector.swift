@@ -106,6 +106,8 @@ public struct HostConnector {
         if profile.hostKnowsHeadset {
             log("reporting HMD model \(profile.ownModel.model) (supported by \(host.hostname) in previous session)")
         }
+        profile.hostHasPlayForDreamModels = hosts.hasPlayForDreamModels(host.clientID)
+        if profile.showsPlayForDreamControllers { log("showing the Play For Dream controller models (installed on \(host.hostname) by the companion)") }
         guard let session = StreamSession(args, profile: profile, interface: interface) else {
             // Report whether session creation failed due to an unsupported transport token or a socket error.
             guard SVLLink(token: args.token) != nil else {
@@ -115,7 +117,16 @@ public struct HostConnector {
         }
         log("transport: \(session.transportName)")
         let clientID = host.clientID, known = profile.hostKnowsHeadset, model = profile.ownModel.model, log = log
+        let hadModels = profile.hostHasPlayForDreamModels, usesModels = profile.playForDreamControllers
         session.onHostFeatures = { features in
+            let hasModels = features?.contains(.playForDreamModels) ?? false
+            if hasModels != hadModels {
+                hosts.set(clientID, playForDreamModels: hasModels)
+                if usesModels {
+                    log(hasModels ? "host has the Play For Dream controller models; will show them starting next session"
+                                  : "host no longer has the Play For Dream controller models; showing Quest controllers next session")
+                }
+            }
             let knows = features?.contains(.headsetSettings) ?? false
             guard knows != known else { return }
             hosts.set(clientID, knowsHeadset: knows)

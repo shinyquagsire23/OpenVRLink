@@ -26,6 +26,13 @@ public struct DeviceProfile {
     /// 3660 -> 4184, 4096 -> 4684). We divide `eyePixels` by `renderTargetPerDisplayPixel`
     /// before sending so SteamVR lands on the requested render target (within 4-pixel rounding).
     public var eyePixels: (width: Int, height: Int)?
+    /// Full-view per-eye resolution matching the display's center pixel density when rendering a secondary
+    /// sharp layer (`FrameLayout.Sharp`). Reported to WiVRn hosts so they enable foveated encoding; Steam
+    /// hosts continue to receive `eyePixels`.
+    public var detailEyePixels: (width: Int, height: Int)?
+    /// Starts sessions sending hand tracking once per video frame rather than with every pose
+    /// (`HeadsetQuirks.leanUplink`).
+    public var leanUplink = false
     /// Ratio of SteamVR's 100% render target resolution to the reported panel display size on each axis.
     static let renderTargetPerDisplayPixel: Float = 1.1436
     public var refreshHz: Float = 90
@@ -119,6 +126,16 @@ public struct DeviceProfile {
     /// from the previous session with that host (`KnownHosts`).
     public var hostKnowsHeadset = false
 
+    /// Request encoding gamma when connected to a host with OpenVRLink extensions (`HostExtensions.Features.encodingGamma`).
+    public var wantsEncodingGamma = true
+
+    /// Whether this headset uses Play For Dream controllers and whether the host's `driver_openvrlink` has
+    /// their render models installed (`HostExtensions.Features.playForDreamModels`, cached from the previous
+    /// session in `KnownHosts`). When both are true, the client reports Play For Dream controller models
+    /// instead of Quest Touch models.
+    public var playForDreamControllers = false, hostHasPlayForDreamModels = false
+    var showsPlayForDreamControllers: Bool { playForDreamControllers && hostHasPlayForDreamModels && !senseControllerModels }
+
     /// Returns the native `(model, manufacturer)` pair for this device. Windows builds of
     /// `driver_vrlink` (SteamVR 2.19.4) recognize `"Apple Vision Pro M2"` and `"Apple Vision Pro M5"`
     /// with a fixed 1800 x 1920 render target and no eye tracking, while `"Apple Vision Pro"`
@@ -150,7 +167,7 @@ public struct DeviceProfile {
 
     /// Builds the static identity and battery property values (`ValueID -> Bytes`) published
     /// when a controller or tracked hand becomes active.
-    func handValues(_ side: Side, isController: Bool) -> [UInt8: Bytes] {
+    func handValues(_ side: Side, isController: Bool, model: ControllerModel = .touch) -> [UInt8: Bytes] {
         let name = side == .left ? "Left" : "Right"
         let power = DeviceProfile.powerProps(nil, reportsBattery: false)
         let staticProps = DeviceProfile.staticProps
@@ -160,10 +177,13 @@ public struct DeviceProfile {
             ? staticProps(["oculus", "OpenVRLink_Sense_\(name)", "Sony", "PlayStation VR2 Sense (\(name))",
                            "{openvrlink_sense}playstation_vr2_sense_\(name.lowercased())", "openvrlink_sense",
                            "{oculus}/input/touch_profile.json", "oculus_touch", "oculus/OpenVRLink_Sense_\(name)"], 0)
-            // Static controller properties sent by vrlink for a Quest 2 Touch controller.
-            : staticProps(["oculus", "VRLINKQ2_Controller_\(name)", "Oculus", "Oculus Quest2 (\(name) Controller)",
-                           "oculus_quest2_controller_\(name.lowercased())", "vrlink",
-                           "{oculus}/input/touch_profile.json", "oculus_touch", "oculus/VRLINKQ2_Controller_\(name)"], 0)
+            : showsPlayForDreamControllers
+            // Uses the Play For Dream render model while keeping the Oculus Touch input profile.
+            ? staticProps(["oculus", "OpenVRLink_PFD_\(name)", "Play For Dream", "Play For Dream MR (\(name) Controller)",
+                           "{openvrlink}pfd_mr_controller_\(name.lowercased())", "openvrlink",
+                           "{oculus}/input/touch_profile.json", "oculus_touch", "oculus/OpenVRLink_PFD_\(name)"], 0)
+            // Static controller properties sent by vrlink for the active OpenXR interaction profile.
+            : staticProps(model.staticStrings(side), 0)
         let identity = isController
             ? controller
             : staticProps(["vrlink", "VRLINKQ_Hand_\(name)", "VRLink", "VRLink Hand Tracker (\(name) Hand)",

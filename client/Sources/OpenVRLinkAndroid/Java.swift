@@ -126,6 +126,15 @@ struct Java {
         return threw() ? nil : result
     }
 
+    /// Returns a reference to `object` that stays valid across threads and JNI frames until `release(_:)`.
+    func retained(_ object: jobject?) -> jobject? {
+        object.flatMap { calls.NewGlobalRef(env, $0) }
+    }
+
+    func release(_ object: jobject) {
+        calls.DeleteGlobalRef(env, object)
+    }
+
     func stringField(_ target: jobject?, _ name: String) -> String? {
         guard let target, let kind = calls.GetObjectClass(env, target),
               let field = calls.GetFieldID(env, kind, name, "Ljava/lang/String;"), !threw()
@@ -180,6 +189,24 @@ struct ActivityCalls {
             else { return nil }
             return (name, handle)
         }
+    }
+
+    /// Acquires a `WifiManager.WifiLock` in `WIFI_MODE_FULL_LOW_LATENCY` mode (matching `vrlink`'s
+    /// `WifiLock::Lock`), disabling Wi-Fi power save while the app is foregrounded. Returns a global JNI
+    /// reference to pass to `drop(wifiLock:)`, or `nil` on failure. Requires `WAKE_LOCK`.
+    func holdWifiLock() -> jobject? {
+        let context = java.object(activity, "getApplicationContext", "()Landroid/content/Context;")
+        let manager = java.object(context, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;", [jvalue(l: java.string("wifi"))])
+        // WifiManager.WIFI_MODE_FULL_LOW_LATENCY = 4 (Android 10 and later).
+        let held = java.object(manager, "createWifiLock", "(ILjava/lang/String;)Landroid/net/wifi/WifiManager$WifiLock;",
+                               [jvalue(i: 4), jvalue(l: java.string("OpenVRLink"))])
+        guard java.void(held, "acquire", "()V"), java.bool(held, "isHeld", "()Z") == true else { return nil }
+        return java.retained(held)
+    }
+
+    func drop(wifiLock: jobject) {
+        java.void(wifiLock, "release", "()V")
+        java.release(wifiLock)
     }
 
     /// Reads the user-assigned device name from `Settings.Global`, if set.

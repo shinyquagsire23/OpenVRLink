@@ -59,6 +59,9 @@ public protocol StreamingSession: AnyObject {
     func frameShown(_ frameID: UInt16, at uptimeNanoseconds: UInt64)
     /// Reports the next expected display vsync timestamp and refresh interval in seconds.
     func displayRefreshes(at uptimeNanoseconds: UInt64, period: Double)
+    /// Caps the display refresh rates advertised to the host at `hz` during thermal throttling, or restores
+    /// the full rate list when `nil`.
+    func holdRefreshRates(to hz: Float?)
     /// Sends a room boundary to the host as floor corners in `PlaySpace` coordinates,
     /// or clears the boundary when empty. Safe to call from any thread before or after `start`.
     func setBoundary(_ boundary: [Point2])
@@ -96,6 +99,10 @@ struct RefreshRate {
         period = measured
         return Change(from: before, to: hz)
     }
+}
+
+extension StreamingSession {
+    public func holdRefreshRates(to hz: Float?) {}
 }
 
 /// Deduplicates battery status updates for a single device so the host is only notified

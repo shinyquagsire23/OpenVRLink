@@ -16,6 +16,8 @@ enum Server {
     static let gammaValueKey: StaticString = "encodingGammaValue"
     static let gammaAvailableKey: StaticString = "gammaAvailable"
     static let statusKey: StaticString = "status"
+    /// `PlayForDreamModel.settingsKey`: true in `default.vrsettings` when the Play For Dream controller models are installed.
+    static let playForDreamModelsKey: StaticString = "playForDreamModels"
     static let defaultGamma: Float = 1.6
     /// Settings sections installed by `openvrlink-companion` for OpenVRLink's native HMD models (`Install.headsets`).
     static let headsetSections: [StaticString] = ["vrlink_Apple Vision Pro (OpenVRLink)", "vrlink_OpenVRLink Headset"]

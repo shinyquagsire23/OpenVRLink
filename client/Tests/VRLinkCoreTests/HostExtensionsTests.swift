@@ -51,6 +51,48 @@ final class HostExtensionsTests: XCTestCase {
         XCTAssertEqual(names(profile).model, "OpenVRLink Headset")
     }
 
+    func testPlayForDreamControllersAreShownOnlyWhereTheHostHasTheirModels() {
+        func model(_ profile: DeviceProfile, _ side: Side) -> String {
+            // The render model is the fifth of the 128-byte strings after the 4-byte mask.
+            let props = profile.handValues(side, isController: true)[DeviceProfile.ValueID.staticController(side)] ?? []
+            return String(decoding: props[(4 + 4 * 128)..<(4 + 5 * 128)].prefix { $0 != 0 }, as: UTF8.self)
+        }
+        var profile = DeviceProfile()
+        profile.playForDreamControllers = true
+        XCTAssertEqual(model(profile, .left), "oculus_quest2_controller_left")
+        profile.hostHasPlayForDreamModels = true
+        XCTAssertEqual(model(profile, .left), "{openvrlink}pfd_mr_controller_left")
+        XCTAssertEqual(model(profile, .right), "{openvrlink}pfd_mr_controller_right")
+        // Non-Play For Dream headsets keep Quest 2 Touch models regardless of host support.
+        profile.playForDreamControllers = false
+        XCTAssertEqual(model(profile, .right), "oculus_quest2_controller_right")
+    }
+
+    func testControllersAreDescribedAsVRLinkDescribesThem() {
+        // Matches `staticProps` and `poseAction` in vrlink's controller_config.json.
+        XCTAssertEqual(ControllerModel.touchPro.staticStrings(.left),
+                       ["oculus", "VRLINKQP_Controller_Left", "Oculus", "Oculus Quest Pro (Left Controller)", "oculus_quest_pro_controller_left",
+                        "vrlink", "{oculus}/input/touch_profile.json", "oculus_touch", "oculus/VRLINKQP_Controller_Left"])
+        XCTAssertEqual(ControllerModel.touchPlus.staticStrings(.right)[4], "oculus_quest_plus_controller_right")
+        XCTAssertEqual(ControllerModel.pico4.staticStrings(.right),
+                       ["pico", "VRLINKP4_Controller_Right", "PICO", "PICO 4 (Right Controller)", "pico_4_controller_right", "vrlink",
+                        "{vrlink}/input/pico_controller_profile.json", "pico_controller", "PICO/VRLINKP4_Controller_Right"])
+        XCTAssertEqual(ControllerModel.viveFocus3.staticStrings(.left)[8], "HTC/VRLINKVIVE_FOCUS3_Controller_Left")
+        // Matches vrlink's Quest Touch grip offset, mirrored across X for the right hand.
+        for (got, wanted) in zip(ControllerModel.touch.gripOffset(.left), [-0.007, -0.0342, -0.0961, 0.9839, -0.1788, 0, 0] as [Float]) {
+            XCTAssertEqual(got, wanted, accuracy: 0.0001)
+        }
+        XCTAssertEqual(ControllerModel.touchPro.gripOffset(.right)[0], 0.007, accuracy: 1e-6)
+        XCTAssertEqual(ControllerModel.picoNeo3.gripOffset(.right)[0], -0.003, accuracy: 1e-6)
+        // Reported controller properties follow the active ControllerModel regardless of headset.
+        func model(_ profile: DeviceProfile, _ kind: ControllerModel) -> String {
+            let props = profile.handValues(.left, isController: true, model: kind)[DeviceProfile.ValueID.staticController(.left)] ?? []
+            return String(decoding: props[(4 + 4 * 128)..<(4 + 5 * 128)].prefix { $0 != 0 }, as: UTF8.self)
+        }
+        XCTAssertEqual(model(DeviceProfile(), .touchPro), "oculus_quest_pro_controller_left")
+        XCTAssertEqual(model(DeviceProfile(), .touch), "oculus_quest2_controller_left")
+    }
+
     func testKnownHostsPersistsPerHost() {
         let file = FileManager.default.temporaryDirectory.appendingPathComponent("ovl-hosts-\(UUID().uuidString)/hosts.json")
         defer { try? FileManager.default.removeItem(at: file.deletingLastPathComponent()) }
@@ -59,8 +101,18 @@ final class HostExtensionsTests: XCTestCase {
         KnownHosts(file: file).set(UInt64.max, knowsHeadset: false)
         XCTAssertTrue(KnownHosts(file: file).knowsHeadset(7))
         XCTAssertFalse(KnownHosts(file: file).knowsHeadset(UInt64.max))
+        // Updating one per-host flag preserves the other.
+        KnownHosts(file: file).set(7, playForDreamModels: true)
+        XCTAssertTrue(KnownHosts(file: file).knowsHeadset(7))
+        XCTAssertTrue(KnownHosts(file: file).hasPlayForDreamModels(7))
+        XCTAssertFalse(KnownHosts(file: file).hasPlayForDreamModels(UInt64.max))
         KnownHosts(file: file).set(7, knowsHeadset: false)
         XCTAssertFalse(KnownHosts(file: file).knowsHeadset(7))
+        XCTAssertTrue(KnownHosts(file: file).hasPlayForDreamModels(7))
+        // Older hosts.json files without playForDreamModels still decode cleanly.
+        try? Data(#"{"9":{"knowsHeadset":true}}"#.utf8).write(to: file)
+        XCTAssertTrue(KnownHosts(file: file).knowsHeadset(9))
+        XCTAssertFalse(KnownHosts(file: file).hasPlayForDreamModels(9))
     }
 
     func testTheClientAnnouncesItselfWithAnAdvancingHeartbeat() {

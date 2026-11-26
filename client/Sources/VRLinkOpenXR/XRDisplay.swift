@@ -54,7 +54,26 @@ public final class XRDisplay<Graphics: XRGraphics> {
     private let session: XrSession
     private var space: XrSpace?
     private var headSpace: XrSpace?
+    /// Per-eye base swapchains, followed by the two sharp-layer swapchains when enabled.
     private var swapchains: [XRSwapchain] = []
+    private var hasSharpLayer: Bool { swapchains.count == 4 }
+    private let eyeDetail: Float
+    /// Host-requested refresh rate and active thermal refresh-rate cap. Guarded by `lock`.
+    private var wantedHz: Float?, heatCapHz: Float?
+    /// Display refreshes per video frame (2 during half-rate thermal throttling, 1 otherwise). Guarded by `lock`.
+    private var picturesEvery = 1
+    /// Highest reported `XR_EXT_performance_settings` thermal level (0 normal, 25 warning, 75 impaired) and timestamp of its onset.
+    private var heat: Int32 = 0, heatSince: UInt64 = 0, heatChecked: UInt64 = 0
+    private var heatByDomain: [UInt32: Int32] = [:]
+    private let sustainedPerformance: Bool
+    private let compositorPlacesLayers: Bool
+    /// Active `XR_FB_passthrough` instance and layer handle when passthrough uses a composition layer.
+    private var passthrough: XrPassthroughFB?, passthroughLayer: XrPassthroughLayerFB?
+    private var passthroughRunning = false
+    private var sharpShown = false
+    /// Previously rendered projection views cached for resubmission on display refreshes with no new video frame.
+    private var drawnFor: (eyes: [XrCompositionLayerProjectionView], sharp: [XrCompositionLayerProjectionView], sharpAlone: Bool,
+                           key: ChromaKey?, transparent: Bool)?
     private var recommended: (width: Int, height: Int) = (0, 0)
     private var blendModes: [XrEnvironmentBlendMode] = []
     private var refreshRates: [Float] = []
@@ -67,7 +86,8 @@ public final class XRDisplay<Graphics: XRGraphics> {
     private var described = false
     private var latestDisplayTime: XrTime = 0
     private var pace = FramePace()
-    private var face: XRFace?
+    private var face: (any FaceSource)?
+    private let tracking: TrackingThread
     /// Whether face tracking is active for this session.
     public var tracksFace: Bool { face != nil }
     /// Latest face expression weights, or `nil` when face tracking is unavailable or untracked. Thread-safe.
@@ -82,8 +102,22 @@ public final class XRDisplay<Graphics: XRGraphics> {
     /// Timestamp (`XrTime`) at which a pending reference-space change takes effect.
     private var spaceChangesAt: XrTime?
 
+    /// - Parameters:
+    ///   - sharpLayerPixels: Width and height in pixels of a secondary swapchain per eye used to submit the
+    ///     stream's high-density region (`FrameLayout.Sharp`) on its own projection layer, or 0 to disable.
+    ///   - eyeDetail: Ratio of the display's center pixel density to the recommended eye swapchain size,
+    ///     reported to foveating hosts (`DeviceProfile.detailEyePixels`) when the sharp layer is enabled.
+    ///   - compositorPlacesLayers: Whether the runtime honors per-layer poses and fields of view
+    ///     (`HeadsetQuirks.compositorPlacesLayers`). When false, the sharp layer and frame reuse are disabled.
+    ///   - passthroughLayer: Prefer an `XR_FB_passthrough` layer over alpha-blend environment mode.
+    ///   - colorSpace: Color space declared via `XR_FB_color_space` (`rec709`, `rec2020`, `p3`, or `unmanaged`).
     public init(applicationName: String, graphics: Graphics, frames: DisplayQueue<Graphics.Frame>, panel: XRPanelLayer? = nil,
-                process: XRProcess = XRProcess(), log: @escaping (String) -> Void) throws {
+                process: XRProcess = XRProcess(), sharpLayerPixels: Int = 0, eyeDetail: Float = 1,
+                sustainedPerformance: Bool = true, compositorPlacesLayers: Bool = true, passthroughLayer: Bool = false,
+                colorSpace: String = "rec709", log: @escaping (String) -> Void) throws {
+        self.eyeDetail = eyeDetail
+        self.compositorPlacesLayers = compositorPlacesLayers
+        self.sustainedPerformance = sustainedPerformance
         self.graphics = graphics
         self.panel = panel
         self.frames = frames
@@ -107,6 +141,13 @@ public final class XRDisplay<Graphics: XRGraphics> {
         guard let made else { throw XRFailure.call("xrCreateSession", XR_ERROR_RUNTIME_FAILURE) }
         session = made
 
+        // Declare the stream's sRGB/Rec.709 color primaries so wide-gamut displays do not oversaturate colors.
+        let spaces = ["rec709": XR_COLOR_SPACE_REC709_FB, "rec2020": XR_COLOR_SPACE_REC2020_FB, "p3": XR_COLOR_SPACE_P3_FB]
+        if instance.extensions.contains("XR_FB_color_space"), let set = calls.setColorSpace, let space = spaces[colorSpace] {
+            let result = set(made, space)
+            log("openxr: color space set to \(colorSpace)" + (result.rawValue < 0 ? " refused (\(XRFailure.name(of: result)))" : ""))
+        }
+
         // Prefer STAGE for guardian bounds and floor height, falling back to LOCAL_FLOOR and then LOCAL.
         var count: UInt32 = 0
         try check(calls.enumerateReferenceSpaces(made, 0, &count, nil), "xrEnumerateReferenceSpaces")
@@ -128,7 +169,8 @@ public final class XRDisplay<Graphics: XRGraphics> {
         log("openxr: tracking in the \(origin.rawValue) space")
 
         input = try XRInput(instance: instance, session: made, log: log)
-        face = XRFace(instance: instance, session: made, log: log)
+        face = makeFaceSource(instance: instance, session: made, log: log)
+        tracking = TrackingThread(input: input, face: face)
 
         let stereo = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO
         try check(calls.enumerateViewConfigurationViews(instance.handle, instance.system, stereo, 0, &count, nil),
@@ -162,6 +204,29 @@ public final class XRDisplay<Graphics: XRGraphics> {
             guard let swapchain else { throw XRFailure.call("xrCreateSwapchain", XR_ERROR_RUNTIME_FAILURE) }
             swapchains.append(XRSwapchain(handle: swapchain, format: format, width: Int(info.width), height: Int(info.height)))
         }
+        // The sharp layer's swapchains come after the eyes' so a draw's `eye` index picks either.
+        let sharpSide = !compositorPlacesLayers ? 0 : min(sharpLayerPixels, Int(min(views[0].maxImageRectWidth, views[0].maxImageRectHeight)))
+        if sharpSide >= 256 {
+            for _ in views {
+                var info = XrSwapchainCreateInfo()
+                info.type = XR_TYPE_SWAPCHAIN_CREATE_INFO
+                info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT
+                info.format = format
+                info.sampleCount = 1
+                info.width = UInt32(sharpSide)
+                info.height = UInt32(sharpSide)
+                info.faceCount = 1
+                info.arraySize = 1
+                info.mipCount = 1
+                var swapchain: XrSwapchain?
+                guard calls.createSwapchain(made, &info, &swapchain).rawValue >= 0, let swapchain else {
+                    log("openxr: no swapchain for the sharp layer; drawing each eye on one layer")
+                    swapchains.removeLast(swapchains.count - 2)
+                    break
+                }
+                swapchains.append(XRSwapchain(handle: swapchain, format: format, width: sharpSide, height: sharpSide))
+            }
+        }
         try graphics.adopt(swapchains, instance: instance)
         if let panel {
             if let panelFormat = graphics.choosePanelFormat(among: formats) {
@@ -186,7 +251,9 @@ public final class XRDisplay<Graphics: XRGraphics> {
                 log("openxr: no swapchain format for the panel (offered: \(formats)); it will not be shown")
             }
         }
-        log("openxr: drawing \(recommended.width) x \(recommended.height) per eye in format \(format)")
+        log("openxr: drawing \(recommended.width) x \(recommended.height) per eye in format \(format) (at most "
+            + "\(views[0].maxImageRectWidth) x \(views[0].maxImageRectHeight))"
+            + (hasSharpLayer ? ", and the stream's sharpest part again at \(sharpSide) x \(sharpSide)" : ""))
 
         try check(calls.enumerateEnvironmentBlendModes(instance.handle, instance.system, stereo, 0, &count, nil),
                   "xrEnumerateEnvironmentBlendModes")
@@ -199,18 +266,54 @@ public final class XRDisplay<Graphics: XRGraphics> {
             var rates = [Float](repeating: 0, count: Int(count))
             if enumerate(made, count, &count, &rates).rawValue >= 0 { refreshRates = rates }
         }
+
+        // Create an XR_FB_passthrough layer when alpha-blend environment mode is unavailable or overridden by passthroughLayer.
+        if instance.extensions.contains("XR_FB_passthrough"), passthroughLayer || !blendModes.contains(XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND),
+           let create = calls.createPassthrough, let createLayer = calls.createPassthroughLayer {
+            var info = XrPassthroughCreateInfoFB()
+            info.type = XR_TYPE_PASSTHROUGH_CREATE_INFO_FB
+            var result = create(made, &info, &passthrough)
+            if result.rawValue >= 0, let passthrough {
+                var layerInfo = XrPassthroughLayerCreateInfoFB()
+                layerInfo.type = XR_TYPE_PASSTHROUGH_LAYER_CREATE_INFO_FB
+                layerInfo.passthrough = passthrough
+                layerInfo.flags = XR_PASSTHROUGH_IS_RUNNING_AT_CREATION_BIT_FB
+                layerInfo.purpose = XR_PASSTHROUGH_LAYER_PURPOSE_RECONSTRUCTION_FB
+                result = createLayer(made, &layerInfo, &self.passthroughLayer)
+            }
+            if result.rawValue < 0 || self.passthroughLayer == nil {
+                log("openxr: no passthrough layer (\(XRFailure.name(of: result)))")
+                if let passthrough { _ = calls.destroyPassthrough?(passthrough) }
+                passthrough = nil
+                self.passthroughLayer = nil
+            } else {
+                log("openxr: using XR_FB_passthrough layer for passthrough")
+            }
+        }
+    }
+
+    /// Starts or pauses passthrough camera capture to match frame transparency.
+    private func runPassthrough(_ wanted: Bool) {
+        guard let passthrough, wanted != passthroughRunning else { return }
+        // Explicitly call xrPassthroughStartFB because the YVR runtime ignores XR_PASSTHROUGH_IS_RUNNING_AT_CREATION_BIT_FB.
+        let result = wanted ? instance.calls.passthroughStart?(passthrough) : instance.calls.passthroughPause?(passthrough)
+        passthroughRunning = wanted
+        if let result, result.rawValue < 0 { log("openxr: could not \(wanted ? "start" : "pause") passthrough (\(XRFailure.name(of: result)))") }
     }
 
     deinit {
+        tracking.stop()
         let calls = instance.calls
         for swapchain in swapchains + [panel?.swapchain].compactMap({ $0 }) { _ = calls.destroySwapchain(swapchain.handle) }
+        if let passthroughLayer { _ = calls.destroyPassthroughLayer?(passthroughLayer) }
+        if let passthrough { _ = calls.destroyPassthrough?(passthrough) }
         for space in [space, headSpace] { if let space { _ = calls.destroySpace(space) } }
         _ = calls.destroySession(session)
     }
 
     /// Whether the headset supports `XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND` passthrough, required for chroma
     /// keying and alpha-blended streams.
-    public var canShowRoom: Bool { blendModes.contains(XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND) }
+    public var canShowRoom: Bool { passthroughLayer != nil || blendModes.contains(XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND) }
 
     /// Requests that the OpenXR session exit, causing `run()` to return once shutdown completes. Thread-safe.
     public func quit() {
@@ -221,9 +324,87 @@ public final class XRDisplay<Graphics: XRGraphics> {
 
     /// Requests a display refresh rate of `hz` when `XR_FB_display_refresh_rate` supports it. Thread-safe.
     public func requestRefreshRate(_ hz: Float) {
-        guard let request = instance.calls.requestDisplayRefreshRate, refreshRates.contains(hz) else { return }
-        _ = request(session, hz)
+        guard refreshRates.contains(hz) else { return }
+        lock.lock()
+        // Ignore host rate requests while thermal throttling restricts the advertised rate list.
+        if heatCapHz == nil { wantedHz = hz }
+        lock.unlock()
+        applyRefreshRate()
     }
+
+    /// Applies `wantedHz` clamped to any active thermal refresh-rate cap.
+    private func applyRefreshRate() {
+        guard let request = instance.calls.requestDisplayRefreshRate else { return }
+        lock.lock()
+        let wanted = wantedHz, cap = heatCapHz
+        lock.unlock()
+        guard let top = wanted ?? refreshRates.max() else { return }
+        let steps = rateSteps
+        guard let step = steps.filter({ $0.shown <= min(top, cap ?? top) + 0.5 }).max(by: { $0.shown < $1.shown })
+                ?? steps.min(by: { $0.shown < $1.shown }) else { return }
+        _ = request(session, step.display)
+        lock.lock()
+        let changed = picturesEvery != step.every
+        picturesEvery = step.every
+        lock.unlock()
+        if changed { log("openxr: asking the host for a picture every \(step.every == 1 ? "frame" : "\(step.every) frames") (\(step.shown) a second)") }
+    }
+
+    /// Available target frame rates sorted highest-first: all native display refresh rates, plus half of the
+    /// lowest native refresh rate (keeping the display at its lowest rate and requesting a video frame every
+    /// second refresh).
+    ///
+    /// Half-rates of higher refresh rates (such as 45 fps at 90 Hz or 36 fps at 72 Hz) are omitted because
+    /// reaching them from 60 Hz increases display clocks while hot and triggers extra host encoder resets.
+    private var rateSteps: [(shown: Float, display: Float, every: Int)] {
+        guard let slowest = refreshRates.min() else { return [] }
+        return (refreshRates.map { (shown: $0, display: $0, every: 1) } + [(shown: slowest / 2, display: slowest, every: 2)])
+            .sorted { $0.shown > $1.shown }
+    }
+
+    /// Steps the refresh rate down while `XR_EXT_performance_settings` reports thermal impairment (`75`), and
+    /// steps it back up once thermal state returns to normal (`0`).
+    private func followHeat(at now: UInt64) {
+        guard refreshRates.count > 1, now >= heatChecked + 1_000_000_000 else { return }
+        heatChecked = now
+        lock.lock()
+        let holding = heatCapHz
+        lock.unlock()
+        // Re-apply the cap once per second so newly connected sessions pick up an active thermal cap.
+        streamingSession()?.holdRefreshRates(to: holding)
+        let seconds = Double(now - heatSince) / 1e9
+        lock.lock()
+        let cap = heatCapHz, wanted = wantedHz
+        lock.unlock()
+        var hz: Float = 0
+        _ = instance.calls.getDisplayRefreshRate?(session, &hz)
+        let current = cap ?? (hz > 0 ? hz : wanted ?? refreshRates.max() ?? 0)
+        let rates = rateSteps.map(\.shown)
+        var next = cap
+        if heat >= 75, seconds >= (cap == nil ? 3 : XRDisplay.heatStep), let lower = rates.filter({ $0 < current - 0.5 }).max() {
+            next = lower
+        } else if heat < 25, seconds >= XRDisplay.heatStep, let cap {
+            let higher = rates.filter { $0 > cap + 0.5 }.min()
+            next = higher.flatMap { $0 >= (wanted ?? refreshRates.max() ?? $0) - 0.5 ? nil : $0 }
+        } else {
+            return
+        }
+        guard next != cap else { return }
+        heatSince = now
+        lock.lock()
+        // Record the baseline refresh rate before throttling so we can restore it once temperatures drop.
+        if wantedHz == nil, hz > 0 { wantedHz = hz }
+        heatCapHz = next
+        lock.unlock()
+        // Update the session's advertised rate list before changing the frame interval so the host does not
+        // immediately re-request the previous rate.
+        streamingSession()?.holdRefreshRates(to: next)
+        log(next.map { "openxr: heat level \(heat); holding the stream to \($0) pictures a second" } ?? "openxr: heat back to normal; rate no longer held down")
+        applyRefreshRate()
+    }
+
+    /// Interval in seconds between thermal refresh-rate adjustments.
+    static var heatStep: Double { 30 }
 
     /// Returns the four corners of the stage play-area rectangle when using `.stage` with valid bounds.
     public func boundary() -> [Point2] {
@@ -271,6 +452,36 @@ public final class XRDisplay<Graphics: XRGraphics> {
                 let change = withUnsafeBytes(of: &event) { $0.load(as: XrEventDataReferenceSpaceChangePending.self) }
                 log("openxr: \(origin.rawValue) reference space change pending")
                 spaceChangesAt = max(spaceChangesAt ?? 0, change.changeTime)
+            case XR_TYPE_EVENT_DATA_RECOMMENDED_RESOLUTION_CHANGED_ANDROID:
+                // Log Android XR's dynamic swapchain resolution recommendation (allocated swapchains keep their initial size).
+                var count: UInt32 = 0
+                var blank = XrViewConfigurationView()
+                blank.type = XR_TYPE_VIEW_CONFIGURATION_VIEW
+                var views = [XrViewConfigurationView](repeating: blank, count: 2)
+                if calls.enumerateViewConfigurationViews(instance.handle, instance.system, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                                                         2, &count, &views).rawValue >= 0 {
+                    log("openxr: the system now suggests \(views[0].recommendedImageRectWidth) x \(views[0].recommendedImageRectHeight) per eye"
+                        + " (drawing \(recommended.width) x \(recommended.height))")
+                }
+            case XR_TYPE_EVENT_DATA_PERF_SETTINGS_EXT:
+                // Log CPU/GPU performance and thermal state transitions (0 normal, 25 warning, 75 impaired).
+                let change = withUnsafeBytes(of: &event) { $0.load(as: XrEventDataPerfSettingsEXT.self) }
+                let part = change.domain == XR_PERF_SETTINGS_DOMAIN_GPU_EXT ? "GPU" : "CPU"
+                let what: String
+                switch change.subDomain {
+                case XR_PERF_SETTINGS_SUB_DOMAIN_COMPOSITING_EXT: what = "compositing"
+                case XR_PERF_SETTINGS_SUB_DOMAIN_RENDERING_EXT: what = "rendering"
+                default: what = "heat"
+                }
+                log("openxr: \(part) \(what) went from level \(change.fromLevel.rawValue) to \(change.toLevel.rawValue) (0 normal, 25 warning, 75 impaired)")
+                if change.subDomain == XR_PERF_SETTINGS_SUB_DOMAIN_THERMAL_EXT {
+                    heatByDomain[change.domain.rawValue] = Int32(change.toLevel.rawValue)
+                    let worst = heatByDomain.values.max() ?? 0
+                    if worst != heat {
+                        heat = worst
+                        heatSince = Uptime.nanoseconds
+                    }
+                }
             case XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB:
                 let change = withUnsafeBytes(of: &event) { $0.load(as: XrEventDataDisplayRefreshRateChangedFB.self) }
                 log("openxr: display refresh rate changed from \(change.fromDisplayRefreshRate) to \(change.toDisplayRefreshRate) Hz")
@@ -291,10 +502,19 @@ public final class XRDisplay<Graphics: XRGraphics> {
             running = true
             measured = false
             log("openxr: session started")
+            // Request sustained high CPU and GPU clock levels rather than default power-saving clocks.
+            if sustainedPerformance, let setLevel = calls.setPerformanceLevel {
+                for domain in [XR_PERF_SETTINGS_DOMAIN_CPU_EXT, XR_PERF_SETTINGS_DOMAIN_GPU_EXT] {
+                    let result = setLevel(session, domain, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT)
+                    if result.rawValue < 0 { log("openxr: could not set the performance level (XrResult \(result.rawValue))") }
+                }
+            }
         case XR_SESSION_STATE_STOPPING:
             running = false
             onPaused?()
-            try check(calls.endSession(session), "xrEndSession")
+            // Wait for any in-flight tracking poll to finish before ending the OpenXR session.
+            runPassthrough(false)
+            _ = try tracking.whileIdle { try check(calls.endSession(session), "xrEndSession") }
             log("openxr: session stopped")
         case XR_SESSION_STATE_EXITING, XR_SESSION_STATE_LOSS_PENDING:
             if running { onPaused?() }
@@ -335,6 +555,11 @@ public final class XRDisplay<Graphics: XRGraphics> {
         profile.eyesInHead = turned.map { Pose(position: $0.position, right: Vec3(1, 0, 0), up: Vec3(0, 1, 0), forward: Vec3(0, 0, -1)) }
         profile.eyeFrusta = zip(views, turned).map { Frustum($0.fov).enclosing(turnedAs: $1) }
         profile.eyePixels = recommended
+        if hasSharpLayer, eyeDetail > 1 {
+            // Round dimensions to multiples of 32 pixels for hardware video encoders.
+            func finer(_ side: Int) -> Int { Int((Float(side) * eyeDetail / 32).rounded()) * 32 }
+            profile.detailEyePixels = (finer(recommended.width), finer(recommended.height))
+        }
         var hz: Float = 0
         if let current = instance.calls.getDisplayRefreshRate, current(session, &hz).rawValue >= 0, hz > 0 {
             profile.refreshHz = hz
@@ -372,8 +597,9 @@ public final class XRDisplay<Graphics: XRGraphics> {
         let period = timing.predictedDisplayPeriod > 0 ? Double(timing.predictedDisplayPeriod) / 1e9 : 1.0 / 90
         latestDisplayTime = time
 
-        if let space { input.update(at: time, in: space) }
-        face?.update(at: time)
+        // Poll controllers, hands, eye gaze, and face on TrackingThread (~10 ms via IPC on Android XR) so input
+        // queries do not stall the render loop.
+        if let space { tracking.sample(at: time, in: space) }
         if let changes = spaceChangesAt, time >= changes {
             spaceChangesAt = nil
             // Reset the panel pose so it is placed in front of the user in the updated reference space.
@@ -384,16 +610,31 @@ public final class XRDisplay<Graphics: XRGraphics> {
             measured = true
             onReady?(profile)
         }
+        // Record per-stage pre-draw timings for FramePace.
+        var stepBegan = Uptime.nanoseconds
+        pace.note("tracking", stepBegan - waited)
+        func stepDone(_ name: String) {
+            let now = Uptime.nanoseconds
+            pace.note(name, now - stepBegan)
+            stepBegan = now
+        }
 
+        followHeat(at: waited)
         let picked = frames.next()
         if let stream = streamingSession() {
             // Fall back to one refresh period ahead when XR_KHR_convert_timespec_time is unavailable.
             let shown = uptime(of: time) ?? Uptime.nanoseconds + UInt64(period * 1e9)
-            stream.displayRefreshes(at: shown + UInt64(period * 1e9), period: period)
+            // At a half rate the host is told a frame lasts two of the display's.
+            lock.lock()
+            let every = picturesEvery
+            lock.unlock()
+            stream.displayRefreshes(at: shown + UInt64(period * 1e9), period: period * Double(every))
             if let picked, picked.isNew { stream.frameShown(picked.frame.frameID, at: shown) }
         }
 
+        stepDone("picking a picture")
         let field = followDepth(picked)
+        stepDone("depth")
         let key = chromaKey()
         if graphics.chromaKey != key { graphics.chromaKey = key }
         let frame = picked?.frame
@@ -401,7 +642,10 @@ public final class XRDisplay<Graphics: XRGraphics> {
         // Use alpha blending for passthrough when the stream is transparent and the headset supports it;
         // otherwise use the runtime's preferred blend mode.
         let alphaBlend = XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
-        let blend = transparent && blendModes.contains(alphaBlend) ? alphaBlend : (blendModes.first ?? XR_ENVIRONMENT_BLEND_MODE_OPAQUE)
+        let opaque = blendModes.contains(XR_ENVIRONMENT_BLEND_MODE_OPAQUE) ? XR_ENVIRONMENT_BLEND_MODE_OPAQUE : blendModes.first
+        let blend = passthroughLayer != nil ? (opaque ?? XR_ENVIRONMENT_BLEND_MODE_OPAQUE)
+            : transparent && blendModes.contains(alphaBlend) ? alphaBlend : (blendModes.first ?? XR_ENVIRONMENT_BLEND_MODE_OPAQUE)
+        runPassthrough(transparent && timing.shouldRender != 0)
 
         var end = XrFrameEndInfo()
         end.type = XR_TYPE_FRAME_END_INFO
@@ -414,9 +658,32 @@ public final class XRDisplay<Graphics: XRGraphics> {
             return
         }
 
+        stepDone("panel and views")
         var draws: [XREyeDraw] = []
         var projected: [XrCompositionLayerProjectionView] = []
-        for eye in Eye.allCases {
+        var sharpProjected: [XrCompositionLayerProjectionView] = []
+        // Whether the sharp layer renders a standalone alpha-feathered tile over a transparent background.
+        var sharpAlone = true
+        var acquired: [XRSwapchain] = []
+        // Reuse the previous frame's swapchain images and render poses when no new video frame has arrived,
+        // letting the OpenXR compositor reproject them to the current head pose.
+        let reuse = compositorPlacesLayers && picked?.isNew == false && drawnFor != nil && field.show == nil
+            && drawnFor?.key == key && drawnFor?.transparent == transparent
+        if reuse {
+            projected = drawnFor?.eyes ?? []
+            sharpProjected = drawnFor?.sharp ?? []
+            sharpAlone = drawnFor?.sharpAlone ?? true
+            pace.note("share of frames handed over undrawn", 1_000_000)   // averages to a fraction, not milliseconds
+        }
+        let eyeViews = Eye.allCases.map { EyeView(eye: Pose(views[$0.rawValue].pose), frustum: Frustum(views[$0.rawValue].fov)) }
+        // Compute per-eye sharp-layer frusta (enabled for both eyes together or neither).
+        var sharp: [Frustum] = []
+        if !reuse, hasSharpLayer, let frame {
+            sharp = Eye.allCases.compactMap { Composition.sharpFrustum(for: $0, layout: frame.layout, from: eyeViews[$0.rawValue]) }
+            if sharp.count != 2 { sharp = [] }
+        }
+        var allQuads: [[Quad]] = []
+        for eye in (reuse ? [] : Eye.allCases) {
             let swapchain = swapchains[eye.rawValue]
             var image: UInt32 = 0
             try check(calls.acquireSwapchainImage(swapchain.handle, nil, &image), "xrAcquireSwapchainImage")
@@ -425,28 +692,92 @@ public final class XRDisplay<Graphics: XRGraphics> {
             wait.timeout = XR_INFINITE_DURATION
             try check(calls.waitSwapchainImage(swapchain.handle, &wait), "xrWaitSwapchainImage")
 
-            let view = EyeView(eye: Pose(views[eye.rawValue].pose), frustum: Frustum(views[eye.rawValue].fov))
+            stepDone("swapchain images")
+            let view = eyeViews[eye.rawValue]
             var quads: [Quad] = []
             if let frame {
                 quads = Composition.quads(for: eye, layout: frame.layout, depth: field.use)
                 if let shown = field.show { quads += Composition.picture(of: shown, for: eye, layout: frame.layout) }
             }
-            draws.append(XREyeDraw(eye: eye.rawValue, image: Int(image), view: view, quads: quads))
+            allQuads.append(quads)
+            // When the sharp layer draws a standalone foveal tile, omit that tile from the base eye layer and
+            // render the base layer into a sub-rect sized to 1.25x the peripheral tile dimensions.
+            var size: (width: Int, height: Int)?
+            if !sharp.isEmpty, let region = frame?.layout.views[eye.rawValue].sharp, let tile = region.tile, let rest = region.rest,
+               quads.indices.contains(tile), field.show == nil {
+                quads.remove(at: tile)
+                size = (min(swapchain.width, max(256, rest.width * 5 / 4)), min(swapchain.height, max(256, rest.height * 5 / 4)))
+            }
+            draws.append(XREyeDraw(eye: eye.rawValue, image: Int(image), view: view, quads: quads, size: size))
+            stepDone("quads")
             var layerView = XrCompositionLayerProjectionView()
             layerView.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW
             layerView.pose = views[eye.rawValue].pose
             layerView.fov = views[eye.rawValue].fov
             layerView.subImage.swapchain = swapchain.handle
-            layerView.subImage.imageRect.extent = XrExtent2Di(width: Int32(swapchain.width), height: Int32(swapchain.height))
+            layerView.subImage.imageRect.extent = XrExtent2Di(width: Int32(size?.width ?? swapchain.width),
+                                                              height: Int32(size?.height ?? swapchain.height))
             projected.append(layerView)
+            acquired.append(swapchain)
         }
+        // Render the high-density region into the sharp-layer swapchains through its enclosing sub-frustum.
+        if !reuse, hasSharpLayer, let frame {
+            if sharp.count == 2 {
+                for eye in Eye.allCases {
+                    let swapchain = swapchains[2 + eye.rawValue]
+                    var image: UInt32 = 0
+                    try check(calls.acquireSwapchainImage(swapchain.handle, nil, &image), "xrAcquireSwapchainImage(sharp)")
+                    var wait = XrSwapchainImageWaitInfo()
+                    wait.type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO
+                    wait.timeout = XR_INFINITE_DURATION
+                    try check(calls.waitSwapchainImage(swapchain.handle, &wait), "xrWaitSwapchainImage(sharp)")
+                    acquired.append(swapchain)
+                    let window = sharp[eye.rawValue]
+                    // Clamp to the source region's pixel size; when a single tile covers the region, draw only
+                    // that tile onto a transparent attachment so its feathered border blends over the base layer.
+                    let region = frame.layout.views[eye.rawValue].sharp
+                    let size = (width: min(swapchain.width, max(64, region?.width ?? swapchain.width)),
+                                height: min(swapchain.height, max(64, region?.height ?? swapchain.height)))
+                    var quads = allQuads[eye.rawValue]
+                    if let tile = region?.tile, quads.indices.contains(tile) { quads = [quads[tile]] } else { sharpAlone = false }
+                    draws.append(XREyeDraw(eye: 2 + eye.rawValue, image: Int(image),
+                                           view: EyeView(eye: draws[eye.rawValue].view.eye, frustum: window), quads: quads,
+                                           size: size, clear: region?.tile != nil))
+                    var layerView = projected[eye.rawValue]
+                    layerView.fov = XrFovf(angleLeft: atan(window.left), angleRight: atan(window.right),
+                                           angleUp: atan(window.up), angleDown: atan(window.down))
+                    layerView.subImage.swapchain = swapchain.handle
+                    layerView.subImage.imageRect.extent = XrExtent2Di(width: Int32(size.width), height: Int32(size.height))
+                    sharpProjected.append(layerView)
+                }
+            }
+            if sharpShown != (sharp.count == 2) {
+                sharpShown = sharp.count == 2
+                if sharpShown, let first = frame.layout.views.first?.sharp {
+                    let window = sharp[0]
+                    log(String(format: "openxr: sharp layer on: the stream's densest part is %d x %d pixels over %.1f x %.1f degrees, "
+                               + "%.0f pixels per degree against the eye layer's %.0f",
+                               first.width, first.height,
+                               (atan(window.right) - atan(window.left)) * 180 / .pi, (atan(window.up) - atan(window.down)) * 180 / .pi,
+                               Float(first.width) / ((atan(first.frustum.right) - atan(first.frustum.left)) * 180 / .pi),
+                               Float(recommended.width) / ((atan(draws[0].view.frustum.right) - atan(draws[0].view.frustum.left)) * 180 / .pi)))
+                } else {
+                    log("openxr: sharp layer off: the stream has no denser part in view")
+                }
+            }
+        }
+        stepDone("swapchain images")
         let drawBegan = Uptime.nanoseconds
-        graphics.draw(draws, frame: frame, transparent: transparent)
+        if !reuse {
+            graphics.draw(draws, frame: frame, transparent: transparent)
+            pace.note("waiting for the GPU", graphics.lastGPUWait)
+            drawnFor = frame == nil ? nil : (projected, sharpProjected, sharpAlone, key, transparent)
+        }
         let drawn = Uptime.nanoseconds
-        for swapchain in swapchains {
+        for swapchain in acquired {
             try check(calls.releaseSwapchainImage(swapchain.handle, nil), "xrReleaseSwapchainImage")
         }
-        if !described {
+        if !described, !draws.isEmpty {
             described = true
             let eye = draws[0].view.eye
             log(String(format: "openxr: first frame, left eye at (%.2f, %.2f, %.2f) m looking (%.2f, %.2f, %.2f), blend mode %d",
@@ -458,12 +789,29 @@ public final class XRDisplay<Graphics: XRGraphics> {
         layer.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION
         layer.space = space
         if transparent { layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT }
+        var room = XrCompositionLayerPassthroughFB()
+        room.type = XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB
+        room.flags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
+        room.layerHandle = passthroughLayer
+        var sharpLayer = layer
+        if sharpAlone { sharpLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT }
         try projected.withUnsafeBufferPointer { views in
             layer.viewCount = UInt32(views.count)
             layer.views = views.baseAddress
+            try sharpProjected.withUnsafeBufferPointer { sharpViews in
+            sharpLayer.viewCount = UInt32(sharpViews.count)
+            sharpLayer.views = sharpViews.baseAddress
+            try withUnsafeBytes(of: &sharpLayer) { sharpBytes in
             try withUnsafeBytes(of: &layer) { bytes in
                 try withUnsafeBytes(of: &quad) { quadBytes in
+                try withUnsafeBytes(of: &room) { roomBytes in
                     var layers = [bytes.baseAddress?.assumingMemoryBound(to: XrCompositionLayerBaseHeader.self)]
+                    // The room goes under everything, seen wherever the picture over it is see-through.
+                    if passthroughLayer != nil, transparent {
+                        layers.insert(roomBytes.baseAddress?.assumingMemoryBound(to: XrCompositionLayerBaseHeader.self), at: 0)
+                    }
+                    // The sharp layer goes over the eye layer and shows the same picture, only finer.
+                    if !sharpProjected.isEmpty { layers.append(sharpBytes.baseAddress?.assumingMemoryBound(to: XrCompositionLayerBaseHeader.self)) }
                     // Composite the panel quad in front of the projection layer.
                     if panelShown != nil { layers.append(quadBytes.baseAddress?.assumingMemoryBound(to: XrCompositionLayerBaseHeader.self)) }
                     try layers.withUnsafeBufferPointer {
@@ -472,6 +820,9 @@ public final class XRDisplay<Graphics: XRGraphics> {
                         _ = try check(calls.endFrame(session, &end), "xrEndFrame")
                     }
                 }
+                }
+            }
+            }
             }
         }
         if frame != nil {
@@ -584,6 +935,81 @@ public final class XRDisplay<Graphics: XRGraphics> {
     }
 }
 
+/// Polls `XRInput` and `FaceSource` on a dedicated thread using the latest predicted display timestamp.
+///
+/// If a sample takes longer than one frame interval, intermediate timestamps are coalesced so only the newest
+/// requested timestamp runs next without blocking the render loop.
+final class TrackingThread: @unchecked Sendable {
+    private let input: XRInput
+    private let face: (any FaceSource)?
+    private let lock = NSLock()
+    /// Held while a sample is being taken.
+    private let busy = NSLock()
+    private let wake = DispatchSemaphore(value: 0)
+    private var wanted: (time: XrTime, space: XrSpace)?
+    private var started = false, stopped = false
+
+    init(input: XRInput, face: (any FaceSource)?) {
+        self.input = input
+        self.face = face
+    }
+
+    /// Asks for a sample at `time`, replacing any not yet begun.
+    func sample(at time: XrTime, in space: XrSpace) {
+        lock.lock()
+        let waiting = wanted != nil
+        wanted = (time, space)
+        let start = !started
+        started = true
+        lock.unlock()
+        if start {
+            let thread = Thread { [self] in run() }
+            thread.name = "OpenVRLink tracking"
+            thread.qualityOfService = .userInteractive
+            thread.start()
+        }
+        if !waiting { wake.signal() }
+    }
+
+    private func run() {
+        while true {
+            wake.wait()
+            lock.lock()
+            let next = wanted
+            wanted = nil
+            let leave = stopped
+            lock.unlock()
+            if leave { return }
+            guard let next else { continue }
+            busy.lock()
+            input.update(at: next.time, in: next.space)
+            face?.update(at: next.time)
+            busy.unlock()
+        }
+    }
+
+    /// Runs `body` while no sample is being taken.
+    func whileIdle<Result>(_ body: () throws -> Result) rethrows -> Result {
+        lock.lock()
+        wanted = nil
+        lock.unlock()
+        busy.lock()
+        defer { busy.unlock() }
+        return try body()
+    }
+
+    /// Ends the thread, returning once any sample in progress is done.
+    func stop() {
+        lock.lock()
+        stopped = true
+        wanted = nil
+        lock.unlock()
+        wake.signal()
+        busy.lock()
+        busy.unlock()
+    }
+}
+
 /// Accumulates per-stage frame-loop timings during streaming and formats a periodic summary log line.
 struct FramePace {
     static let every = 5.0
@@ -592,6 +1018,12 @@ struct FramePace {
     private var frames = 0, new = 0, late = 0
     private var wait: UInt64 = 0, prepare: UInt64 = 0, draw: UInt64 = 0, end: UInt64 = 0
     private var longestDraw: UInt64 = 0, longestGap: UInt64 = 0
+    private var steps: [String: UInt64] = [:]
+
+    /// Adds `nanoseconds` to the running total of a named step within a frame.
+    mutating func note(_ step: String, _ nanoseconds: UInt64) {
+        steps[step, default: 0] += nanoseconds
+    }
 
     /// Records timing for one displayed frame (in nanoseconds) across `xrWaitFrame`, frame preparation, GPU draw
     /// submission, and `xrEndFrame`.
@@ -618,7 +1050,10 @@ struct FramePace {
                               + "prepared %.1f, drew %.1f (longest %.1f), ended %.1f; longest between frames %.1f ms",
                           Double(frames) / seconds, 1 / period, Double(new) / seconds, each(wait), each(prepare), each(draw),
                           Double(longestDraw) / 1e6, each(end), Double(longestGap) / 1e6)
+        // Steps that average a quarter millisecond or more, longest first.
+        let parts = steps.filter { each($0.value) >= 0.25 }.sorted { $0.value > $1.value }
+            .map { String(format: "%@ %.1f", $0.key, each($0.value)) }.joined(separator: ", ")
         self = FramePace()
-        return line
+        return parts.isEmpty ? line : line + "; of which " + parts
     }
 }

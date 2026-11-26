@@ -121,6 +121,13 @@ final class PanelTests: XCTestCase {
         XCTAssertFalse(panel.update())
         XCTAssertGreaterThan(panel.picture.pixels.filter { $0 != 0 }.count, panel.width * panel.height)
         save(panel.picture, as: "searching")
+        // Enabling quirks adds the Quirks tab and renders saved overrides.
+        panel.quirks = HeadsetQuirks(.playForDream)
+        model.settings.quirkOverrides = ["video_range": "narrow"]
+        XCTAssertTrue(panel.update())
+        panel.quirks = nil
+        model.settings.quirkOverrides = [:]
+        for _ in 0..<4 { panel.update() }
 
         // Discovering hosts triggers a redraw.
         model.finder.onChange?([FoundHost(name: "Deskside", address: "192.168.1.20", kind: .steam),

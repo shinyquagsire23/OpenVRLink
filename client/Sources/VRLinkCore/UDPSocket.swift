@@ -56,6 +56,10 @@ public final class UDPSocket {
         }
         var size: Int32 = 8 << 20   // a keyframe arrives as a burst of several hundred datagrams
         setsockopt(descriptor, SOL_SOCKET, SO_RCVBUF, &size, socklen_t(MemoryLayout<Int32>.size))
+        // Increase SO_SNDBUF from the small system default (~100 packets) so temporary Wi-Fi driver stalls on
+        // headsets like Galaxy XR do not immediately reject outbound packets.
+        var outgoing: Int32 = 4 << 20
+        setsockopt(descriptor, SOL_SOCKET, SO_SNDBUF, &outgoing, socklen_t(MemoryLayout<Int32>.size))
     }
 
     deinit { close(descriptor) }
@@ -109,8 +113,31 @@ public final class UDPSocket {
                 UInt16(bigEndian: bound.sin_port), prefix)
     }
 
-    public func send(_ bytes: Bytes) {
-        _ = systemSend(descriptor, bytes, bytes.count, 0)
+    /// Sends a single datagram non-blockingly and returns `true` if accepted by the kernel. Non-blocking sends
+    /// prevent the session loop from stalling if the outbound socket buffer fills during a link stall.
+    @discardableResult
+    public func send(_ bytes: Bytes) -> Bool {
+        if systemSend(descriptor, bytes, bytes.count, Int32(MSG_DONTWAIT)) == bytes.count { return true }
+        lastSendError = (errno, bytes.count)
+        return false
+    }
+
+    /// Outbound bytes still queued in the kernel socket buffer (`SIOCOUTQ` on Linux/Android), or `nil` if unsupported.
+    public var bytesWaitingToSend: Int? {
+        #if os(Linux) || os(Android)
+        var waiting: Int32 = 0
+        return ioctl(descriptor, 0x5411, &waiting) == 0 ? Int(waiting) : nil      // SIOCOUTQ
+        #else
+        return nil
+        #endif
+    }
+
+    /// `errno` and byte length of the most recent rejected `send`.
+    public private(set) var lastSendError: (code: Int32, size: Int) = (0, 0)
+
+    /// Formatted error description for the most recent rejected `send`.
+    public var lastSendErrorText: String {
+        "\(String(cString: strerror(lastSendError.code))) (error \(lastSendError.code)) on a datagram of \(lastSendError.size) bytes"
     }
 
     public func send(_ bytes: Bytes, host: String, port: UInt16) {

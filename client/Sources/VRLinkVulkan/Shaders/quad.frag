@@ -5,7 +5,8 @@
 // Vulkan fragment shader for VulkanXRGraphics, matching VRLinkMetal's Quad.metal. Compiled twice: once for
 // standard alpha blending and once with -DKEYED for chroma keying via dual-source blending.
 //
-// Both textures use an immutable VkSamplerYcbcrConversion sampler, producing gamma-encoded RGB values.
+// Both textures use an immutable VkSamplerYcbcrConversion sampler. Sampled values are transformed by
+// style.fix0..fix2 (ColorProbe.Treatment.correction) to restore full-range BT.2020 gamma-encoded RGB.
 #version 450
 
 layout(location = 0) in vec2 uv;
@@ -38,7 +39,20 @@ layout(push_constant) uniform Style {
     vec4 fill;
     vec4 keyColor;
     vec2 keyRange;
+    // Non-zero during ColorProbe readback to encode unclamped values as sampled * 0.5 + 0.25 within an 8-bit target.
+    float probe;
+    float unused;
+    // Row-major 3x4 affine matrix applied to (r, g, b, 1) to invert unwanted Y'CbCr sampler range expansion or
+    // matrix conversions.
+    vec4 fix0;
+    vec4 fix1;
+    vec4 fix2;
 } style;
+
+vec3 corrected(vec3 raw) {
+    vec4 from = vec4(raw, 1.0);
+    return vec3(dot(style.fix0, from), dot(style.fix1, from), dot(style.fix2, from));
+}
 
 vec3 linearFromSRGB(vec3 encoded) {
     return mix(encoded / 12.92, pow((encoded + 0.055) / 1.055, vec3(2.4)), greaterThan(encoded, vec3(0.04045)));
@@ -89,7 +103,16 @@ void main() {
 #endif
         return;
     }
-    vec3 sampled = clamp(texture(picture, uv / ahead).rgb, 0.0, 1.0);
+    vec3 sampled = corrected(texture(picture, uv / ahead).rgb);
+    if (style.probe != 0.0) {
+        vec3 kept = clamp(sampled * 0.5 + 0.25, 0.0, 1.0);
+        color = vec4(style.linearTarget != 0.0 ? linearFromSRGB(kept) : kept, 1.0);
+#ifdef KEYED
+        cover = vec4(1.0);
+#endif
+        return;
+    }
+    sampled = clamp(sampled, 0.0, 1.0);
     // Invert the host's v^(1/gamma) transfer adjustment used to preserve shadow detail.
     if (style.gamma > 1.0) {
         sampled = pow(sampled, vec3(style.gamma));
@@ -109,7 +132,7 @@ void main() {
     // Separate alpha streams encode opacity in the red/luma channel with premultiplied RGB in `picture`.
     float opacity = 1.0;
     if (style.hasAlpha != 0.0) {
-        opacity = texture(alphaPicture, alphaUV / ahead).r;
+        opacity = corrected(texture(alphaPicture, alphaUV / ahead).rgb).g;
         if (opacity < 0.02) {
             discard;
         }

@@ -37,7 +37,7 @@ packet captures or static analysis of `vrlink` and `driver_vrlink`.
 | `oxClient` | client | heartbeat: `version * 65536 + tick`, `tick` = milliseconds / 250, low 16 bits |
 | `oxWant` | client | bitmask of features supported by the client |
 | `oxHost` | host | heartbeat, using the same encoding |
-| `oxAvail` | host | bitmask of available host features: bit 0 = encoding gamma (section 2), bit 1 = native OpenVRLink headset settings (section 3) |
+| `oxAvail` | host | bitmask of available host features: bit 0 = encoding gamma (section 2), bit 1 = native OpenVRLink headset settings (section 3), bit 2 = Play For Dream controller models (section 3a) |
 | `oxOn` | host | bitmask of features applied to outgoing frames |
 | `oxGamma` | host | active encoding gamma (`1` when gamma is inactive) |
 
@@ -245,6 +245,39 @@ With the macOS viewer (**live**), the first session recorded support for the
 host and the second session connected under its native model name; this has not
 been verified on a Vision Pro yet.
 
+## 3a. Play For Dream controller models (feature bit 2)
+
+`openvrlink-companion` bundles the Play For Dream MR controller render models
+(`pfd_mr_controller_left` and `pfd_mr_controller_right`, extracted from the
+`vrlink_pfd_mr` resource driver in Play For Dream's "MR SteamLink Driver"
+1.0.1.0 installer and redistributed with Play For Dream's permission) and writes
+them into `driver_openvrlink`'s `resources/rendermodels` directory during
+driver installation. (The `yvr_d1_*` models installed in `SteamVR/drivers/pfd`
+by older Play For Dream software belong to an earlier YVR headset.) Because the
+component JSON files already animate from Oculus Touch input paths
+(`/input/trigger`, `/input/joystick`, `/input/a/click`, `/input/grip`,
+`/input/system/click`), the models require no input remapping.
+
+Installing the driver sets `driver_openvrlink/playForDreamModels` to `true` in
+`default.vrsettings`, and `driver_openvrlink` advertises bit 2 of `oxAvail`
+whenever that key is enabled. As with bit 1, the client publishes controller
+static properties before `oxAvail` arrives, so it caches bit 2 per host in
+`hosts.json` and applies it starting on the next session. When connected to a
+host with bit 2 cached, a Play For Dream headset reports render model
+`{openvrlink}pfd_mr_controller_<side>` with resource root `openvrlink`;
+otherwise it falls back to Quest 2 Touch models. In both cases, the input
+profile and controller type remain `oculus_touch` (**tested**:
+`HostExtensionsTests`, `CompanionKitTests`).
+
+`ControllerState.gripOffset` uses the grip-to-model transform from Play For
+Dream's official SteamVR driver settings. In Play For Dream's setup for stock
+`vrlink`, `driver_vrlink` reads `vrlink_<device>` and
+`vrlink_<device>_controller_left`/`_right` sections (`vrlink_yvr_d3`, matching
+the headset's Android device name), where each controller section can override
+the render model, input profile, controller type, and—when
+`providesOffsetOverride` is true—the client's grip offset (`offsetPosX/Y/Z` in
+meters and `offsetDegX/Y/Z`).
+
 ## 4. Settings
 
 Extension settings use a dedicated `driver_openvrlink` section in
@@ -256,6 +289,7 @@ Extension settings use a dedicated `driver_openvrlink` section in
 | `encodingGammaValue` | user | gamma exponent |
 | `gammaAvailable` | driver | whether `driver_openvrlink` patched `driver_vrlink` for gamma |
 | `status` | driver | one-line patch status summary |
+| `playForDreamModels` | companion (driver defaults) | whether Play For Dream controller render models are installed in `driver_openvrlink` |
 
 By default, `openvrlink-companion install` adds UI controls for these keys to
 SteamVR's VR Link settings tab by editing `driver_vrlink`'s

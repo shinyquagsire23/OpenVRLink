@@ -1,0 +1,146 @@
+{
+    "thumbnail" : "pfd_mr_controller_left.png",
+    "components": {
+        "trigger": {
+            "filename": "pfd_mr_controller_left_trigger.obj",
+            "motion":{
+                "type":"rotate",
+                "controller_axis":1,
+                "controller_axis_component":0,
+                "trigger_path" : "/input/trigger",
+                "value_mapping": [0.0,-5.0],
+                "pivot": [0.0000, 0.012, 0.012],
+                "axis": [1.0, 0.0, 0.0]
+            },
+            "component_local" : {
+                "origin": [0.0155, -0.0328, 0.0299],
+                "rotate_xyz" : [-0.0,-0.0,0.0]
+            }
+        },        
+        "joystick": {
+            "filename": "pfd_mr_controller_left_joystick.obj",
+            "motion":{
+                "type":"joystick",
+                "controller_axis": 0,
+                "component_path" : "/input/joystick",
+                "center": [0.00, -0.0100, 0.030],
+                "rotate_xyz": [0.0, 0.0, 0.0],
+                "joystick_rotation_x": [6.5,-6.5],
+                "joystick_rotation_y": [6.5,-6.5],
+                "press_translate": [0.0, -0.0008, 0.0005]
+            },
+            "component_local" : {
+                "origin": [0.0014, -0.0002, 0.0260],
+                "rotate_xyz" : [0.0,0,0.0]
+            }
+        },
+	"button_x": {
+            "filename": "pfd_mr_controller_left_xbutton.obj",
+            "motion":{
+                "type":"translate",
+                "pressed_path" : "/input/x/click",
+                "controller_button": 2,
+                "value_mapping": [0.0, 0.002],
+                "axis": [0.0, -0.927, 0.375]
+            },
+            "component_local" : {
+                "origin": [0.0155, 0.0031, 0.0455],
+                "rotate_xyz" : [237.0, 0.0, 0.0]
+            }
+        },
+        "button_y": {
+            "filename": "pfd_mr_controller_left_ybutton.obj",
+            "motion":{
+                "type":"translate",
+                "pressed_path" : "/input/y/click",
+                "controller_button": 1,
+                "value_mapping": [0.0, 0.002],
+                "axis": [0.0, -0.927, 0.375]
+            },
+            "component_local" : {
+                "origin": [0.0232, -0.0027, 0.0337],
+                "rotate_xyz" : [237.0, 0.0, 0.0]
+            }
+        },
+        "button_grip": {
+            "filename": "pfd_mr_controller_left_grip.obj",
+            "motion":{
+                "type":"rotate",
+				 "controller_axis":2,
+                "controller_axis_component":0,
+		"trigger_path" : "/input/grip",
+                "controller_button": 2,
+                "value_mapping": [0.0,0.5],
+                "pivot": [0.005, -0.012, 0.00],
+                "axis": [0.0, -1.0, 0.0]
+            },
+            "component_local" : {
+                "origin": [0.0169, -0.0080, 0.0730],
+                "rotate_xyz" : [0.0,0.0,0.0]
+            }
+        },        
+        "sys_button": {
+            "filename": "pfd_mr_controller_left_home.obj",
+            "motion":{
+                "type":"translate",
+                "pressed_path" : "/input/system/click",
+                "controller_button": 0,
+                "value_mapping": [0.0, 0.00075],
+                "axis": [0.0, -1.0, 0.0]
+            },
+            "component_local" : {
+                "origin": [-0.0006, 0.0035, 0.0480],
+                "rotate_xyz" : [94.93,0.0,0.0]
+            }
+        },
+        "body": {
+            "filename": "pfd_mr_controller_left_body.obj",
+            "component_local" : {
+                "origin": [0.00554, -0.00735, 0.139],
+                "rotate_xyz" : [-0.4,-180.0,0.0]
+            }
+        },
+        "base": {
+            "component_local" : {
+                "origin": [0.0, -0.014, 0.174],
+                "rotate_xyz" : [-0.821,-180.0,0.0]
+            }
+        },
+        "gdc2015": {
+            "component_local" : {
+                "origin": [0.0, 0.0, 0.0],
+                "rotate_xyz" : [0.0,0.0,0.0]
+            }
+        },
+        "tip": {
+            "component_local" : {
+                "origin": [0.000, -0.025, 0.000],
+                "rotate_xyz" : [-30.0,-0.0,0.0]
+            }
+        },
+        "front": {
+            "component_local" : {
+                "origin": [0.0, -0.01, -0.007],
+                "rotate_xyz" : [-55,0.0,0.0]
+            }
+        },
+	"openxr_aim": {
+            "component_local" : {
+                "origin": [0.01, -0.02, -0.00],
+                "rotate_xyz" : [-25.6, 0.0, 0.0]
+            }
+        },
+	"openxr_grip": {
+            "component_local" : {
+                "origin": [0.01, 0.00, 0.085],
+                "rotate_xyz" : [20.6, 0.0, 0.0]
+            }
+        },
+        "handgrip": {
+            "component_local" : {
+                "origin": [0.0, 0.003, 0.097],
+                "rotate_xyz" : [5.037,0.0,0.0]
+             }
+        }
+    }  
+}

@@ -121,15 +121,38 @@ public struct FrameLayout {
         }
     }
 
+    /// Highest-density sub-region of a view (such as a Steam foveal tile or WiVRn's uncompressed center band)
+    /// and its encoded pixel dimensions.
+    public struct Sharp {
+        /// Sub-frustum relative to the rendered eye pose.
+        public var frustum: Frustum
+        public var width: Int, height: Int
+        /// Index of a standalone tile covering this region (such as a Steam foveal tile), allowing the sharp
+        /// layer to draw only that tile and alpha-blend its feathered border over the base layer.
+        public var tile: Int?
+        /// Encoded pixel dimensions of the remaining peripheral view when `tile` is drawn on a separate sharp layer.
+        public var rest: (width: Int, height: Int)?
+
+        public init(frustum: Frustum, width: Int, height: Int, tile: Int? = nil, rest: (width: Int, height: Int)? = nil) {
+            self.frustum = frustum
+            self.width = width; self.height = height
+            self.tile = tile
+            self.rest = rest
+        }
+    }
+
     public struct View {
         /// World-space eye pose used by the host when rendering this view.
         public var eye: Pose
         /// Tiles ordered back-to-front.
         public var tiles: [Tile]
+        /// High-density sub-region of this view, if present, for rendering on a secondary sharp layer.
+        public var sharp: Sharp?
 
-        public init(eye: Pose, tiles: [Tile]) {
+        public init(eye: Pose, tiles: [Tile], sharp: Sharp? = nil) {
             self.eye = eye
             self.tiles = tiles
+            self.sharp = sharp
         }
     }
 
@@ -212,6 +235,26 @@ public enum Composition {
             }
         }
         return quads
+    }
+
+    /// Projects the high-density `sharp` region for `eye` (placed at `distance` from the rendered eye pose)
+    /// into the display's `view` frustum, clipping to `view.frustum`, or returns `nil` when absent or mostly
+    /// out of view.
+    public static func sharpFrustum(for eye: Eye, layout: FrameLayout, from view: EyeView) -> Frustum? {
+        guard layout.views.indices.contains(eye.rawValue), let sharp = layout.views[eye.rawValue].sharp else { return nil }
+        var seen = Frustum(left: .infinity, right: -.infinity, down: .infinity, up: -.infinity)
+        for corner in sharp.frustum.corners(from: layout.views[eye.rawValue].eye, distance: distance) {
+            let offset = corner - view.eye.position
+            let ahead = offset.dot(view.eye.forward)
+            guard ahead > 0.01 else { return nil }
+            let across = offset.dot(view.eye.right) / ahead, up = offset.dot(view.eye.up) / ahead
+            seen = Frustum(left: min(seen.left, across), right: max(seen.right, across), down: min(seen.down, up), up: max(seen.up, up))
+        }
+        let cut = Frustum(left: max(seen.left, view.frustum.left), right: min(seen.right, view.frustum.right),
+                          down: max(seen.down, view.frustum.down), up: min(seen.up, view.frustum.up))
+        // Skip the sharp layer if less than one-third of the region remains visible along either axis.
+        guard cut.right - cut.left > (seen.right - seen.left) / 3, cut.up - cut.down > (seen.up - seen.down) / 3 else { return nil }
+        return cut
     }
 
     /// `cell` sets the maximum tangent span per warped mesh cell (~2.3 degrees, roughly

@@ -69,11 +69,25 @@ public final class XRInput {
     /// Supported OpenXR controller interaction profiles, falling back to `khr/simple_controller` for basic
     /// trigger and menu input.
     static let profiles: [Profile] = [
+        Profile("/interaction_profiles/khr/simple_controller", both: poses.merging([
+            .trigger: "input/select/click", .menu: "input/menu/click", .point: "input/aim/pose", .press: "input/select/click",
+        ]) { $1 }),
         Profile("/interaction_profiles/oculus/touch_controller", both: touch, left: touchLeft, right: touchRight),
         Profile("/interaction_profiles/meta/touch_controller_plus", needs: "XR_META_touch_controller_plus",
                 both: touch.filter { $0.key != .restTouch }, left: touchLeft, right: touchRight),
+        Profile("/interaction_profiles/facebook/touch_controller_pro", needs: "XR_FB_touch_controller_pro",
+                both: touch, left: touchLeft, right: touchRight),
         Profile("/interaction_profiles/bytedance/pico4_controller", needs: "XR_BD_controller_interaction",
                 both: touch.filter { $0.key != .restTouch }, left: touchLeft, right: touchRight),
+        Profile("/interaction_profiles/bytedance/pico_neo3_controller", needs: "XR_BD_controller_interaction",
+                both: touch.filter { $0.key != .restTouch }, left: touchLeft, right: touchRight),
+        // Bind button clicks and analog values only; touch paths require a newer revision of XR_HTC_vive_focus3_controller_interaction.
+        Profile("/interaction_profiles/htc/vive_focus3_controller", needs: "XR_HTC_vive_focus3_controller_interaction", both: poses.merging([
+            .stickClick: "input/thumbstick/click", .stick: "input/thumbstick",
+            .trigger: "input/trigger/value", .squeeze: "input/squeeze/value",
+            .point: "input/aim/pose", .press: "input/trigger/value",
+        ]) { $1 }, left: [.lower: "input/x/click", .upper: "input/y/click", .menu: "input/menu/click"],
+                right: [.lower: "input/a/click", .upper: "input/b/click"]),
         Profile("/interaction_profiles/valve/index_controller", both: poses.merging([
             .lower: "input/a/click", .upper: "input/b/click", .lowerTouch: "input/a/touch", .upperTouch: "input/b/touch",
             .stickClick: "input/thumbstick/click", .stickTouch: "input/thumbstick/touch", .stick: "input/thumbstick",
@@ -84,9 +98,24 @@ public final class XRInput {
         Profile("/interaction_profiles/ext/hand_interaction_ext", needs: "XR_EXT_hand_interaction", both: [
             .point: "input/aim/pose", .press: "input/pinch_ext/value",
         ]),
-        Profile("/interaction_profiles/khr/simple_controller", both: poses.merging([
-            .trigger: "input/select/click", .menu: "input/menu/click", .point: "input/aim/pose", .press: "input/select/click",
-        ]) { $1 }),
+        // Suggest /interaction_profiles/yvr/touch_controller last: YVR and Play For Dream runtimes accept every
+        // suggested profile and activate whichever was suggested last, so placing khr/simple_controller last
+        // binds select to the A button and leaves the trigger unbound.
+        Profile("/interaction_profiles/yvr/touch_controller", both: poses.merging([
+            .stickClick: "input/thumbstick/click", .stickTouch: "input/thumbstick/touch", .stick: "input/thumbstick",
+            .trigger: "input/trigger/value", .triggerTouch: "input/trigger/touch", .squeeze: "input/squeeze/click",
+            .point: "input/aim/pose", .press: "input/trigger/value",
+        ]) { $1 }, left: touchLeft, right: touchRight),
+    ]
+
+    /// Maps OpenXR interaction profile paths to `ControllerModel` values (unlisted profiles default to `.touch`).
+    static let models: [String: ControllerModel] = [
+        "/interaction_profiles/oculus/touch_controller": .touch,
+        "/interaction_profiles/facebook/touch_controller_pro": .touchPro,
+        "/interaction_profiles/meta/touch_controller_plus": .touchPlus,
+        "/interaction_profiles/bytedance/pico_neo3_controller": .picoNeo3,
+        "/interaction_profiles/bytedance/pico4_controller": .pico4,
+        "/interaction_profiles/htc/vive_focus3_controller": .viveFocus3,
     ]
 
     /// Polls a platform system button not exposed through OpenXR (such as Android's back button) and maps it to
@@ -96,6 +125,13 @@ public final class XRInput {
     /// Per-hand local grip pose offsets (`[left, right]`) used to align the headset's controller grip with Quest
     /// Touch (`HeadsetQuirks.gripOffset`). Configured before streaming starts.
     public var gripOffsets: [Pose]?
+
+    /// Derive head or controller velocities from finite differences between two predicted poses instead of
+    /// using the runtime's reported velocity vectors (`HeadsetQuirks.headVelocityFromPoses`). Configured before
+    /// streaming starts.
+    public var headVelocityFromPoses = false, controllerVelocityFromPoses = false
+    /// Prediction delta used when computing finite-difference velocities.
+    private static let velocitySpan: XrDuration = 20_000_000
 
     /// Gaze fixation point in head space (+X right, +Y up, +Z back, in meters), or `nil` when eye gaze is
     /// untracked. Thread-safe.
@@ -138,6 +174,12 @@ public final class XRInput {
         public var press: Float
     }
     private var noted: [String] = ["", ""]
+    /// Cached mapping from resolved OpenXR interaction profile `XrPath` handles to `ControllerModel`. Accessed only from `update(at:in:)`.
+    private var modelsByPath: [XrPath: ControllerModel] = [:]
+    /// Joint-based pointer estimators used when the runtime provides no aim action pose for bare hands. Accessed only from `update(at:in:)`.
+    private var handPointers = [HandPointer(), HandPointer()]
+    private var pointsFromJoints = [false, false]
+    private var gripDescribed = [false, false]
 
     init(instance: XRInstance, session: XrSession, log: @escaping (String) -> Void) throws {
         self.instance = instance
@@ -312,6 +354,26 @@ public final class XRInput {
         }
     }
 
+    /// - Parameter fromPoses: When true, computes linear and angular velocity from finite differences between
+    ///   `time` and `time + velocitySpan` instead of using the runtime's reported velocity vectors.
+    private func locate(_ space: XrSpace?, in base: XrSpace, at time: XrTime, velocityFromPoses fromPoses: Bool) -> TrackedPose? {
+        guard var now = locate(space, in: base, at: time) else { return nil }
+        guard fromPoses, let later = locate(space, in: base, at: time + XRInput.velocitySpan)?.pose else { return now }
+        let seconds = Float(XRInput.velocitySpan) / 1e9
+        now.linearVelocity = (later.position - now.pose.position) * (1 / seconds)
+        // Relative rotation from `a` to `b` expressed as a base-space rotation vector divided by `seconds`.
+        let a = now.pose.quaternion, b = later.quaternion
+        var turn = [b[0] * a[0] + b[1] * a[1] + b[2] * a[2] + b[3] * a[3],
+                    -b[0] * a[1] + b[1] * a[0] - b[2] * a[3] + b[3] * a[2],
+                    -b[0] * a[2] + b[1] * a[3] + b[2] * a[0] - b[3] * a[1],
+                    -b[0] * a[3] - b[1] * a[2] + b[2] * a[1] + b[3] * a[0]]
+        if turn[0] < 0 { turn = turn.map { -$0 } }
+        let axis = Vec3(turn[1], turn[2], turn[3]), size = axis.dot(axis).squareRoot()
+        let spin = size > 1e-6 ? axis * (2 * atan2(size, turn[0]) / size / seconds) : Vec3(0, 0, 0)
+        now.angularVelocity = Vec3(spin.dot(now.pose.right), spin.dot(now.pose.up), -spin.dot(now.pose.forward))
+        return now
+    }
+
     private func locate(_ space: XrSpace?, in base: XrSpace, at time: XrTime) -> TrackedPose? {
         guard let space else { return nil }
         var velocity = XrSpaceVelocity()
@@ -356,10 +418,36 @@ public final class XRInput {
         var held = XrActionStatePose()
         held.type = XR_TYPE_ACTION_STATE_POSE
         guard instance.calls.getActionStatePose(session, &which, &held).rawValue >= 0, held.isActive != 0,
-              let grip = locate(grips[side.rawValue], in: base, at: time)
+              let grip = locate(grips[side.rawValue], in: base, at: time, velocityFromPoses: controllerVelocityFromPoses)
         else { return nil }
-        var state = ControllerState(grip: gripOffsets.map { grip.placing($0[side.rawValue]) } ?? grip)
+        // Query xrGetCurrentInteractionProfile directly because the host caches the first controller static
+        // properties it receives, and XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED can arrive after the first pose.
+        var current = XrInteractionProfileState()
+        current.type = XR_TYPE_INTERACTION_PROFILE_STATE
+        var model = ControllerModel.touch
+        if instance.calls.getCurrentInteractionProfile(session, sides[side.rawValue], &current).rawValue >= 0 {
+            if let known = modelsByPath[current.interactionProfile] {
+                model = known
+            } else {
+                model = XRInput.models[instance.string(current.interactionProfile)] ?? .touch
+                modelsByPath[current.interactionProfile] = model
+            }
+        }
+        // Apply HeadsetQuirks.gripOffset only when reporting a Quest Touch controller; native controller
+        // profiles use vrlink's per-controller grip offset directly.
+        var state = ControllerState(grip: model.isTouch ? gripOffsets.map { grip.placing($0[side.rawValue]) } ?? grip : grip)
+        state.model = model
         state.aim = locate(aims[side.rawValue], in: base, at: time)?.pose
+        // Log the controller's aim-to-grip offset once per hand (runtimes differ in grip pitch; Quest Touch aims
+        // ~46 deg downward relative to the grip).
+        if !gripDescribed[side.rawValue], let aim = state.aim {
+            gripDescribed[side.rawValue] = true
+            let from = grip.pose, along = aim.forward, apart = aim.position - from.position
+            let pitch = atan2(along.dot(from.up), along.dot(from.forward)) * 180 / .pi
+            let yaw = atan2(along.dot(from.right), along.dot(from.forward)) * 180 / .pi
+            log(String(format: "openxr: %@ controller's aim is pitched %.1f and turned %.1f degrees from its grip, and %.3f right, %.3f up, %.3f ahead of it (m)",
+                       side == .left ? "left" : "right", pitch, yaw, apart.dot(from.right), apart.dot(from.up), apart.dot(from.forward)))
+        }
         state.lowerButton = pressed(.lower, side)
         state.upperButton = pressed(.upper, side)
         state.menuButton = pressed(.menu, side) || (side == .left && systemButton?() == true)
@@ -426,7 +514,7 @@ public final class XRInput {
             // Returns XR_SESSION_NOT_FOCUSED (a qualified success code) when the session is unfocused.
             _ = calls.syncActions(session, &sync)
         }
-        let head = locate(headSpace, in: base, at: time)
+        let head = locate(headSpace, in: base, at: time, velocityFromPoses: headVelocityFromPoses)
         let hands = Side.allCases.map { side -> HandInput? in
             if let held = controller(side, in: base, at: time) { return .controller(held) }
             return hand(side, in: base, at: time).map { .hand($0) }
@@ -438,10 +526,19 @@ public final class XRInput {
             which.subactionPath = sides[side.rawValue]
             var held = XrActionStatePose()
             held.type = XR_TYPE_ACTION_STATE_POSE
-            guard calls.getActionStatePose(session, &which, &held).rawValue >= 0, held.isActive != 0,
-                  let ray = locate(points[side.rawValue], in: base, at: time)
-            else { return nil }
-            return Pointer(ray: ray.pose, press: amount(.press, side))
+            if calls.getActionStatePose(session, &which, &held).rawValue >= 0, held.isActive != 0,
+               let ray = locate(points[side.rawValue], in: base, at: time) {
+                return Pointer(ray: ray.pose, press: amount(.press, side))
+            }
+            // Fall back to joint-derived ray and pinch tracking on runtimes without XR_EXT_hand_interaction.
+            guard case .hand(let tracked)? = hands[side.rawValue], let head else { return nil }
+            let found = handPointers[side.rawValue].point(tracked, side: side, head: head.pose,
+                                                          seconds: Double(Uptime.nanoseconds) / 1e9)
+            if !pointsFromJoints[side.rawValue] {
+                pointsFromJoints[side.rawValue] = true
+                log("openxr: no aim pose for the \(side == .left ? "left" : "right") hand; pointing from its joints")
+            }
+            return Pointer(ray: found.ray, press: found.pressed ? 1 : 0)
         }
         // Sample eye gaze in head space and project a fixation point along the gaze ray.
         var gaze: Vec3?

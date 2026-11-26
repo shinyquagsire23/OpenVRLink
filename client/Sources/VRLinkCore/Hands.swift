@@ -344,6 +344,23 @@ struct AimFilter {
     }
 }
 
+/// Computes a panel pointer ray and index-pinch state from tracked hand joints on runtimes that support
+/// `XR_EXT_hand_tracking` without `XR_EXT_hand_interaction`, using the same aim ray and pinch detection sent
+/// to the host (`TrackedHand.aim`, `HandGestures`).
+public struct HandPointer {
+    private var filter = AimFilter()
+    private var gestures: HandGestures?
+
+    public init() {}
+
+    /// - Parameter seconds: A monotonic timestamp for the smoothing filter.
+    public mutating func point(_ hand: TrackedHand, side: Side, head: Pose, seconds: Double) -> (ray: Pose, pressed: Bool) {
+        let now = HandGestures(hand, previous: gestures)
+        gestures = now
+        return (filter.smooth(hand.aim(side, head: head), seconds: seconds), now.pinch[0])
+    }
+}
+
 /// Processed input for a single hand, ready to send over either protocol.
 /// For tracked hands, this includes recognized gestures and the smoothed aim ray.
 enum ResolvedHand {

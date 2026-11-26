@@ -20,6 +20,10 @@ public final class Panel {
     public let width: Int, height: Int
     /// Platform capabilities controlling which settings items are shown.
     public var features: SettingsForm.Features
+    /// Detected headset quirks (before user overrides) shown in the Quirks tab, or `nil` to hide the tab.
+    public var quirks: HeadsetQuirks?
+    /// Active quirks from app startup, used to indicate pending changes that require a restart.
+    public var quirksInEffect: HeadsetQuirks?
     /// Subtitle displayed next to the header (for example, app version and device model).
     public var caption = ""
     /// Optional footer hint explaining how to toggle the panel while streaming.
@@ -167,6 +171,10 @@ public final class Panel {
                 settings()
                 igEndTabItem()
             }
+            if let quirks, igBeginTabItem("Quirks") {
+                quirksTab(quirks)
+                igEndTabItem()
+            }
             igEndTabBar()
         }
         igEnd()
@@ -296,6 +304,53 @@ public final class Panel {
             igDummy(0, 30 * unit)
             igTextDim(hint)
         }
+    }
+
+    /// Renders per-quirk override controls persisted to `Settings.quirkOverrides` (applied on next app launch).
+    private func quirksTab(_ defaults: HeadsetQuirks) {
+        igBeginChild("quirks", 0, 0, false)
+        var overrides = model.settings.quirkOverrides
+        let before = overrides
+        let current = defaults.overridden(by: overrides)
+        igTextWrapped("Workarounds for \(defaults.headset.rawValue). Changes take effect the next time the app starts.")
+        igSpacing()
+        var id: Int32 = 1000
+        for option in HeadsetQuirks.options {
+            guard let usual = defaults.value(of: option.key), let now = current.value(of: option.key) else { continue }
+            id += 1
+            igPushID(id)
+            /// Stores an override only when the value differs from the headset default.
+            func set(_ value: String) { overrides[option.key] = value == usual ? nil : value }
+            let waiting = quirksInEffect?.value(of: option.key).map { $0 != now } ?? false
+            let title = option.title + (waiting ? "  (restart the app to apply)" : now == usual ? "" : "  (changed)")
+            switch option.kind {
+            case .flag:
+                var on = now == "1"
+                if igCheckbox(title, &on) { set(on ? "1" : "0") }
+            case .choice(let names):
+                igText(title)
+                for name in names {
+                    igSameLine(16 * unit)
+                    if igRadio(name, now == name) { set(name) }
+                }
+            case .number(let range, let step):
+                var value = Float(now) ?? range.lowerBound
+                igNextItemWidth(520 * unit)
+                if igSlider(title, &value, range.lowerBound, range.upperBound, step < 1 ? "%.1f" : "%.0f") {
+                    let stepped = (value / step).rounded() * step
+                    set(step < 1 ? String(format: "%.1f", stepped) : String(Int(stepped)))
+                }
+            }
+            igPopID()
+        }
+        igSpacing()
+        if !overrides.isEmpty, igButton("Reset to this headset's defaults", 0, 0) { overrides = [:] }
+        if overrides != before {
+            var settings = model.settings
+            settings.quirkOverrides = overrides
+            model.settings = settings
+        }
+        igEndChild()
     }
 
     private func settings() {

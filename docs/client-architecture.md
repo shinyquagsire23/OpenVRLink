@@ -296,6 +296,17 @@ notice so the host closes the session.
 
 ### Reference spaces and input
 
+Polling controllers, hands, eye gaze, and face tracking takes dozens of OpenXR
+calls per update. On Android XR, each call crosses an IPC boundary into the
+runtime process, adding up to roughly 10 ms per update. Running those queries
+synchronously on the render thread capped a 90 Hz session at 50–55 fps, which
+also caused Android XR to throttle the recommended eye swapchain resolution by
+4x. To keep input polling off the render path, `TrackingThread` (in
+`XRDisplay.swift`) polls `XRInput` and `XRFace` on a dedicated thread using the
+latest predicted display timestamp passed from the frame loop. `FramePace` logs
+a per-stage breakdown (`of which ...`) so frame-loop bottlenecks are visible in
+the logs.
+
 Tracking and rendering prefer the `STAGE` reference space when supported (using
 `xrGetReferenceSpaceBoundsRect` as the room chaperone boundary sent to the
 host), falling back to `LOCAL_FLOOR` and then `LOCAL`. OpenXR relies directly on
@@ -310,13 +321,14 @@ physical spot.
 
 Eye gaze uses `XR_EXT_eye_gaze_interaction`. Because that extension provides a
 gaze ray in view space without a convergence distance, `XRInput` projects a
-fixation point 10 m along the ray. Face tracking uses
-`XR_ANDROID_face_tracking` (`XRFace.swift`), whose first 63 blendshape weights
-match the `XR_FB_face_tracking2` layout expected by the host (`TONGUE_OUT` maps
-to index 68). On Galaxy XR, the runtime reports no face weights until the user
-completes system face calibration; `XRFace` queries
-`xrGetFaceCalibrationStateANDROID` so the in-headset panel can prompt the user
-to calibrate.
+fixation point 10 m along the ray. Face tracking (`XRFace.swift`) uses either
+`XR_ANDROID_face_tracking` (whose first 63 blendshape weights match the
+`XR_FB_face_tracking2` layout expected by the host, with `TONGUE_OUT` mapped to
+index 68) or `XR_FB_face_tracking2` on Quest (`XRFaceMeta`), which uses the same
+70-weight layout as `FaceExpressions` directly. On Galaxy XR, the runtime
+reports no face weights until the user completes system face calibration;
+`XRFace` queries `xrGetFaceCalibrationStateANDROID` so the in-headset panel can
+prompt the user to calibrate.
 
 On Android, the system back button is delivered to the `NativeActivity` input
 queue rather than OpenXR. During an immersive session, `Activity.swift` consumes
@@ -327,15 +339,128 @@ support `XR_FB_hand_tracking_aim` (such as Quest), `XRInput` also reads the
 left-hand menu pinch gesture alongside the hand joints and maps it to the same
 menu bit.
 
+Controller identity is reported per hand from the active OpenXR interaction
+profile (`xrGetCurrentInteractionProfile`). `ControllerModel` stores `vrlink`'s
+`staticProps` strings and `poseAction` grip offsets (from
+`controller_config.json`) for Oculus Touch, Touch Pro, Touch Plus, Pico Neo 3,
+Pico 4, and Vive Focus 3, so a Quest 3 paired with Touch Pro controllers reports
+Touch Pro models to SteamVR. Unrecognized interaction profiles fall back to
+Quest 2 Touch. `HeadsetQuirks.gripOffset`, which maps non-Quest grip poses onto
+the Quest Touch frame, is only applied when reporting a Touch-family controller.
+
 `XRInput` defines a single action set covering `ControllerState` inputs, with
-suggested bindings for Oculus Touch, Meta Touch Plus, Pico 4, Valve Index, and
-Khronos simple controller profiles. When a hand is not holding an active
-controller, `XRInput` queries the 26 joints from `XR_EXT_hand_tracking`, which
-already match the joint ordering and axis convention of `TrackedHand`.
-Transparent or chroma-keyed streams request `XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND`
-when the headset supports passthrough blending. Both `MetalXRGraphics` and
+suggested bindings for Oculus Touch, Touch Pro, Meta Touch Plus, Pico Neo 3,
+Pico 4, Vive Focus 3, Valve Index, YVR Touch (used by YVR and Play For Dream
+headsets, which otherwise bind the simple controller profile with select mapped
+to the A button), and Khronos simple controller profiles. When a hand is not
+holding an active controller, `XRInput` queries the 26 joints from
+`XR_EXT_hand_tracking`, which already match the joint ordering and axis
+convention of `TrackedHand`. Transparent or chroma-keyed streams request
+`XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND` when supported. If the runtime does not
+offer alpha-blend mode (or `HeadsetQuirks.passthroughLayer` is enabled),
+`XRDisplay` creates an `XR_FB_passthrough` layer and submits it behind the
+source-alpha projection layer. `XRDisplay` explicitly starts and pauses
+passthrough cameras with `xrPassthroughStartFB` and `xrPassthroughPauseFB` as
+transparency changes because the YVR runtime ignores
+`XR_PASSTHROUGH_IS_RUNNING_AT_CREATION_BIT_FB`. Both `MetalXRGraphics` and
 `VulkanXRGraphics` support chroma keying; the Vulkan backend compiles a second
 `quad.frag` variant that uses dual-source blending to match `Quad.metal`.
+
+### Sharp layer
+
+OpenXR runtimes often recommend an eye swapchain resolution well below the
+panel's center pixel density (for example, Galaxy XR recommends 1856 x 2160 for
+its 3552 x 3840 panels, or roughly 18 PPD), whereas a Steam host's foveal tile
+packs 2048 pixels into roughly 55 degrees. Rendering everything into the single
+eye swapchain discards about half of the foveal tile's resolution on each axis.
+
+When a frame's layout specifies a high-density region (`FrameLayout.View.sharp`),
+`XRDisplay` submits two projection layers per eye, similar to how `vrlink`
+submits separate base and foveal layers:
+
+- The base eye layer covering the full field of view.
+- A sharp overlay layer backed by a second swapchain per eye
+  (`HeadsetQuirks.sharpLayerPixels`). Its field of view is computed by
+  `Composition.sharpFrustum` to tightly enclose the high-density region from the
+  current display eye pose, tracking the host's gaze-steered foveal tile each
+  frame so the compositor samples it at native density.
+
+`XRDisplay` renders into the top-left sub-rect of the sharp swapchain matching
+the source region's pixel dimensions (clamped to the swapchain size). On Steam
+hosts, where a single foveal tile covers the region, only that tile is drawn
+onto a transparent attachment and alpha-blended over the base layer using its
+feathered border. On WiVRn hosts, where foveation uses rectilinear bands rather
+than an alpha-feathered inset, all quads are drawn into the sharp layer with a
+hard resolution boundary; rendering all quads at the full 2048 x 2048 swapchain
+size increased frame draw times on Galaxy XR from ~3 ms to ~11 ms, dropping
+below 72 Hz.
+
+To keep GPU fill cost low when rendering two layers:
+
+- When the sharp layer draws a standalone foveal tile (Steam hosts), `XRDisplay`
+  omits that tile from the base eye layer and renders the base layer into a
+  swapchain sub-rect sized to 1.25x the peripheral tile dimensions (1152 or 2048
+  square) rather than the full eye swapchain.
+- When no new video frame has arrived since the previous display refresh,
+  `XRDisplay` skips rendering and resubmits the previous frame's swapchain
+  layers with their original render poses, letting the OpenXR compositor
+  reproject them to the updated head pose.
+
+When `XR_EXT_performance_settings` is available and
+`HeadsetQuirks.sustainedPerformance` is enabled, `XRDisplay` requests sustained
+high CPU and GPU performance levels at session startup and logs thermal or
+throttling notifications (`openxr: GPU heat went from level 0 to 25 ...`).
+
+On Steam hosts, `sharp` corresponds to the foveal tile; on WiVRn hosts, it
+corresponds to the uncompressed center band. Because WiVRn only enables
+foveation when the requested eye resolution exceeds the encoded stream size,
+enabling the sharp layer causes the client to report
+`DeviceProfile.detailEyePixels` (the runtime's recommended resolution multiplied
+by `HeadsetQuirks.eyeDetail`) to WiVRn hosts. Steam hosts still receive the
+standard recommended size, since SteamVR crops the foveal tile directly from its
+render target according to SteamVR's render resolution setting.
+
+When the sharp layer activates, `XRDisplay` logs `openxr: sharp layer on: ...`
+with the effective pixels per degree of both layers.
+
+### Probing the video color pipeline
+
+Hardware decoders and Vulkan `VkSamplerYcbcrConversion` drivers handle
+full-range BT.2020 video inconsistently across Android headsets. Some Qualcomm
+drivers apply a narrow-range expansion to full-range frames (pushing black
+below zero), and samplers importing vendor-private `AHardwareBuffer` formats may
+ignore the requested color matrix. To handle this automatically on Android, the
+client probes the active decode-and-sample path at startup.
+
+`ColorProbe` (in `VRLinkCore`) embeds short 256 x 256 HEVC Main 10 and Main
+(8-bit) test clips containing 16 flat color patches with known Y'CbCr values (8
+grays and 8 chroma patches) and VUI headers matching the live stream (full
+range, BT.2020 primaries, gamma 2.2, `identity` matrix). At startup,
+`Activity.measureColors` decodes each clip through a temporary
+`MediaCodecDecoder` and passes the decoded frames to
+`VulkanXRGraphics.probeColors`, which renders them through the stream's Y'CbCr
+sampler into the offscreen stereo-downsample target with no color correction and
+reads the pixels back. During the probe pass, `quad.frag` encodes outputs as
+`sampled * 0.5 + 0.25` so out-of-range values below `0` or above `1` are
+preserved in the 8-bit readback buffer. Because some decoders treat the initial
+frame differently from subsequent frames, the probe evaluates both the first and
+sixth decoded frames and uses the steady-state result.
+
+`ColorProbe.analyze` compares the 16 sampled patch colors against each known
+driver behavior: RGB conversion using BT.2020, BT.709, or BT.601, or unconverted
+Y'CbCr, each with or without narrow-range expansion. When a candidate matches
+within `0.03` per channel, `VulkanXRGraphics` stores the exact analytical
+inverse 3x4 affine matrix (`Treatment.correction`, passed to `quad.frag` as
+`style.fix0`–`fix2`) for that `AHardwareBuffer` external format. The matched
+behavior is logged (`colors: ...`); if no candidate fits, all 16 patch readings
+are logged and the renderer falls back to `HeadsetQuirks.shaderColorConversion`
+and `HeadsetQuirks.undoRangeStretch`.
+
+If a decoder switches to a different vendor buffer format mid-stream (as observed
+on Play For Dream shortly after stream startup), any unprobed format also falls
+back to the configured quirks. This probe only characterizes decoding and Y'CbCr
+sampling up to the fragment shader; compositor color management on the output
+swapchain is configured separately via `XR_FB_color_space`.
 
 ### Depth correction
 
@@ -377,9 +502,13 @@ through a staging buffer (`choosePanelFormat`, `adoptPanel`, and `drawPanel` on
 you each time it appears and intersects pointer rays with the quad to get panel
 pixel coordinates. Those rays use dedicated `point` and `press` actions bound to
 controller aim and trigger, or to hand aim and pinch through
-`XR_EXT_hand_interaction`. Keeping them separate from the stream's `aim` and
-`trigger` actions prevents a hand-interaction profile from making a tracked hand
-look like a controller to the host.
+`XR_EXT_hand_interaction`. On runtimes that support `XR_EXT_hand_tracking`
+without `XR_EXT_hand_interaction` (such as Play For Dream), bare hands have no
+OpenXR aim action pose, so `XRInput` falls back to `HandPointer`, which computes
+the pointer ray and index-pinch state from the hand joints using the same
+geometry sent to the host. Keeping panel actions separate from the stream's
+`aim` and `trigger` actions prevents a hand-interaction profile from making a
+tracked hand look like a controller to the host.
 
 The panel stays up until the first video frame is decoded. Holding the menu
 button for 0.8 s shows or hides the panel during an active stream, while short
@@ -489,6 +618,10 @@ system permission dialog and then re-checks the permission state.
   corresponding permission is already granted. Devices that do not define those
   permissions skip the prompt (Quest grants `com.oculus.permission.HAND_TRACKING`
   at install time).
+- `com.oculus.permission.EYE_TRACKING`, `com.oculus.permission.FACE_TRACKING`
+  (Quest), and `com.picovr.permission.EYE_TRACKING` (Pico) are included in the
+  same startup permission request on devices that define them to enable
+  `XR_EXT_eye_gaze_interaction` and `XR_FB_face_tracking2`.
 - `android.permission.RECORD_AUDIO` is requested when a stream starts with
   "Send my microphone" enabled.
 
@@ -503,11 +636,28 @@ MediaCodec do not report. Defaults follow ALVR's OpenXR client:
 | `floatTarget` | off | Render to `R16G16B16A16_SFLOAT` swapchains when offered. Off by default because the video stream is 8-bit and 8-bit sRGB swapchains behave consistently across runtimes. |
 | `floatTargetIsEncoded` | on for Pico and Galaxy XR | Whether the compositor treats a float swapchain as sRGB-encoded rather than linear, which OpenXR leaves unspecified. |
 | `videoRange` | as reported by decoder | Overrides narrow or full YCbCr range conversion for decoders that misreport color range. |
+| `measureColors` | on | Probes the video decode and Y'CbCr sampling path at startup with `ColorProbe` and applies an inverse 3x4 color matrix in `quad.frag` (see [Probing the video color pipeline](#probing-the-video-color-pipeline)). When disabled or when the probe matches no known behavior, the renderer falls back to `shaderColorConversion` and `undoRangeStretch`. |
+| `shaderColorConversion` | off | Configures the Vulkan sampler with `RGB_IDENTITY` and converts Y'CbCr to RGB (full-range BT.2020, non-constant luminance) in `quad.frag` instead of using the GPU driver's Y'CbCr conversion. |
+| `undoRangeStretch` | on for Play For Dream | Inverts a narrow-range expansion (16...235 to 0...255) applied by the decoder or GPU driver to full-range frames, matching the range fix ALVR applies on most standalone headsets. |
+| `headVelocityFromPoses`, `controllerVelocityFromPoses` | head: Pico, Vive, YVR, Play For Dream; controllers: Pico, Vive | Derives linear and angular velocities by finite-differencing poses 20 ms apart instead of using the runtime's reported velocity vectors. These runtimes report velocities in the wrong coordinate frame, causing misdirected host pose prediction (matching ALVR's `get_head_data` workaround). |
+| `colorSpace` | `rec709` | Color space declared to the compositor via `XR_FB_color_space` when supported (matching ALVR). Leaving wide-gamut displays unmanaged oversaturates the sRGB-rendered stream. |
 | `decoderWidth`, `decoderHeight` | 2048 x 2048 | Initial decoder dimensions used when parameter sets are not parsed beforehand (currently AV1). `PictureSize` parses H.264 and HEVC dimensions from the SPS. |
 | `decoderLowLatency` | on | Enables the Android 11 `low-latency` key and Qualcomm's vendor low-latency extension. |
 | `gripOffset` | per-headset (from ALVR) | Local transform `(x, y, z, pitch, yaw, roll)` applied to the left controller grip pose (and mirrored for the right) so non-Quest controllers align with the Quest Touch profile reported to the host. Computed by composing ALVR's per-headset offset with the inverse of ALVR's Quest offset (`get_controller_offset` in `alvr/client_openxr/src/interaction.rs`); on Galaxy XR this shifts the grip 5.5 cm back along +Z with +15 deg of pitch. |
 | `waitForGPU` | on | Waits on the frame's GPU fence before releasing swapchain images to the OpenXR runtime. |
+| `sharpLayerPixels` | 2048 | Width and height in pixels of the secondary per-eye swapchain used for the high-density foveal layer (see [Sharp layer](#sharp-layer)); 0 disables the second layer. |
+| `eyeDetail` | 1.4 (1.9 on Galaxy XR) | Ratio of the display's center pixel density to the runtime's recommended eye swapchain size. Multiplied into the eye resolution reported to WiVRn hosts when the sharp layer is active so WiVRn enables foveation. |
+| `sustainedPerformance` | on | Requests sustained high CPU and GPU performance levels via `XR_EXT_performance_settings` when the OpenXR session starts. |
+| `compositorPlacesLayers` | off for YVR and Play For Dream | Whether the OpenXR compositor honors per-layer poses and fields of view. When off, `XRDisplay` renders every frame from the current display view and disables the sharp layer, sub-rect eye rendering, and frame-layer reuse (matching ALVR's `use_custom_reprojection` workaround). |
+| `passthroughLayer` | on for YVR and Play For Dream | Uses an `XR_FB_passthrough` composition layer for passthrough even if the runtime advertises `XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND`. Runtimes without alpha-blend mode use `XR_FB_passthrough` automatically. |
+| `leanUplink` | on for Galaxy XR | Starts sessions sending hand-tracking packets once per video frame rather than with every pose update. On Galaxy XR, Wi-Fi begins rejecting outgoing packets with `EAGAIN` once the Wi-Fi thermal sensor exceeds ~75 °C. On all headsets, any 1-second interval with rejected sends steps down the uplink rate (hands once per frame, poses twice per frame, then poses once per frame), and 10 seconds without errors steps it back up (logged as `uplink: ...`). |
 | `decoderOperatingRate` | 32767 | `operating-rate` passed to `AMediaCodec` (0 leaves it unset). Qualcomm decoders scale clocks from this hint and default to 30 fps without it; 32767 matches ALVR's maximum-rate setting. If configuring the codec fails with this key set, the decoder retries without it. |
+
+On Android, the in-headset panel's Quirks tab exposes most of these settings
+(`HeadsetQuirks.options`) initialized to the detected headset's defaults and
+persists user changes in `Settings.quirkOverrides`. At startup, OpenVRLink
+applies the headset defaults, then saved panel overrides, and finally any
+`debug.openvrlink.*` system properties.
 
 You can override any of these without rebuilding by setting
 `debug.openvrlink.*` system properties before launching the app. Active values
@@ -519,6 +669,13 @@ adb shell setprop debug.openvrlink.float_target 1
 adb shell setprop debug.openvrlink.float_encoded 0
 adb shell setprop debug.openvrlink.video_range full      # narrow, full, or auto
 adb shell setprop debug.openvrlink.decoder_operating_rate 0
+adb shell setprop debug.openvrlink.sustained_performance 0
+adb shell setprop debug.openvrlink.lean_uplink 0
+adb shell setprop debug.openvrlink.compositor_places_layers 0
+adb shell setprop debug.openvrlink.passthrough_layer 1
+adb shell setprop debug.openvrlink.shader_color_conversion 1
+adb shell setprop debug.openvrlink.sharp_layer 0         # pixels per side; 0 turns the sharp layer off
+adb shell setprop debug.openvrlink.eye_detail 1.5
 adb shell setprop debug.openvrlink.grip_offset 0,0,0.055,15,0,0   # x,y,z meters; pitch,yaw,roll degrees
 adb logcat -s OpenVRLink
 ```
@@ -538,6 +695,81 @@ interface names to `HostConnector`. When connecting over one of those
 interfaces, `NetworkInterfaces.bind` (in `VRLinkCore`) binds each socket to the
 matching network handle via `android_setsocknetwork` and logs
 `using wired interface <name>`.
+
+#### Low-latency Wi-Fi
+
+While streaming, `Activity.swift` acquires a `WifiManager.WifiLock` in
+`WIFI_MODE_FULL_LOW_LATENCY` (mode 4, Android 10+) over JNI and releases it when
+the stream stops. Android honors this lock while the app is foregrounded with
+the display active, disabling Wi-Fi power save and requesting low-latency mode
+from the Wi-Fi driver. This matches `vrlink` (`WifiLock::Lock` in
+`libvrlink_scene.so` calls `createWifiLock(4, ...)` after checking
+`WAKE_LOCK`). Acquiring the lock requires `ACCESS_WIFI_STATE` and `WAKE_LOCK`,
+plus `com.oculus.permission.WIFI_LOCK` on Quest. Acquisition status is logged
+as `wifi: holding the low-latency lock`.
+
+Android apps cannot disable background Wi-Fi scanning directly; whether
+`WIFI_MODE_FULL_LOW_LATENCY` also suppresses background scans or roaming
+depends on the vendor Wi-Fi driver.
+
+#### Headset manifest metadata
+
+`AndroidManifest.xml` includes the vendor-specific metadata and categories
+expected by standalone headset launchers, modeled after `steamlink-vr.apk`
+(`com.valvesoftware.steamlinkvr` 2.0.20):
+
+| entry | purpose |
+|---|---|
+| `com.oculus.intent.category.VR`, `com.oculus.supportedDevices`, `com.oculus.vr.focusaware` | Quest: marks the app as immersive VR across all Quest models and keeps rendering behind the system overlay |
+| `com.yvr.intent.category.VR` | YVR and Play For Dream launchers |
+| `pvr.app.type` (application and activity), `pvr.sdk.version` = `OpenXR` | Pico |
+| `com.htc.vr.content.NumDoFHmd`, `NumDoFController`, `NumController` | Vive (declares 6DoF HMD and two 6DoF controllers) |
+| `android.window.PROPERTY_XR_BOUNDARY_TYPE_RECOMMENDED` = `XR_BOUNDARY_TYPE_LARGE` | Android XR: requests system room-boundary rendering during opaque full-space streaming |
+| `android.hardware.xr.input.controller`, `hand_tracking`, `eye_tracking` (optional) | Android XR input feature declarations |
+| `resizeableActivity` = `false`, fullscreen theme | Disables window chrome and resizing on the immersive activity |
+
+Several entries from `steamlink-vr.apk` are omitted intentionally:
+`com.oculus.handtracking.frequency` = `LOW` (already the default), Pico face
+tracking permissions (not implemented), `oculus.software.vr.app.hybrid` and
+location permissions (used by the 2D Steam Link shell and its 5 GHz Wi-Fi
+check), and `libopenxr_forwardloader.oculus.so` (OpenVRLink bundles the
+standard Khronos loader instead).
+
+#### Thermal throttling
+
+`XRDisplay` monitors thermal notifications from `XR_EXT_performance_settings`
+(`XR_PERF_SETTINGS_SUB_DOMAIN_THERMAL_EXT`). While the highest reported thermal
+level is `XR_PERF_SETTINGS_NOTIF_LEVEL_IMPAIRED_EXT` (`75`), `XRDisplay` steps
+the display refresh rate down one supported rate at a time—first after 3 s, and
+then every 30 s. Once thermal state returns to normal (`0`) for 30 s, it steps
+the refresh rate back up toward the host's requested rate. Each rate change
+updates the frame interval reported by the streaming session so the host scales
+back rendering and encoding to match (`openxr: heat level 75; holding the stream
+to ...`).
+
+If thermal throttling remains active at the display's lowest native refresh
+rate (for example, 60 Hz), `XRDisplay` adds one final half-rate step (30 fps):
+the display stays at 60 Hz, while the session reports a 2x frame interval so
+the host renders and encodes every other display refresh. Intermediate
+half-rates of higher refresh rates (such as 45 fps at 90 Hz or 36 fps at 72 Hz)
+are skipped because switching from 60 Hz up to 90 Hz to reach 45 fps raises
+display clocks while the headset is already hot, and each rate change triggers
+an encoder reset on the host (stepping through 60, 45, 36, and 30 fps on Galaxy
+XR caused up to eight host encoder resets within 15 s).
+
+Because `driver_vrlink` selects its target rate from the client's advertised
+rate list and retries every second if the client runs slower (`vrlink: Client
+is ignoring our request for 72.00 Hz (still at 60.00 Hz); retrying`),
+`StreamingSession.holdRefreshRates` restricts the advertised `availableRates`
+list to rates at or below the active thermal cap (or the half-rate alone)
+before changing the reported frame interval, then restores the full list once
+throttling clears.
+
+On Galaxy XR over Wi-Fi, high temperatures can also stall the kernel's outbound
+UDP queue, causing non-blocking `send` calls to fail with `EAGAIN` even at low
+packet rates. `UDPSocket` requests a 4 MB `SO_SNDBUF` (up from the default
+buffer of roughly 100 small packets) and queries `SIOCOUTQ` to log outbound
+queue buildup (`uplink: N KB sent but still held by the system`).
 
 #### Performance logging
 

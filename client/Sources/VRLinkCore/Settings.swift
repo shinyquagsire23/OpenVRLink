@@ -79,6 +79,10 @@ public struct Settings: Codable, Equatable {
     /// Overlay a translucent color-coded depth grid (red near, blue far) to visualize `depthFromPicture`.
     public var showDepth = false
 
+    /// Per-option `HeadsetQuirks` overrides keyed by `HeadsetQuirks.options` key, formatted for
+    /// `HeadsetQuirks.apply`. Omitted keys use the headset's defaults; changes take effect on next app launch.
+    public var quirkOverrides: [String: String] = [:]
+
     public static let fovScaleRange: ClosedRange<Float> = 0.2...1.6
 
     public init() {}
@@ -111,6 +115,7 @@ public struct Settings: Codable, Equatable {
         read(.realityKitRenderer, into: &realityKitRenderer)
         read(.depthFromPicture, into: &depthFromPicture)
         read(.showDepth, into: &showDepth)
+        read(.quirkOverrides, into: &quirkOverrides)
         if let found = try? saved.decodeIfPresent(GazeCalibration.self, forKey: .gazeCalibration) { gazeCalibration = found }
         self = tidied()
     }

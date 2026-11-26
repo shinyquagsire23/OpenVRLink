@@ -74,9 +74,16 @@ public final class XRInstance {
         "XR_ANDROID_face_tracking",
         "XR_FB_hand_tracking_aim",           // system hand gestures (such as Quest's left-hand menu pinch)
         "XR_FB_display_refresh_rate",
+        "XR_FB_color_space",                 // declare content color primaries on wide-gamut displays
+        "XR_FB_passthrough",                 // passthrough layer when alpha-blend mode is unavailable
+        "XR_ANDROID_recommended_resolution", // dynamic eye resolution notifications on Android XR
+        "XR_EXT_performance_settings",       // sustained clock requests and thermal throttling events
         "XR_EXT_local_floor",
         "XR_META_touch_controller_plus",
+        "XR_FB_touch_controller_pro",
         "XR_BD_controller_interaction",
+        "XR_HTC_vive_focus3_controller_interaction",
+        "XR_FB_face_tracking2",              // Quest Pro camera face tracking and Quest 3 audio lip sync
     ]
 
     /// - Parameter required: Instance extensions required by the graphics backend.
@@ -263,7 +270,15 @@ struct Calls {
     let locateHandJoints: PFN_xrLocateHandJointsEXT?
     let enumerateDisplayRefreshRates: PFN_xrEnumerateDisplayRefreshRatesFB?
     let getDisplayRefreshRate: PFN_xrGetDisplayRefreshRateFB?
+    let setPerformanceLevel: PFN_xrPerfSettingsSetPerformanceLevelEXT?
     let requestDisplayRefreshRate: PFN_xrRequestDisplayRefreshRateFB?
+    let setColorSpace: PFN_xrSetColorSpaceFB?
+    let createPassthrough: PFN_xrCreatePassthroughFB?
+    let destroyPassthrough: PFN_xrDestroyPassthroughFB?
+    let passthroughStart: PFN_xrPassthroughStartFB?
+    let passthroughPause: PFN_xrPassthroughPauseFB?
+    let createPassthroughLayer: PFN_xrCreatePassthroughLayerFB?
+    let destroyPassthroughLayer: PFN_xrDestroyPassthroughLayerFB?
 
     init(_ find: (String) -> PFN_xrVoidFunction?) throws {
         func need<Function>(_ name: String) throws -> Function {
@@ -321,6 +336,14 @@ struct Calls {
         locateHandJoints = extra("xrLocateHandJointsEXT")
         enumerateDisplayRefreshRates = extra("xrEnumerateDisplayRefreshRatesFB")
         getDisplayRefreshRate = extra("xrGetDisplayRefreshRateFB")
+        setPerformanceLevel = extra("xrPerfSettingsSetPerformanceLevelEXT")
         requestDisplayRefreshRate = extra("xrRequestDisplayRefreshRateFB")
+        setColorSpace = extra("xrSetColorSpaceFB")
+        createPassthrough = extra("xrCreatePassthroughFB")
+        destroyPassthrough = extra("xrDestroyPassthroughFB")
+        passthroughStart = extra("xrPassthroughStartFB")
+        passthroughPause = extra("xrPassthroughPauseFB")
+        createPassthroughLayer = extra("xrCreatePassthroughLayerFB")
+        destroyPassthroughLayer = extra("xrDestroyPassthroughLayerFB")
     }
 }

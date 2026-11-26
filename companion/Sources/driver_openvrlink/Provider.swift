@@ -98,8 +98,11 @@ private enum Provider {
         let gammaOn = Server.bool(Server.gammaOnKey, default: true)
         let headsets = Server.headsetsKnown()
         let gamma = Server.float(Server.gammaValueKey, default: Server.defaultGamma)
+        // Set in default.vrsettings when openvrlink-companion installs the bundled controller models.
+        let models = Server.bool(Server.playForDreamModelsKey, default: false)
         Platform.lock()
         Shared.host?.available = (gammaAvailable ? Handshake.gammaFeature : 0) | (headsets ? Handshake.headsetFeature : 0)
+            | (models ? Handshake.playForDreamModelsFeature : 0)
         Shared.host?.enabled = gammaOn ? Handshake.gammaFeature : 0
         Shared.host?.gamma = gamma
         Platform.unlock()

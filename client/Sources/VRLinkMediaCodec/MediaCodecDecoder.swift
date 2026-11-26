@@ -66,6 +66,15 @@ public final class MediaCodecDecoder: StreamDecoder {
     private let assembler = PictureAssembler<HardwarePicture>()
     private let quirks: HeadsetQuirks
 
+    /// Directory where the initial access units of each video stream are dumped (`stream-<picture>.bin`, Annex B
+    /// for H.264/HEVC) for offline inspection, or `nil` to disable. Must be set before a stream starts.
+    public static var keepStreamStartIn: String?
+    /// Number of initial access units written to each stream dump file.
+    static let keptUnits = 60
+
+    /// Whether this decoder writes stream-start dumps when `keepStreamStartIn` is set (disabled for `ColorProbe` clips).
+    public var keepsStreamStart = true
+
     public init(quirks: HeadsetQuirks = HeadsetQuirks()) {
         self.quirks = quirks
     }
@@ -80,6 +89,7 @@ public final class MediaCodecDecoder: StreamDecoder {
         while decoders.count <= frame.picture {
             let picture = decoders.count
             let decoder = PictureCodec(picture: picture, quirks: quirks)
+            decoder.keepsStart = keepsStreamStart
             decoder.onPicture = { [weak self] frameID, decoded, layout in
                 guard let self, let whole = assembler.add(decoded, index: picture, frameID: frameID, of: layout.pictures) else { return }
                 onImage?(HardwareFrame(frameID: frameID, pictures: whole, layout: layout))
@@ -169,6 +179,14 @@ final class PictureCodec {
         // second and fall behind a 90 Hz stream.
         AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_PRIORITY, 0)
         if operatingRate > 0 { AMediaFormat_setInt32(format, "operating-rate", Int32(operatingRate)) }
+        // Set full-range BT.2020 color keys matching vrlink (QSVLCodecNDK::Init). Without explicit color keys,
+        // some decoders mark frames as narrow-range after the first frame, causing the GPU sampler to apply an
+        // unwanted range expansion.
+        if quirks.decoderColorKeys {
+            AMediaFormat_setInt32(format, "color-standard", 6)   // COLOR_STANDARD_BT2020
+            AMediaFormat_setInt32(format, "color-range", 1)      // COLOR_RANGE_FULL
+            AMediaFormat_setInt32(format, "color-transfer", 1)   // COLOR_TRANSFER_LINEAR, matching vrlink
+        }
         // Request low-latency output so frames are emitted immediately without B-frame reordering buffering.
         if quirks.decoderLowLatency {
             AMediaFormat_setInt32(format, "low-latency", 1)
@@ -228,10 +246,22 @@ final class PictureCodec {
         return true
     }
 
+    /// Whether this `PictureCodec` writes stream-start dumps (`MediaCodecDecoder.keepStreamStartIn`).
+    var keepsStart = true
+    private var keeping: OpaquePointer?
+    private var kept = 0
+
     func decode(_ frame: EncodedFrame) {
         let bytes = UnsafeBufferPointer(frame.data.bytes)
         if let seen = AnnexB.keyframeCodec(bytes), seen != kind {
             Log.note(kind == nil ? "decoder: starting \(seen.rawValue) stream" : "decoder: switching codec to \(seen.rawValue)")
+            if let keeping { fclose(keeping) }
+            keeping = nil
+            kept = 0
+            if let folder = MediaCodecDecoder.keepStreamStartIn, keepsStart {
+                keeping = fopen("\(folder)/stream-\(picture).bin", "wb")
+                Log.note(keeping == nil ? "decoder: could not keep the stream's start in \(folder)" : "decoder: keeping the stream's start in \(folder)/stream-\(picture).bin")
+            }
             stop()
             guard start(seen, keyframe: bytes) else {
                 onFailure?(frame.frameID)
@@ -244,6 +274,14 @@ final class PictureCodec {
                 Log.note("decoder: waiting for a keyframe")
             }
             return
+        }
+        if let keeping, let start = bytes.baseAddress {
+            fwrite(start, 1, bytes.count, keeping)
+            kept += 1
+            if kept >= MediaCodecDecoder.keptUnits {
+                fclose(keeping)
+                self.keeping = nil
+            }
         }
         // AMediaCodec accepts H.264 and HEVC access units directly in Annex B format (with in-band parameter
         // sets) and AV1 frames as raw OBUs.

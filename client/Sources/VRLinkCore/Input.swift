@@ -45,6 +45,61 @@ public struct PowerState: Equatable {
     var rounded: PowerState { PowerState(level: (level * 100).rounded() / 100, charging: charging) }
 }
 
+/// Controller identity reported to a SteamVR host, matching `vrlink`'s `staticProps` and `poseAction`
+/// definitions in `assets/config/controller_config.json` (keyed by OpenXR interaction profile so a Quest 3
+/// paired with Touch Pro controllers reports Touch Pro models).
+public enum ControllerModel: String, CaseIterable {
+    /// Quest 2 Touch controller (also used as the fallback for unrecognized interaction profiles).
+    case touch
+    /// Quest Pro Touch Pro controller.
+    case touchPro
+    /// Quest 3 Touch Plus controller.
+    case touchPlus
+    case picoNeo3, pico4, viveFocus3
+
+    /// Tracking system, serial prefix, manufacturer, model prefix, render model prefix, input profile,
+    /// controller type, and vendor prefix.
+    private var words: (system: String, serial: String, maker: String, model: String, render: String, profile: String, type: String, vendor: String) {
+        let touch = "{oculus}/input/touch_profile.json", pico = "{vrlink}/input/pico_controller_profile.json"
+        switch self {
+        case .touch: return ("oculus", "VRLINKQ2", "Oculus", "Oculus Quest2", "oculus_quest2_controller", touch, "oculus_touch", "oculus")
+        case .touchPro: return ("oculus", "VRLINKQP", "Oculus", "Oculus Quest Pro", "oculus_quest_pro_controller", touch, "oculus_touch", "oculus")
+        case .touchPlus: return ("oculus", "VRLINKQ3", "Oculus", "Oculus Quest3", "oculus_quest_plus_controller", touch, "oculus_touch", "oculus")
+        case .picoNeo3: return ("pico", "VRLINKPICONEO3", "PICO", "PICO Neo 3", "pico_neo3_controller", pico, "pico_controller", "PICO")
+        case .pico4: return ("pico", "VRLINKP4", "PICO", "PICO 4", "pico_4_controller", pico, "pico_controller", "PICO")
+        case .viveFocus3:
+            return ("htc", "VRLINKVIVEFOCUS3", "HTC", "Vive Focus 3", "vive_focus3_controller",
+                    "{vrlink}/input/vive_focus3_controller_profile.json", "vive_focus3_controller", "HTC")
+        }
+    }
+
+    /// Returns the nine `VTE_StaticProps_t` strings for `side`.
+    func staticStrings(_ side: Side) -> [String] {
+        let name = side == .left ? "Left" : "Right", w = words
+        // vrlink's Focus 3 device-type string includes an underscore omitted from its serial prefix.
+        let typed = self == .viveFocus3 ? "VRLINKVIVE_FOCUS3" : w.serial
+        return [w.system, "\(w.serial)_Controller_\(name)", w.maker, "\(w.model) (\(name) Controller)", "\(w.render)_\(name.lowercased())",
+                "vrlink", w.profile, w.type, "\(w.vendor)/\(typed)_Controller_\(name)"]
+    }
+
+    /// Returns `vrlink`'s transform from the OpenXR grip pose to SteamVR's device origin as 7 floats
+    /// (`x, y, z, qw, qx, qy, qz`), mirrored across X for the right hand.
+    func gripOffset(_ side: Side) -> [Float] {
+        let left: (x: Float, y: Float, z: Float, pitch: Float)
+        switch self {
+        case .touch, .touchPro, .touchPlus: left = (-0.007, -0.03416, -0.09607, -20.6)
+        case .picoNeo3: left = (0.003, -0.046, -0.115, -10)
+        case .pico4: left = (-0.007, -0.0512, -0.09607, -10)
+        case .viveFocus3: left = (0, -0.002, -0.11, -5)
+        }
+        let half = left.pitch * Float.pi / 360
+        return [side == .left ? left.x : -left.x, left.y, left.z, cos(half), sin(half), 0, 0]
+    }
+
+    /// Whether this model uses the Oculus Touch family, where `HeadsetQuirks.gripOffset` applies.
+    public var isTouch: Bool { self == .touch || self == .touchPro || self == .touchPlus }
+}
+
 public struct ControllerState {
     /// World-space OpenXR grip pose and velocity, with the origin centered in the
     /// handle, -z pointing forward along the handle, and +x pointing out of the
@@ -56,6 +111,9 @@ public struct ControllerState {
 
     /// Optional battery state; when `nil`, no battery property is reported to the host.
     public var power: PowerState?
+
+    /// Controller model corresponding to the active OpenXR interaction profile.
+    public var model = ControllerModel.touch
 
     /// Lower and upper face buttons: X and Y on the left, A and B on the right.
     public var lowerButton = false, upperButton = false
@@ -115,12 +173,16 @@ public struct ControllerState {
     /// SteamVR's render model metadata) with a (+2 mm, 0, -10 mm) nudge, followed
     /// by translating 11 cm forward along the pitched -z axis.
     ///
-    /// When `senseModel` is false, SteamVR renders a Quest Touch controller and we
-    /// use `vrlink`'s Touch grip offset (`docs/svl-tracking-input/controllers.md`).
-    static func gripOffset(_ side: Side, senseModel: Bool) -> [Float] {
-        guard senseModel else {
-            return [side == .left ? -0.007 : 0.007, -0.0342, -0.0961, 0.9839, -0.1788, 0, 0]
+    /// When `senseModel` is false, uses the grip offset for `model` (`docs/svl-tracking-input/controllers.md`),
+    /// or Play For Dream's host-driver override (`offsetPos*` and `offsetDegX` under
+    /// `vrlink_yvr_d3_controller_left` in "MR SteamLink Driver" 1.0.1.0: 2.5 cm up, 3.5 cm forward, +25 deg
+    /// pitch, since Play For Dream's grip pose aligns with the aim ray rather than the handle).
+    static func gripOffset(_ side: Side, senseModel: Bool, playForDream: Bool = false, model: ControllerModel = .touch) -> [Float] {
+        if playForDream, !senseModel {
+            let pitch = 25 * Float.pi / 180
+            return [0, 0.025, -0.035, cos(pitch / 2), sin(pitch / 2), 0, 0]
         }
+        guard senseModel else { return model.gripOffset(side) }
         let pitch = 5.037 * Float.pi / 180
         let forward: Float = 0.11
         // 11 cm forward along the pitched -z axis expressed in the unpitched grip frame.

@@ -203,6 +203,9 @@ public struct Setup {
         if let driverLibrary, (try? Data(contentsOf: library)) != driverLibrary {
             return ComponentState(kind: .updateAvailable, detail: "Installed; openvrlink-companion includes a different driver build." + compatibility)
         }
+        if driverLibrary != nil, !PlayForDreamModel.isPresent(inDriver: folder) {
+            return ComponentState(kind: .updateAvailable, detail: "Installed; an update adds the Play For Dream controller models." + compatibility)
+        }
         if driverLibrary != nil, !installedOwnTab, let vrlink = found.vrlink, !Install.vrlinkMenuPresent(inVRLink: vrlink) {
             return ComponentState(kind: .updateAvailable, detail: "Installed, but its controls are missing from SteamVR's VR Link settings (likely overwritten by a SteamVR update).")
         }
@@ -217,7 +220,8 @@ public struct Setup {
         let ownTab = self.ownTab ?? true
         try Install.writeDriver(to: driver, library: driverLibrary, beside: besideDriver, windows: windows, ownTab: ownTab)
         try Steam.setExternalDriver(driver, present: true, in: places)
-        var lines = ["VR Link extensions driver installed to \(Steam.nativePath(driver))"]
+        var lines = ["VR Link extensions driver installed to \(Steam.nativePath(driver))",
+                     "  with the Play For Dream controller models (\(PlayForDreamModel.models.joined(separator: ", ")))"]
         if let vrlink = found.vrlink {
             do {
                 try Install.setVRLinkMenu(present: !ownTab, inVRLink: vrlink)

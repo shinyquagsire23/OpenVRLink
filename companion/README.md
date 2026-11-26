@@ -7,7 +7,8 @@ FoundationEssentials:
 | target | description |
 |---|---|
 | `PatchCore` | Locates functions in `driver_vrlink`, patches DXBC and SPIR-V shaders, and implements the host side of the extension handshake. Uses only raw memory and Swift value types (no Foundation) so `driver_openvrlink` can link it directly |
-| `CompanionKit` | Locates Steam and SteamVR, adapts Sense controller render models, and installs `driver_openvrlink` and its settings schema entries |
+| `CompanionKit` | Locates Steam and SteamVR, adapts Sense controller render models, and installs `driver_openvrlink` (with the bundled Play For Dream controller models) and its settings schema entries |
+| `ControllerModels` | Bundles the Play For Dream MR controller render models (`pfd/`, redistributed with Play For Dream's permission) via `#embed` |
 | `openvrlink-companion` | GUI and command-line installer and diagnostic tool |
 | `WinAPI` | C header declarations for Win32 GUI, WinHTTP, and resource APIs on Windows (empty on other platforms) |
 | `driver_openvrlink` | Device-less SteamVR driver loaded into `vrserver` alongside `driver_vrlink` to apply in-memory hooks |
@@ -27,11 +28,15 @@ updated, and uninstalled separately:
   flags an available update if a better model source is installed later (such as
   installing Sony's app after using ALVR's models) or if the input remapping
   changes.
-- **VR Link extensions driver** (`driver`). Installs `driver_openvrlink` and
-  adds its settings controls to SteamVR's VR Link settings tab.
+- **VR Link extensions driver** (`driver`). Installs `driver_openvrlink`,
+  adds its settings controls to SteamVR's VR Link settings tab, and writes the
+  bundled Play For Dream MR controller render models into the driver's resources
+  so Play For Dream headsets show native controller models instead of Quest
+  Touch controllers (starting on the second session with that host).
   `openvrlink-companion` flags an update when its bundled driver differs from
-  the installed binary, or when a SteamVR update overwrites `driver_vrlink`'s
-  settings schema and removes the OpenVRLink controls.
+  the installed binary, when those controller models are missing, or when a
+  SteamVR update overwrites `driver_vrlink`'s settings schema and removes the
+  OpenVRLink controls.
 
 ### Windows
 

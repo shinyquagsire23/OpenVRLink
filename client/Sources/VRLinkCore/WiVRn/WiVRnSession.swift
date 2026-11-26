@@ -255,7 +255,8 @@ public final class WiVRnSession: StreamingSession {
     }
 
     private func headsetInfo() -> WiVRnHeadsetInfo {
-        let render = profile.eyePixels ?? WiVRnSession.defaultEyePixels
+        // Request detailEyePixels when available so WiVRn renders at center panel density and foveates the periphery.
+        let render = profile.detailEyePixels ?? profile.eyePixels ?? WiVRnSession.defaultEyePixels
         // Budget for two full-size eye streams plus an alpha stream at half of
         // one eye's area (2.5 eyes total). Without budgeting for the alpha stream,
         // WayVR's passthrough mode dropped to 97 fps on a 120 Hz display.
@@ -303,8 +304,15 @@ public final class WiVRnSession: StreamingSession {
 
     /// Sends a single packet over the UDP media socket, encrypting it if a cipher is active.
     private func sendStream(_ packet: Bytes) {
-        stream.send(streamCipher?.sealed(packet) ?? packet)
+        if !stream.send(streamCipher?.sealed(packet) ?? packet) { sendsRefused += 1 }
     }
+
+    /// Rejected outbound datagram count and peak loop iteration duration since the last 1-second log report.
+    private var sendsRefused = 0
+    private var hapticsBySide = [0, 0]
+    private var longestLoop: Int64 = 0
+    /// Summary of the most recent input state sent for each hand.
+    private var handsSent = ["nothing", "nothing"]
 
     /// Reads from the TCP control socket until a complete packet arrives or `timeout` elapses.
     private func awaitControl(timeout: Double = 10, required: Bool = true) throws -> WiVRnToHeadset? {
@@ -365,11 +373,15 @@ public final class WiVRnSession: StreamingSession {
         var frameStart = WiVRnSession.now()
         var sends = trackingTimes(from: frameStart)
         var nextReport = Date().addingTimeInterval(1)
+        var lastLoop: Int64?, reports = 0
         while true {
             lock.lock()
             let keepGoing = running, period = refreshPeriod
             lock.unlock()
             if !keepGoing { return }
+            let loopStart = WiVRnSession.now()
+            if let last = lastLoop { longestLoop = max(longestLoop, loopStart - last) }
+            lastLoop = loopStart
 
             let due = sends.first?.at ?? frameStart
             let readable = Sockets.readable([stream.descriptor, control.descriptor],
@@ -411,7 +423,20 @@ public final class WiVRnSession: StreamingSession {
                 }
                 onLog?("left eye \(framesReceived[0]) frames/s, right eye \(framesReceived[1]); so far \(framesLost[0]) and \(framesLost[1]) lost"
                        + "; audio \(audio.underruns) underruns, \(audio.overflows) overflows"
-                       + (hapticPulses > 0 ? "; \(hapticPulses) haptic pulses played" : ""))
+                       + (hapticPulses > 0 ? "; \(hapticPulses) haptic pulses played (\(hapticsBySide[0]) left, \(hapticsBySide[1]) right)" : ""))
+                hapticsBySide = [0, 0]
+                if longestLoop > 100_000_000 {
+                    onLog?("the session thread was held up: \(longestLoop / 1_000_000) ms in one pass")
+                }
+                if sendsRefused > 0 { onLog?("\(sendsRefused) datagrams not sent; the last: \(stream.lastSendErrorText)") }
+                reports += 1
+                // Every second while a controller is held, otherwise every five.
+                if reports % 5 == 0 || handsSent.contains(where: { $0.hasPrefix("controller") }) {
+                    onLog?("sending left hand: \(handsSent[0])")
+                    onLog?("sending right hand: \(handsSent[1])")
+                }
+                longestLoop = 0
+                sendsRefused = 0
                 framesReceived = [0, 0, 0]
                 hapticPulses = 0
                 nextReport = nextReport.addingTimeInterval(1)
@@ -466,6 +491,18 @@ public final class WiVRnSession: StreamingSession {
                 grip.pose = aiming.aimPose(side)
                 poses.append(WiVRnDevicePose(WiVRn.Device.aim(side), grip))
                 inputs += controller.wivrnInputs(side)
+                let at = controller.grip.pose.position, aimed = grip.pose
+                func on(_ name: String, _ value: Bool) -> String { value ? " " + name : "" }
+                handsSent[side.rawValue] = String(format: "controller grip %.2f %.2f %.2f, %.2f m/s, %.1f rad/s; aim (%@) sent %.0f ms ahead at %.2f %.2f %.2f pointing %.2f %.2f %.2f; trigger %.2f squeeze %.2f stick %.2f %.2f;",
+                                                  at.x, at.y, at.z, length(controller.grip.linearVelocity), length(controller.grip.angularVelocity),
+                                                  controller.aim == nil ? "computed from grip" : "from runtime", ahead * 1000,
+                                                  aimed.position.x, aimed.position.y, aimed.position.z,
+                                                  aimed.forward.x, aimed.forward.y, aimed.forward.z,
+                                                  controller.trigger, controller.squeeze, controller.stickX, controller.stickY)
+                    + on("lower", controller.lowerButton) + on("upper", controller.upperButton) + on("menu", controller.menuButton)
+                    + on("stick", controller.stickClick) + on("lower-touch", controller.lowerButtonTouched)
+                    + on("upper-touch", controller.upperButtonTouched) + on("trigger-touch", controller.triggerTouched)
+                    + on("stick-touch", controller.stickTouched) + on("rest-touch", controller.thumbRestTouched)
             case .hand(let hand, let gestures, let aim):
                 nowHolding[side.rawValue] = WiVRn.InteractionProfile.hand
                 // Map palm to grip, thumb-index midpoint (with aim orientation) to
@@ -476,8 +513,9 @@ public final class WiVRnSession: StreamingSession {
                 poses += [WiVRnDevicePose(WiVRn.Device.grip(side), hand.joints[0]), WiVRnDevicePose(WiVRn.Device.aim(side), aim),
                           WiVRnDevicePose(WiVRn.Device.pinchPose(side), pinch), WiVRnDevicePose(WiVRn.Device.poke(side), indexTip)]
                 inputs += gestures.wivrnInputs(side)
+                handsSent[side.rawValue] = "bare hand" + (gestures.pinch[0] ? ", pinching" : "") + (gestures.grip ? ", grasping" : "")
             case nil:
-                break
+                handsSent[side.rawValue] = "nothing"
             }
         }
         holding = nowHolding
@@ -540,7 +578,9 @@ public final class WiVRnSession: StreamingSession {
             // when the set of requested devices changes.
             if pattern.map(\.device) != self.pattern.map(\.device) {
                 let head = pattern.filter { $0.device == WiVRn.Device.head }.map { "\($0.prediction / 1_000_000) ms" }
-                onLog?("the host wants the head predicted \(head.joined(separator: ", ")) ahead, and \(pattern.count - head.count) poses of other devices")
+                let others = pattern.filter { $0.device != WiVRn.Device.head }.map { "\($0.device)" }
+                onLog?("the host wants the head predicted \(head.joined(separator: ", ")) ahead, and \(others.count) poses of other devices"
+                       + (others.isEmpty ? "" : " (" + others.joined(separator: ", ") + ")"))
             }
             self.pattern = pattern
         case .videoDescription(let description):
@@ -558,6 +598,7 @@ public final class WiVRnSession: StreamingSession {
             // Zero amplitude indicates a stop command; ignore it since our haptic pulses are short and self-terminating.
             guard let side = WiVRn.Device.haptics[device], amplitude > 0 else { break }
             hapticPulses += 1
+            hapticsBySide[side.rawValue] += 1
             onHaptic?(HapticPulse(side: side, frequency: frequency,
                                   seconds: max(Float(nanoseconds) / 1e9, HapticPulse.shortest), amplitude: min(1, amplitude)))
         case .serverMessage(let kind, let text):
@@ -644,7 +685,25 @@ public final class WiVRnSession: StreamingSession {
                                                   alpha: transparency))
                 }
             }
-            return FrameLayout.View(eye: views[eye].pose, tiles: tiles)
+            // Select the highest-density horizontal and vertical foveation bands for the sharp layer.
+            var sharp: FrameLayout.Sharp?
+            if across.count > 1 || down.count > 1, !across.isEmpty, !down.isEmpty {
+                func densest(_ bands: [(encoded: ClosedRange<Float>, source: ClosedRange<Float>)]) -> (encoded: ClosedRange<Float>, source: ClosedRange<Float>) {
+                    func density(_ band: (encoded: ClosedRange<Float>, source: ClosedRange<Float>)) -> Float {
+                        (band.encoded.upperBound - band.encoded.lowerBound) / max(1e-6, band.source.upperBound - band.source.lowerBound)
+                    }
+                    return bands.max { density($0) < density($1) } ?? bands[0]
+                }
+                let column = densest(across), row = densest(down)
+                sharp = FrameLayout.Sharp(
+                    frustum: Frustum(left: whole.left + (whole.right - whole.left) * column.source.lowerBound,
+                                     right: whole.left + (whole.right - whole.left) * column.source.upperBound,
+                                     down: whole.up - (whole.up - whole.down) * row.source.upperBound,
+                                     up: whole.up - (whole.up - whole.down) * row.source.lowerBound),
+                    width: Int((column.encoded.upperBound - column.encoded.lowerBound) * Float(encoded.width)),
+                    height: Int((row.encoded.upperBound - row.encoded.lowerBound) * Float(encoded.height)))
+            }
+            return FrameLayout.View(eye: views[eye].pose, tiles: tiles, sharp: sharp)
         }
         return FrameLayout(views: layoutViews, pictures: views.count + (alpha ? 1 : 0), eyePixels: pixels)
     }

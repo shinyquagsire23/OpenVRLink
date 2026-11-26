@@ -30,7 +30,9 @@ let package = Package(
         // Steam discovery, Sense controller model setup, and driver installation.
         // version.json from the repository root, compiled in as text.
         .target(name: "RepoVersion"),
-        .target(name: "CompanionKit", dependencies: ["PatchCore", "RepoVersion"]),
+        // The Play For Dream controller render models, compiled in as bytes.
+        .target(name: "ControllerModels", exclude: ["pfd"]),
+        .target(name: "CompanionKit", dependencies: ["PatchCore", "RepoVersion", "ControllerModels"]),
         .testTarget(name: "CompanionKitTests", dependencies: ["CompanionKit"]),
         // C target exposing Win32 GUI, WinHTTP, and resource APIs on Windows (empty on other platforms).
         .target(name: "WinAPI"),

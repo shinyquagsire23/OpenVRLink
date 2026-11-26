@@ -26,6 +26,23 @@ final class HandTests: XCTestCase {
         }
     }
 
+    func testHandPointerPressesOnIndexPinch() {
+        let head = Pose(position: Vec3(0, 1.6, 0), right: Vec3(1, 0, 0), up: Vec3(0, 1, 0), forward: Vec3(0, 0, -1))
+        var hand = TrackedHand.flat(wrist: wrist, side: .right)
+        var pointer = HandPointer()
+        let open = pointer.point(hand, side: .right, head: head, seconds: 1)
+        XCTAssertFalse(open.pressed)
+        // Verify the pointer ray points forward away from the head, matching TrackedHand.aim.
+        XCTAssertGreaterThan(open.ray.forward.dot(head.forward), 0.5)
+        hand.joints[TrackedHand.tip(0)].position = hand.joints[TrackedHand.thumbTip].position
+        XCTAssertTrue(pointer.point(hand, side: .right, head: head, seconds: 1.01).pressed)
+        // Held through the wider release distance.
+        hand.joints[TrackedHand.tip(0)].position = hand.joints[TrackedHand.thumbTip].position + Vec3(0, 0.03, 0)
+        XCTAssertTrue(pointer.point(hand, side: .right, head: head, seconds: 1.02).pressed)
+        hand.joints[TrackedHand.tip(0)].position = hand.joints[TrackedHand.thumbTip].position + Vec3(0, 0.05, 0)
+        XCTAssertFalse(pointer.point(hand, side: .right, head: head, seconds: 1.03).pressed)
+    }
+
     func testSkeletonSurvivesCompression() {
         for side in Side.allCases {
             let hand = TrackedHand.flat(wrist: wrist, side: side)

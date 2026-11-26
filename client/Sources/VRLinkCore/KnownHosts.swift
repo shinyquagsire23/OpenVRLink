@@ -20,6 +20,8 @@ public struct KnownHosts {
 
     private struct Host: Codable {
         var knowsHeadset = false
+        /// Optional for backward compatibility with older `hosts.json` files.
+        var playForDreamModels: Bool?
     }
 
     private func read() -> [String: Host] {
@@ -31,9 +33,16 @@ public struct KnownHosts {
         read()[String(clientID)]?.knowsHeadset ?? false
     }
 
-    public func set(_ clientID: UInt64, knowsHeadset: Bool) {
+    /// Whether the host's companion driver carries the Play For Dream controller render models
+    /// (`DeviceProfile.hostHasPlayForDreamModels`).
+    public func hasPlayForDreamModels(_ clientID: UInt64) -> Bool {
+        read()[String(clientID)]?.playForDreamModels ?? false
+    }
+
+    public func set(_ clientID: UInt64, knowsHeadset: Bool? = nil, playForDreamModels: Bool? = nil) {
         var hosts = read()
-        hosts[String(clientID), default: Host()].knowsHeadset = knowsHeadset
+        if let knowsHeadset { hosts[String(clientID), default: Host()].knowsHeadset = knowsHeadset }
+        if let playForDreamModels { hosts[String(clientID), default: Host()].playForDreamModels = playForDreamModels }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
         guard let data = try? encoder.encode(hosts) else { return }

@@ -24,6 +24,9 @@ public struct HostExtensions {
         /// (advertised in `oxAvail` only). Because the client sends its static HMD properties
         /// before receiving `oxAvail`, this flag is saved in `KnownHosts` for the next session.
         public static let headsetSettings = Features(rawValue: 1 << 1)
+        /// Host's `driver_openvrlink` was installed with the Play For Dream controller render models
+        /// (advertised in `oxAvail` only, and saved in `KnownHosts` for the next session like `headsetSettings`).
+        public static let playForDreamModels = Features(rawValue: 1 << 2)
     }
 
     enum Key {

@@ -24,6 +24,10 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Required to acquire a low-latency WifiManager.WifiLock while streaming (including Quest's vendor Wi-Fi lock permission). -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="com.oculus.permission.WIFI_LOCK" />
     <!-- Requested at runtime when starting a stream with "Send my microphone" enabled. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Requested at runtime when the immersive activity starts on Android XR. -->
@@ -32,9 +36,19 @@
     <uses-permission android:name="android.permission.EYE_TRACKING_FINE" />
     <uses-feature android:name="android.hardware.xr.input.eye_tracking" android:required="false" />
     <uses-permission android:name="android.permission.FACE_TRACKING" />
+    <uses-feature android:name="android.hardware.xr.input.controller" android:required="false" />
+    <uses-feature android:name="android.hardware.xr.input.hand_tracking" android:required="false" />
+    <!-- Requested at runtime for OpenXR eye gaze on Quest Pro and on Pico headsets that track eyes. -->
+    <uses-permission android:name="com.oculus.permission.EYE_TRACKING" />
+    <!-- Requested at runtime for XR_FB_face_tracking2 on Quest Pro (and Quest 3's audio-driven face). -->
+    <uses-permission android:name="com.oculus.permission.FACE_TRACKING" />
+    <uses-feature android:name="oculus.software.face_tracking" android:required="false" />
+    <uses-feature android:name="oculus.software.eye_tracking" android:required="false" />
+    <uses-permission android:name="com.picovr.permission.EYE_TRACKING" />
     <!-- Granted at install time for hand tracking on Quest. -->
     <uses-permission android:name="com.oculus.permission.HAND_TRACKING" />
     <uses-feature android:name="oculus.software.handtracking" android:required="false" />
+    <uses-feature android:name="com.oculus.feature.PASSTHROUGH" android:required="false" />
 
     <!-- Permissions and package-visibility queries required by the Khronos OpenXR Android loader. -->
     <uses-permission android:name="org.khronos.openxr.permission.OPENXR" />
@@ -54,7 +68,16 @@
         <uses-native-library android:name="libopenxr.google.so" android:required="false" />
         <meta-data android:name="com.oculus.supportedDevices" android:value="all" />
         <meta-data android:name="com.oculus.intent.category.VR" android:value="vr_only" />
+        <meta-data android:name="com.oculus.vr.focusaware" android:value="true" />
+        <meta-data android:name="com.yvr.intent.category.VR" android:value="vr_only" />
         <meta-data android:name="pvr.app.type" android:value="vr" />
+        <meta-data android:name="pvr.sdk.version" android:value="OpenXR" />
+        <!-- Declares 6DoF headset and dual-controller support for Vive launchers. -->
+        <meta-data android:name="com.htc.vr.content.NumDoFHmd" android:value="6DoF" />
+        <meta-data android:name="com.htc.vr.content.NumDoFController" android:value="6DoF" />
+        <meta-data android:name="com.htc.vr.content.NumController" android:value="2" />
+        <!-- Requests system room-boundary rendering on Android XR during opaque full-space streaming. -->
+        <property android:name="android.window.PROPERTY_XR_BOUNDARY_TYPE_RECOMMENDED" android:value="XR_BOUNDARY_TYPE_LARGE" />
 
         <!-- Immersive activity that runs the OpenXR session with the panel rendered as a quad layer. -->
         <activity android:name="android.app.NativeActivity"
@@ -62,8 +85,11 @@
             android:launchMode="singleTask"
             android:screenOrientation="landscape"
             android:excludeFromRecents="false"
+            android:resizeableActivity="false"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
             android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|uiMode">
             <meta-data android:name="android.app.lib_name" android:value="OpenVRLinkAndroid" />
+            <meta-data android:name="pvr.app.type" android:value="vr" />
             <!-- Launch directly into unmanaged full-space OpenXR rendering rather than 2D system panels. -->
             <property android:name="android.window.PROPERTY_XR_ACTIVITY_START_MODE"
                 android:value="XR_ACTIVITY_START_MODE_FULL_SPACE_UNMANAGED" />
@@ -72,6 +98,7 @@
                 @IMMERSIVE_LAUNCHER@
                 <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
                 <category android:name="com.oculus.intent.category.VR" />
+                <category android:name="com.yvr.intent.category.VR" />
             </intent-filter>
         </activity>
 

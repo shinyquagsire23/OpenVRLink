@@ -32,6 +32,11 @@ public enum Handshake {
     /// sets this bit); because the client sends its HMD model before receiving `oxAvail`,
     /// it saves this flag for the next session.
     public static let headsetFeature: UInt32 = 1 << 1
+    /// Advertised in `oxAvail` when `driver_openvrlink` includes the Play For Dream controller render models
+    /// (`{openvrlink}pfd_mr_controller_left` and `{openvrlink}pfd_mr_controller_right`). Like `headsetFeature`,
+    /// this bit is only set in `oxAvail`; because the client sends controller static properties before receiving
+    /// `oxAvail`, it caches this flag for the next session.
+    public static let playForDreamModelsFeature: UInt32 = 1 << 2
 
     /// Milliseconds between changes of a heartbeat value.
     public static let beat: UInt64 = 250

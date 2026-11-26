@@ -26,6 +26,24 @@ public struct XRPlatform {
     public var systemButton: (() -> Bool)?
     /// Per-headset controller grip pose offset (`HeadsetQuirks.gripOffset`).
     public var gripOffset: HeadsetQuirks.GripOffset?
+    /// Width and height in pixels of the secondary sharp-layer swapchains (`XRDisplay.init`), or 0 to disable.
+    public var sharpLayerPixels = 0
+    /// Ratio of the display's center pixel density to the recommended eye swapchain size.
+    public var eyeDetail: Float = 1
+    /// Request sustained high CPU and GPU performance levels (`HeadsetQuirks.sustainedPerformance`).
+    public var sustainedPerformance = true
+    /// Start sessions with a reduced uplink packet rate (`HeadsetQuirks.leanUplink`).
+    public var leanUplink = false
+    /// `HeadsetQuirks.compositorPlacesLayers` and `HeadsetQuirks.passthroughLayer`.
+    public var compositorPlacesLayers = true, passthroughLayer = false
+    /// Whether the headset uses Play For Dream controllers (`DeviceProfile.playForDreamControllers`).
+    public var playForDreamControllers = false
+    /// `HeadsetQuirks.headVelocityFromPoses` and `controllerVelocityFromPoses`.
+    public var headVelocityFromPoses = false, controllerVelocityFromPoses = false
+    /// `HeadsetQuirks.colorSpace`.
+    public var colorSpace = "rec709"
+    /// `HeadsetQuirks.encodingGamma`.
+    public var encodingGamma = true
 
     public init(device: DeviceIdentity) {
         self.device = device
@@ -63,9 +81,14 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
         link = StreamLink(decoder: decoder)
         let layer = XRPanelLayer(width: panel.width, height: panel.height)
         display = try XRDisplay(applicationName: applicationName, graphics: graphics, frames: link.frames, panel: layer,
-                                process: process, log: log)
+                                process: process, sharpLayerPixels: platform.sharpLayerPixels, eyeDetail: platform.eyeDetail,
+                                sustainedPerformance: platform.sustainedPerformance,
+                                compositorPlacesLayers: platform.compositorPlacesLayers,
+                                passthroughLayer: platform.passthroughLayer, colorSpace: platform.colorSpace, log: log)
         if let offset = platform.gripOffset, !offset.isNone { display.input.gripOffsets = Side.allCases.map { offset.pose(for: $0) } }
         display.input.systemButton = platform.systemButton
+        display.input.headVelocityFromPoses = platform.headVelocityFromPoses
+        display.input.controllerVelocityFromPoses = platform.controllerVelocityFromPoses
         panel.showsPointer = true
         let hint = "Hold the menu button to show or hide this panel while streaming."
         panel.hint = hint
@@ -176,6 +199,9 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
         updatePlaySpace()
         let settings = model.settings
         profile.systemName = platform.device.systemName
+        profile.leanUplink = platform.leanUplink
+        profile.wantsEncodingGamma = platform.encodingGamma
+        profile.playForDreamControllers = platform.playForDreamControllers
         profile.clientVersion = platform.device.clientVersion
         profile.eyeFrusta = profile.eyeFrusta.map { $0.scaled(horizontal: settings.fovScaleHorizontal, vertical: settings.fovScaleVertical) }
         var connector = HostConnector(platform.device)

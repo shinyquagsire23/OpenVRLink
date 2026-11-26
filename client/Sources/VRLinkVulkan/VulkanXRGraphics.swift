@@ -41,6 +41,7 @@ public final class VulkanXRGraphics: XRGraphics {
     private var linearTarget = false
     /// Per-eye Vulkan image views and framebuffers for the OpenXR swapchains.
     private var targets: [[Target]] = []
+    public private(set) var lastGPUWait: UInt64 = 0
     private var sizes: [VkExtent2D] = []
 
     private struct Target {
@@ -80,6 +81,10 @@ public final class VulkanXRGraphics: XRGraphics {
     private var frameCount = 0
     /// Retains the frame currently in flight on the GPU so its `AHardwareBuffer`s are not recycled prematurely.
     private var drawing: HardwareFrame?
+    /// Initial decoded frames of each stream read back to log average sampled brightness alongside `encodingGamma`.
+    private var streamRead = 0, streamLast: UInt16?
+    private var streamReadings: [(gamma: Float, mean: Float)] = []
+    private static let streamReads = 90
     private static let importsKept = 16
 
     private var vertexBuffer = Buffer(), indexBuffer = Buffer()
@@ -96,6 +101,7 @@ public final class VulkanXRGraphics: XRGraphics {
     public init(quirks: HeadsetQuirks = HeadsetQuirks(), log: @escaping (String) -> Void) {
         self.quirks = quirks
         self.log = log
+        heldCorrection = VulkanXRGraphics.treatment(from: quirks).correction
     }
 
     // MARK: Device
@@ -333,6 +339,12 @@ public final class VulkanXRGraphics: XRGraphics {
         case .narrow: conversion.ycbcrRange = VK_SAMPLER_YCBCR_RANGE_ITU_NARROW
         case .full: conversion.ycbcrRange = VK_SAMPLER_YCBCR_RANGE_ITU_FULL
         case nil: conversion.ycbcrRange = format.suggestedYcbcrRange
+        }
+        if quirks.shaderColorConversion {
+            // Request raw Y'CbCr values (RGB_IDENTITY, full range) so quad.frag performs the BT.2020 conversion.
+            conversion.ycbcrModel = VK_SAMPLER_YCBCR_MODEL_CONVERSION_RGB_IDENTITY
+            conversion.ycbcrRange = VK_SAMPLER_YCBCR_RANGE_ITU_FULL
+            log("vulkan: converting decoded pictures to RGB in the shader (BT.2020, full range) instead of in the sampler")
         }
         log("vulkan: decoded pictures are format \(format.format.rawValue) (external \(format.externalFormat)), model "
             + "\(format.suggestedYcbcrModel.rawValue), range \(format.suggestedYcbcrRange.rawValue) suggested and "
@@ -718,6 +730,202 @@ public final class VulkanXRGraphics: XRGraphics {
     private var shrinkDrawn: (frame: HardwareFrame, plan: StereoPlan, done: (StereoPair?) -> Void)?
     private var shrinkComplained = false
 
+    /// Fallback 3x4 color correction matrix (`QuadStyle` `correction`) derived from `HeadsetQuirks` until
+    /// overridden by `ColorProbe`. Guarded by `shrinkLock`.
+    private var heldCorrection: [Float]
+    /// Per-external-format 3x4 color correction matrices measured by `ColorProbe` (8-bit and 10-bit streams use
+    /// distinct external formats). Guarded by `shrinkLock`.
+    private var measuredCorrections: [UInt64: [Float]] = [:]
+    /// Active 3x4 color correction matrix for the current video sampler format.
+    private var colorCorrection: [Float] {
+        shrinkLock.lock()
+        defer { shrinkLock.unlock() }
+        return sampling.flatMap { measuredCorrections[$0.externalFormat] } ?? heldCorrection
+    }
+    /// Pending and in-flight `ColorProbe` readback requests (analogous to `shrinkAsked` / `shrinkDrawn`).
+    private var probeAsked: (frame: HardwareFrame, done: ((colors: [[Float]], format: UInt64)?) -> Void)?
+    private var probeDrawn: (frame: HardwareFrame, format: UInt64, done: ((colors: [[Float]], format: UInt64)?) -> Void)?
+
+    /// Returns the fallback `ColorProbe.Treatment` configured by `quirks`.
+    public static func treatment(from quirks: HeadsetQuirks) -> ColorProbe.Treatment {
+        ColorProbe.Treatment(matrix: quirks.shaderColorConversion ? nil : .bt2020, stretched: quirks.undoRangeStretch)
+    }
+
+    /// Stores the inverse color matrix for `treatment` on external buffer format `format` (at `bits` bits per
+    /// sample), taking effect on the next rendered frame. Thread-safe.
+    public func correct(for treatment: ColorProbe.Treatment, bits: Int, format: UInt64) {
+        shrinkLock.lock()
+        measuredCorrections[format] = treatment.correction(bits: bits)
+        shrinkLock.unlock()
+    }
+
+    /// Renders a decoded `ColorProbe` frame through the stream's Y'CbCr sampler with no color correction, reads
+    /// back the center of each of the 16 patches, and delivers the unclamped RGB values and external buffer
+    /// format on the render thread.
+    public func probeColors(_ frame: HardwareFrame, done: @escaping ((colors: [[Float]], format: UInt64)?) -> Void) {
+        shrinkLock.lock()
+        let passedOver = probeAsked
+        probeAsked = (frame, done)
+        shrinkLock.unlock()
+        passedOver?.done(nil)
+    }
+
+    /// Samples the initial frames of each stream uncorrected and logs average brightness grouped by `encodingGamma`
+    /// to verify that the host's shader patch brightened frames once `encodingGamma > 1` took effect.
+    private func noteStreamStart(_ frame: HardwareFrame?) {
+        guard let frame else {
+            streamRead = 0
+            streamLast = nil
+            streamReadings = []
+            return
+        }
+        guard quirks.measureColors, streamRead < VulkanXRGraphics.streamReads, frame.frameID != streamLast else { return }
+        streamLast = frame.frameID
+        streamRead += 1
+        let gamma = frame.layout.encodingGamma, last = streamRead == VulkanXRGraphics.streamReads
+        probeColors(frame) { [self] read in
+            if let colors = read?.colors {
+                let all = colors.flatMap { $0.prefix(3) }
+                streamReadings.append((gamma, all.reduce(0, +) / Float(max(1, all.count))))
+            }
+            guard last, !streamReadings.isEmpty else { return }
+            // Group consecutive frames with identical gamma and log their mean brightness.
+            var runs: [(gamma: Float, count: Int, sum: Float)] = []
+            for reading in streamReadings {
+                if let end = runs.last, end.gamma == reading.gamma {
+                    runs[runs.count - 1] = (end.gamma, end.count + 1, end.sum + reading.mean)
+                } else {
+                    runs.append((reading.gamma, 1, reading.mean))
+                }
+            }
+            log("colors: initial stream frames as sampled: "
+                + runs.map { String(format: "%d with gamma %.2f averaging %.3f", $0.count, $0.gamma, $0.sum / Float($0.count)) }.joined(separator: ", then "))
+            streamReadings = []
+        }
+    }
+
+    /// Records the pass for `probeAsked`: the whole picture into `shrinkTarget`, then into `shrinkPixels`.
+    /// Returns whether it took the target, in which case no stereo downsample is recorded this frame.
+    private func recordProbe(_ sets: inout [Int: VkDescriptorSet?]) -> Bool {
+        shrinkLock.lock()
+        let asked = probeAsked
+        // The target and its readback buffer are shared with the stereo downsample: wait for one in flight.
+        let free = shrinkDrawn == nil
+        if free { probeAsked = nil }
+        shrinkLock.unlock()
+        guard let asked, free else { return false }
+        do {
+            guard supportsDepth, let picture = asked.frame.pictures.first, let color = try view(of: picture, with: commands),
+                  let sampling else {
+                asked.done(nil)
+                return false
+            }
+            let side = ColorProbe.side
+            try readyShrinkTarget(eyeWidth: side / 2, height: side)
+            // Two triangles over the whole target, in QuadMesh's vertex layout.
+            var corners: [Float] = []
+            for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 0), (1, 1), (0, 1)] as [(Float, Float)] {
+                corners += [x * 2 - 1, y * 2 - 1, 0, 1, x, y, x, y, 0.5, 0.5, 1]
+            }
+            try reserve(&shrinkVertices, bytes: corners.count * MemoryLayout<Float>.size, usage: VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)
+            try reserve(&shrinkPixels, bytes: side * side * 4, usage: VK_BUFFER_USAGE_TRANSFER_DST_BIT)
+            guard let mapped = shrinkVertices.mapped else {
+                asked.done(nil)
+                return false
+            }
+            corners.withUnsafeBytes { mapped.copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+
+            var barrier = VkImageMemoryBarrier()
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+            barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT.rawValue
+            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED
+            barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+            barrier.srcQueueFamilyIndex = UInt32.max
+            barrier.dstQueueFamilyIndex = UInt32.max
+            barrier.image = shrinkTarget.image
+            barrier.subresourceRange = Vulkan.wholeColor
+            vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT.rawValue,
+                                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT.rawValue, 0, 0, nil, 0, nil, 1, &barrier)
+            let size = VkExtent2D(width: UInt32(side), height: UInt32(side))
+            var clear = VkClearValue(color: VkClearColorValue(float32: (0, 0, 0, 1)))
+            var pass = VkRenderPassBeginInfo()
+            pass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO
+            pass.renderPass = renderPass
+            pass.framebuffer = shrinkTarget.framebuffer
+            pass.renderArea.extent = size
+            pass.clearValueCount = 1
+            withUnsafePointer(to: &clear) {
+                pass.pClearValues = $0
+                vkCmdBeginRenderPass(commands, &pass, VK_SUBPASS_CONTENTS_INLINE)
+            }
+            vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, sampling.pipeline)
+            var vertexHandle = shrinkVertices.handle
+            var offset = VkDeviceSize(0)
+            vkCmdBindVertexBuffers(commands, 0, 1, &vertexHandle, &offset)
+            var style = QuadStyle(feather: 0, hasAlpha: 0, gamma: 1, linearTarget: linearTarget ? 1 : 0, fill: [0, 0, 0, 0], key: nil,
+                                  correction: ColorProbe.noCorrection, probe: true)
+            vkCmdPushConstants(commands, sampling.layout, VK_SHADER_STAGE_FRAGMENT_BIT.rawValue, 0,
+                               UInt32(MemoryLayout<Float>.size * QuadStyle.floats), &style.values)
+            let key = 0xFE << 8 | 0xFF
+            if sets[key] == nil { sets[key] = try descriptors(sampling, color: color, alpha: color) }
+            var set: VkDescriptorSet? = sets[key] ?? nil
+            var viewport = VkViewport(x: 0, y: 0, width: Float(side), height: Float(side), minDepth: 0, maxDepth: 1)
+            var scissor = VkRect2D(offset: VkOffset2D(x: 0, y: 0), extent: size)
+            vkCmdSetViewport(commands, 0, 1, &viewport)
+            vkCmdSetScissor(commands, 0, 1, &scissor)
+            vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, sampling.layout, 0, 1, &set, 0, nil)
+            vkCmdDraw(commands, 6, 1, 0, 0)
+            vkCmdEndRenderPass(commands)
+
+            barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT.rawValue
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT.rawValue
+            barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+            vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT.rawValue,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT.rawValue, 0, 0, nil, 0, nil, 1, &barrier)
+            var region = VkBufferImageCopy()
+            region.imageSubresource = VkImageSubresourceLayers(aspectMask: VK_IMAGE_ASPECT_COLOR_BIT.rawValue, mipLevel: 0,
+                                                               baseArrayLayer: 0, layerCount: 1)
+            region.imageExtent = VkExtent3D(width: size.width, height: size.height, depth: 1)
+            vkCmdCopyImageToBuffer(commands, shrinkTarget.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, shrinkPixels.handle, 1, &region)
+            probeDrawn = (asked.frame, sampling.externalFormat, asked.done)
+            return true
+        } catch {
+            log("vulkan: could not read back color probe frame: \(error)")
+            asked.done(nil)
+            return false
+        }
+    }
+
+    /// Extracts the 16 patch colors from the completed `recordProbe` readback buffer.
+    private func finishProbe() {
+        guard let drawn = probeDrawn else { return }
+        probeDrawn = nil
+        guard let mapped = shrinkPixels.mapped else {
+            drawn.done(nil)
+            return
+        }
+        let side = ColorProbe.side, patch = side / ColorProbe.across
+        let bytes = mapped.assumingMemoryBound(to: UInt8.self)
+        let blueFirst = targetFormat == VK_FORMAT_B8G8R8A8_SRGB || targetFormat == VK_FORMAT_B8G8R8A8_UNORM
+        var colors: [[Float]] = []
+        for index in 0..<(ColorProbe.across * ColorProbe.across) {
+            // Average the center quarter of each patch to avoid chroma bleed from neighboring patches.
+            var sums = [0, 0, 0], count = 0
+            let left = (index % ColorProbe.across) * patch + patch * 3 / 8, top = (index / ColorProbe.across) * patch + patch * 3 / 8
+            for row in top..<(top + patch / 4) {
+                for column in left..<(left + patch / 4) {
+                    let at = (row * side + column) * 4
+                    for channel in 0..<3 { sums[channel] += Int(bytes[at + (blueFirst ? 2 - channel : channel)]) }
+                    count += 1
+                }
+            }
+            // Invert the probe pass's `sampled * 0.5 + 0.25` encoding.
+            colors.append(sums.map { (Float($0) / Float(count) / 255 - 0.25) * 2 })
+        }
+        drawn.done((colors, drawn.format))
+    }
+
     /// Stereo depth readback requires an 8-bit RGBA/BGRA swapchain format.
     public var supportsDepth: Bool { VulkanXRGraphics.formats.contains(targetFormat) }
 
@@ -885,7 +1093,8 @@ public final class VulkanXRGraphics: XRGraphics {
             var offset = VkDeviceSize(0)
             vkCmdBindVertexBuffers(commands, 0, 1, &vertexHandle, &offset)
             // Stereo matching only compares left and right luma, so skip gamma decoding and feathering.
-            var style = QuadStyle(feather: 0, hasAlpha: 0, gamma: 1, linearTarget: linearTarget ? 1 : 0, fill: [0, 0, 0, 0], key: nil)
+            var style = QuadStyle(feather: 0, hasAlpha: 0, gamma: 1, linearTarget: linearTarget ? 1 : 0, fill: [0, 0, 0, 0], key: nil,
+                                  correction: colorCorrection)
             vkCmdPushConstants(commands, sampling.layout, VK_SHADER_STAGE_FRAGMENT_BIT.rawValue, 0,
                                UInt32(MemoryLayout<Float>.size * QuadStyle.floats), &style.values)
             for draw in draws {
@@ -1073,7 +1282,9 @@ public final class VulkanXRGraphics: XRGraphics {
         retired.forEach(destroy)
         retired = []
         finishShrink()
+        finishProbe()
         drawing = frame
+        noteStreamStart(frame)
         frameCount += 1
 
         try Vulkan.check(vkResetCommandBuffer(commands, 0), "vkResetCommandBuffer")
@@ -1105,12 +1316,15 @@ public final class VulkanXRGraphics: XRGraphics {
         try reserve(&indexBuffer, bytes: indexCount * MemoryLayout<UInt16>.size, usage: VK_BUFFER_USAGE_INDEX_BUFFER_BIT)
         if let sampling { vkResetDescriptorPool(device, sampling.descriptors, 0) }
         var sets: [Int: VkDescriptorSet?] = [:]
-        recordShrink(&sets)
+        if !recordProbe(&sets) { recordShrink(&sets) }
 
         var vertexBase = 0, indexBase = 0
         for (eye, mesh) in zip(eyes, meshes) {
-            let size = sizes[eye.eye]
-            var clear = VkClearValue(color: VkClearColorValue(float32: (0, 0, 0, transparent ? 0 : 1)))
+            var size = sizes[eye.eye]
+            if let part = eye.size {
+                size = VkExtent2D(width: min(size.width, UInt32(max(1, part.width))), height: min(size.height, UInt32(max(1, part.height))))
+            }
+            var clear = VkClearValue(color: VkClearColorValue(float32: (0, 0, 0, transparent || eye.clear ? 0 : 1)))
             var pass = VkRenderPassBeginInfo()
             pass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO
             pass.renderPass = renderPass
@@ -1149,7 +1363,8 @@ public final class VulkanXRGraphics: XRGraphics {
                 var set = sets[key] ?? nil
                 vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, sampling.layout, 0, 1, &set, 0, nil)
                 var style = QuadStyle(feather: draw.feather, hasAlpha: alpha != nil && !filled ? 1 : 0, gamma: frame?.layout.encodingGamma ?? 1,
-                                      linearTarget: linearTarget ? 1 : 0, fill: draw.fill ?? [0, 0, 0, 0], key: keying)
+                                      linearTarget: linearTarget ? 1 : 0, fill: draw.fill ?? [0, 0, 0, 0], key: keying,
+                                      correction: colorCorrection)
                 vkCmdPushConstants(commands, sampling.layout, VK_SHADER_STAGE_FRAGMENT_BIT.rawValue, 0,
                                    UInt32(MemoryLayout<Float>.size * QuadStyle.floats), &style.values)
                 vkCmdDrawIndexed(commands, UInt32(draw.indexCount), 1, UInt32(draw.firstIndex), Int32(draw.firstVertex), 0)
@@ -1168,10 +1383,13 @@ public final class VulkanXRGraphics: XRGraphics {
             try Vulkan.check(vkQueueSubmit(queue, 1, &submit, fence), "vkQueueSubmit")
         }
         submitted = true
+        lastGPUWait = 0
         if quirks.waitForGPU {
             // Wait for rendering to finish before the caller releases the swapchain images to the OpenXR runtime.
             var waiting = fence
+            let began = Uptime.nanoseconds
             vkWaitForFences(device, 1, &waiting, 1, UInt64.max)
+            lastGPUWait = Uptime.nanoseconds - began
         }
     }
 
@@ -1207,11 +1425,16 @@ public final class VulkanXRGraphics: XRGraphics {
 
 /// Push-constant block matching `Style` in `quad.frag` (keep layout synchronized with the shader).
 private struct QuadStyle {
-    static let floats = 14
+    static let floats = 28
     var values: [Float]
 
-    init(feather: Float, hasAlpha: Float, gamma: Float, linearTarget: Float, fill: [Float], key: ChromaKey?) {
+    /// - Parameters:
+    ///   - correction: Row-major 3x4 color correction matrix (`ColorProbe.Treatment.correction`).
+    ///   - probe: Encode unclamped sampled colors for `ColorProbe` readback instead of normal rendering.
+    init(feather: Float, hasAlpha: Float, gamma: Float, linearTarget: Float, fill: [Float], key: ChromaKey?, correction: [Float],
+         probe: Bool = false) {
         values = [feather, hasAlpha, gamma, linearTarget] + fill + (key.map { $0.color + [1, $0.near, $0.far] } ?? [0, 0, 0, 0, 0, 0])
+            + [probe ? 1 : 0, 0] + correction
     }
 }
 
