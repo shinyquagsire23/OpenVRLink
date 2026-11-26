@@ -239,7 +239,7 @@ public final class Panel {
         igFontScale(1)
         igSeparator()
         igSpacing()
-        igText("What it runs")
+        igText("Protocol")
         if igRadio("Steam", remembered.kind == .steam) { remembered.kind = .steam }
         igSameLine(30 * unit)
         if igRadio("WiVRn", remembered.kind == .wivrn) { remembered.kind = .wivrn }

@@ -16,6 +16,8 @@ public struct HeadsetQuirks: Equatable {
     public enum Headset: String {
         case quest1, quest2, quest3, quest3S, questPro, quest
         case pico, galaxyXR, lynx, vive, yvr, playForDream
+        /// Valve's Steam Frame, where Android apps run in its Lepton container.
+        case steamFrame
         case unknown
     }
 
@@ -127,7 +129,7 @@ public struct HeadsetQuirks: Equatable {
             case .galaxyXR: own = GripOffset(z: 0.055)
             case .quest, .quest2, .quest3, .quest3S, .questPro: return GripOffset()
             // Play For Dream controllers use a dedicated host-side grip offset in ControllerState.gripOffset.
-            case .lynx, .yvr, .playForDream, .unknown: return GripOffset()
+            case .lynx, .yvr, .playForDream, .steamFrame, .unknown: return GripOffset()
             }
             // Apply the headset's offset to ALVR's common grip pose, then the inverse of Quest's offset.
             let identity = Pose(position: Vec3(0, 0, 0), right: Vec3(1, 0, 0), up: Vec3(0, 1, 0), forward: Vec3(0, 0, -1))
@@ -154,6 +156,9 @@ public struct HeadsetQuirks: Equatable {
             passthroughLayer = true
             sharpLayerPixels = 0
         }
+        // Lepton has only Android's software video decoders. Asked for low latency, its HEVC one refuses to
+        // configure, and the media framework then crashes the app while cleaning up after the refusal.
+        if headset == .steamFrame { decoderLowLatency = false }
         if [.pico, .vive, .yvr, .playForDream].contains(headset) { headVelocityFromPoses = true }
         if headset == .pico || headset == .vive { controllerVelocityFromPoses = true }
         // Play For Dream's decoder/sampler path applies narrow-range expansion to full-range frames, crushing blacks.
@@ -175,6 +180,7 @@ public struct HeadsetQuirks: Equatable {
         case ("yvr", _): return .yvr
         case ("play for dream", _): return .playForDream
         case ("samsung", "xrvst2"): return .galaxyXR
+        case ("valve", _): return .steamFrame
         default: break
         }
         // Match Lynx headsets loosely by manufacturer/model/product until exact Build fields are confirmed.
