@@ -19,6 +19,9 @@ public final class QuadRenderer {
     private let device: MTLDevice
     private let library: MTLLibrary
     private let colorFormat: MTLPixelFormat, depthFormat: MTLPixelFormat
+    /// Current passthrough dimming opacity behind host-keyed frames, updated on the render thread.
+    private var dimNow: Float = 0, dimMoved: UInt64 = 0
+    private static let dimmedBy: Float = 0.75
     private let eyeCount: Int
     private let sampler: MTLSamplerState
     private var textureCache: CVMetalTextureCache!
@@ -216,6 +219,17 @@ public final class QuadRenderer {
         // linear light when linearOutput is enabled, or encoded sRGB values otherwise.
         let keyColor = (linearOutput ? chromaKey?.linearColor : chromaKey?.color) ?? [0, 0, 0]
         let encodingGamma = frame?.layout.encodingGamma ?? 1
+        // Host chroma keying overrides the client's chroma key for this frame. Dimming ramps up to `dimmedBy`
+        // over 50 ms and fades out over 100 ms, matching `vrlink`.
+        let hostKey = frame?.layout.hostKey
+        let now = Uptime.nanoseconds, seconds = dimMoved == 0 ? 0 : min(0.25, Float(now &- dimMoved) / 1e9)
+        dimMoved = now
+        let wanted: Float = hostKey?.dim == true ? QuadRenderer.dimmedBy : 0
+        let step = QuadRenderer.dimmedBy * seconds / (wanted > dimNow ? 0.05 : 0.1)
+        dimNow = wanted > dimNow ? min(wanted, dimNow + step) : max(wanted, dimNow - step)
+        // Use `vrlink`'s default threshold (0.04) when the host specifies 0.
+        let keying: [Float] = hostKey.map { $0.rgb + [2, $0.noiseFloor > 0 ? $0.noiseFloor : 0.04, dimNow, 0, 0] }
+            ?? keyColor + [0, chromaKey?.near ?? 0, chromaKey?.far ?? 1, 0, 0]
         // Each eye can have a different quad layout or count (for example, when
         // eye-tracked foveation splits each eye's tiles differently). Each draw
         // call pairs one quad slot per eye; if one eye has fewer quads, its
@@ -290,7 +304,7 @@ public final class QuadRenderer {
             draws.append(Draw(first: first, columns: columns, rows: rows,
                               style: [style.feather, hasAlpha ? 1 : 0, encodingGamma, linearOutput ? 1 : 0]
                                   + (style.fill ?? [0, 0, 0, 0])
-                                  + keyColor + [0, chromaKey?.near ?? 0, chromaKey?.far ?? 1, 0, 0],
+                                  + (style.fill == nil ? keying : keyColor + [0, chromaKey?.near ?? 0, chromaKey?.far ?? 1, 0, 0]),
                               shown: shown, alphas: alphas))
         }
         guard !vertices.isEmpty,

@@ -307,6 +307,16 @@ final class App: @unchecked Sendable {
                 }
                 if let last = found.last ?? nil, let treatment = last.finding.treatment {
                     graphics.correct(for: treatment, bits: clip.bits, format: last.format)
+                    // Read the final frame back with the correction applied to verify that rendered colors match BT.709.
+                    graphics.probeColors(frames[frames.count - 1], corrected: true) { result in
+                        guard let result, let finding = ColorProbe.analyze(result.colors, of: clip) else {
+                            Log.note("colors: \(clip.name): could not read back frame after correction")
+                            return
+                        }
+                        Log.note("colors: \(clip.name): after correction, " + (finding.treatment == .right
+                            ? "colors match full-range BT.709 (within \(String(format: "%.3f", finding.worst)))"
+                            : "colors are still off: \(finding.description)"))
+                    }
                 } else {
                     Log.note("colors: \(clip.name): falling back to configured color quirks")
                 }
@@ -382,6 +392,7 @@ final class App: @unchecked Sendable {
         platform.playForDreamControllers = quirks.headset == .playForDream
         platform.headVelocityFromPoses = quirks.headVelocityFromPoses
         platform.colorSpace = quirks.colorSpace
+        platform.layerFilter = quirks.layerFilter
         platform.encodingGamma = quirks.encodingGamma
         platform.controllerVelocityFromPoses = quirks.controllerVelocityFromPoses
         platform.systemButton = { [weak self] in

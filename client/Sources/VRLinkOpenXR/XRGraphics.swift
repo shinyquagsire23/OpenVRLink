@@ -44,6 +44,10 @@ public struct XREyeDraw {
 /// `XRDisplay` manages the OpenXR session, frame timing loop, and swapchain lifecycle, while `XRGraphics`
 /// creates the GPU device required by the runtime, wraps swapchain images, and renders quads from decoded
 /// `Frame` textures.
+extension XRGraphics {
+    public var supportsHostChromaKey: Bool { false }
+}
+
 public protocol XRGraphics: AnyObject {
     /// Decoded video frame type sampled by this renderer.
     associatedtype Frame: StreamFrame
@@ -85,6 +89,8 @@ public protocol XRGraphics: AnyObject {
     var chromaKey: ChromaKey? { get set }
     /// Whether the graphics device supports chroma-keyed rendering. Valid after `prepare` completes.
     var supportsChromaKey: Bool { get }
+    /// Whether the renderer supports per-frame SteamVR host chroma keying (`FrameLayout.HostKey`).
+    var supportsHostChromaKey: Bool { get }
 
     /// Whether decoded frames can be read back for stereo depth estimation.
     var supportsDepth: Bool { get }

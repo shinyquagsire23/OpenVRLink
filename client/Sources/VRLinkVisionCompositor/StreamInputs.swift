@@ -48,6 +48,9 @@ public final class StreamInputs {
         guard var profile = measured.value?.profile else { return nil }
         let chosen = settings.current
         profile.senseControllerModels = chosen.senseControllerModels
+        // Both visionOS renderers use `QuadRenderer`, which supports per-frame host chroma keying and
+        // transparent passthrough.
+        profile.hostChromaKey = true
         // Both renderers provide gaze input: CompositorDisplay reads the
         // rasterization rate map, and the RealityKit renderer uses Persona eye tracking.
         profile.tracksGaze = true

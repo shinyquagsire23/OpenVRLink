@@ -26,6 +26,8 @@ public struct QuadMesh {
         /// Indices of the color and optional alpha textures in the decoded frame.
         public var picture: Int
         public var alphaPicture: Int?
+        /// Normalized bounds and feather width of an overlapping feathered quad (see `Quad.covered`).
+        public var covered: (left: Float, top: Float, right: Float, bottom: Float, feather: Float)?
     }
 
     public private(set) var vertices: [Float] = []
@@ -77,7 +79,8 @@ public struct QuadMesh {
                 }
             }
             draws.append(Draw(firstIndex: firstIndex, indexCount: indices.count - firstIndex, firstVertex: firstVertex,
-                              feather: quad.feather, fill: quad.fill, picture: quad.picture, alphaPicture: quad.alpha?.picture))
+                              feather: quad.feather, fill: quad.fill, picture: quad.picture, alphaPicture: quad.alpha?.picture,
+                              covered: quad.covered))
         }
     }
 }

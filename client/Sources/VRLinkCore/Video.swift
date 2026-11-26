@@ -14,6 +14,9 @@ public struct FrameMetadata {
     /// Per-eye (`[left, right]`) bounds placing the foveal tile inside a virtual
     /// image of the base frustum rendered at foveal pixel density.
     public let insets: [(x: Float, y: Float, virtualWidth: Float, virtualHeight: Float)]
+    /// Per-frame host chroma key color index (`1...6`, or `0`/`7` when disabled) and room-dimming flag,
+    /// stored in bits 11...13 and bit 10 of the `u16` flags at +0xEE (`QSVLRendererXR::FlipFrame`).
+    public let keyColor: Int, keyDims: Bool
 
     public init(_ m: Bytes) {
         // A row-major 3x4 at +0x04: columns 0..2 are the head's right, up and
@@ -27,6 +30,9 @@ public struct FrameMetadata {
         atlasHeight = Int(m.integer(at: 0xE8) as UInt16)
         tileWidth = Int(m.integer(at: 0xEA) as UInt16)
         tileHeight = Int(m.integer(at: 0xEC) as UInt16)
+        let flags: UInt16 = m.count >= 0xF0 ? m.integer(at: 0xEE) : 0
+        keyColor = Int(flags >> 11 & 7)
+        keyDims = flags & 0x400 != 0
         insets = [0xC8, 0xD0].map { offset in
             (Float(m.integer(at: offset) as Int16), Float(m.integer(at: offset + 2) as Int16),
              Float(m.integer(at: offset + 4) as Int16), Float(m.integer(at: offset + 6) as Int16))
@@ -75,7 +81,12 @@ public struct FrameMetadata {
             ], sharp: FrameLayout.Sharp(frustum: fovea, width: tileWidth, height: tileHeight, tile: 1,
                                               rest: (tileWidth, tileHeight)))
         }
-        return FrameLayout(views: views, eyePixels: (atlasWidth, tileHeight))
+        var layout = FrameLayout(views: views, eyePixels: (atlasWidth, tileHeight))
+        layout.encodedWith = .bt709
+        if profile.hostChromaKey, let key = FrameLayout.HostKey(color: keyColor, dim: keyDims) {
+            layout.hostKey = key
+        }
+        return layout
     }
 }
 

@@ -24,6 +24,12 @@ public final class VulkanXRGraphics: XRGraphics {
     public var chromaKey: ChromaKey?
     /// Whether the physical device supports Vulkan dual-source blending for chroma keying. Valid after `prepare`.
     public private(set) var supportsChromaKey = false
+    /// Host chroma keying uses standard premultiplied alpha blending rather than dual-source blending.
+    public var supportsHostChromaKey: Bool { true }
+    /// Current passthrough dimming opacity behind host-keyed frames (`0...dimmedBy`), ramping in over 50 ms
+    /// and out over 100 ms to match `vrlink`. Accessed on the render thread.
+    private var dimNow: Float = 0, dimMoved: UInt64 = 0
+    private static let dimmedBy: Float = 0.75
 
     private let log: (String) -> Void
     private var instance: VkInstance?
@@ -742,8 +748,13 @@ public final class VulkanXRGraphics: XRGraphics {
         defer { shrinkLock.unlock() }
         return sampling.flatMap { measuredCorrections[$0.externalFormat] } ?? heldCorrection
     }
+    /// Returns the active color correction for `layout`, or an identity matrix when the bitstream specifies
+    /// its own color matrix.
+    private func correction(for layout: FrameLayout?) -> [Float] {
+        layout?.encodedWith == nil ? ColorProbe.noCorrection : colorCorrection
+    }
     /// Pending and in-flight `ColorProbe` readback requests (analogous to `shrinkAsked` / `shrinkDrawn`).
-    private var probeAsked: (frame: HardwareFrame, done: ((colors: [[Float]], format: UInt64)?) -> Void)?
+    private var probeAsked: (frame: HardwareFrame, corrected: Bool, done: ((colors: [[Float]], format: UInt64)?) -> Void)?
     private var probeDrawn: (frame: HardwareFrame, format: UInt64, done: ((colors: [[Float]], format: UInt64)?) -> Void)?
 
     /// Returns the fallback `ColorProbe.Treatment` configured by `quirks`.
@@ -762,10 +773,13 @@ public final class VulkanXRGraphics: XRGraphics {
     /// Renders a decoded `ColorProbe` frame through the stream's Y'CbCr sampler with no color correction, reads
     /// back the center of each of the 16 patches, and delivers the unclamped RGB values and external buffer
     /// format on the render thread.
-    public func probeColors(_ frame: HardwareFrame, done: @escaping ((colors: [[Float]], format: UInt64)?) -> Void) {
+    ///
+    /// When `corrected` is `true`, applies the active color correction for the frame's external format so the
+    /// readback reflects rendered stream output.
+    public func probeColors(_ frame: HardwareFrame, corrected: Bool = false, done: @escaping ((colors: [[Float]], format: UInt64)?) -> Void) {
         shrinkLock.lock()
         let passedOver = probeAsked
-        probeAsked = (frame, done)
+        probeAsked = (frame, corrected, done)
         shrinkLock.unlock()
         passedOver?.done(nil)
     }
@@ -863,7 +877,7 @@ public final class VulkanXRGraphics: XRGraphics {
             var offset = VkDeviceSize(0)
             vkCmdBindVertexBuffers(commands, 0, 1, &vertexHandle, &offset)
             var style = QuadStyle(feather: 0, hasAlpha: 0, gamma: 1, linearTarget: linearTarget ? 1 : 0, fill: [0, 0, 0, 0], key: nil,
-                                  correction: ColorProbe.noCorrection, probe: true)
+                                  correction: asked.corrected ? colorCorrection : ColorProbe.noCorrection, probe: true)
             vkCmdPushConstants(commands, sampling.layout, VK_SHADER_STAGE_FRAGMENT_BIT.rawValue, 0,
                                UInt32(MemoryLayout<Float>.size * QuadStyle.floats), &style.values)
             let key = 0xFE << 8 | 0xFF
@@ -1094,7 +1108,7 @@ public final class VulkanXRGraphics: XRGraphics {
             vkCmdBindVertexBuffers(commands, 0, 1, &vertexHandle, &offset)
             // Stereo matching only compares left and right luma, so skip gamma decoding and feathering.
             var style = QuadStyle(feather: 0, hasAlpha: 0, gamma: 1, linearTarget: linearTarget ? 1 : 0, fill: [0, 0, 0, 0], key: nil,
-                                  correction: colorCorrection)
+                                  correction: correction(for: asked.frame.layout))
             vkCmdPushConstants(commands, sampling.layout, VK_SHADER_STAGE_FRAGMENT_BIT.rawValue, 0,
                                UInt32(MemoryLayout<Float>.size * QuadStyle.floats), &style.values)
             for draw in draws {
@@ -1284,6 +1298,12 @@ public final class VulkanXRGraphics: XRGraphics {
         finishShrink()
         finishProbe()
         drawing = frame
+        // Ramp passthrough dimming toward the target opacity for this frame.
+        let now = Uptime.nanoseconds, seconds = dimMoved == 0 ? 0 : min(0.25, Float(now &- dimMoved) / 1e9)
+        dimMoved = now
+        let wanted: Float = frame?.layout.hostKey?.dim == true ? VulkanXRGraphics.dimmedBy : 0
+        let step = VulkanXRGraphics.dimmedBy * seconds / (wanted > dimNow ? 0.05 : 0.1)
+        dimNow = wanted > dimNow ? min(wanted, dimNow + step) : max(wanted, dimNow - step)
         noteStreamStart(frame)
         frameCount += 1
 
@@ -1344,15 +1364,23 @@ public final class VulkanXRGraphics: XRGraphics {
             var scissor = VkRect2D(offset: VkOffset2D(x: 0, y: 0), extent: size)
             vkCmdSetViewport(commands, 0, 1, &viewport)
             vkCmdSetScissor(commands, 0, 1, &scissor)
-            let keying = sampling.keyedPipeline == nil ? nil : chromaKey
+            let keying = sampling.keyedPipeline == nil || frame?.layout.hostKey != nil ? nil : chromaKey
             vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, keying == nil ? sampling.pipeline : sampling.keyedPipeline)
             var vertexHandle = vertexBuffer.handle
             var offset = VkDeviceSize(vertexBase * MemoryLayout<Float>.size)
             vkCmdBindVertexBuffers(commands, 0, 1, &vertexHandle, &offset)
             vkCmdBindIndexBuffer(commands, indexBuffer.handle, VkDeviceSize(indexBase * MemoryLayout<UInt16>.size), VK_INDEX_TYPE_UINT16)
 
+            // Host chroma keying overrides the client's chroma key for this frame.
+            let hostKey = frame?.layout.hostKey
             for draw in mesh.draws {
                 let filled = draw.fill != nil
+                var size = (width: 1, height: 1)
+                if hostKey != nil, let pictures = frame?.pictures, pictures.indices.contains(draw.picture) {
+                    var described = AHardwareBuffer_Desc()
+                    AHardwareBuffer_describe(pictures[draw.picture].buffer, &described)
+                    size = (Int(described.width), Int(described.height))
+                }
                 guard filled || (views.indices.contains(draw.picture) && views[draw.picture] != nil) else { continue }
                 // Solid-fill quads do not sample textures, but the descriptor layout still requires valid image views.
                 let color = views.indices.contains(draw.picture) ? views[draw.picture] : views.first ?? nil
@@ -1364,7 +1392,8 @@ public final class VulkanXRGraphics: XRGraphics {
                 vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, sampling.layout, 0, 1, &set, 0, nil)
                 var style = QuadStyle(feather: draw.feather, hasAlpha: alpha != nil && !filled ? 1 : 0, gamma: frame?.layout.encodingGamma ?? 1,
                                       linearTarget: linearTarget ? 1 : 0, fill: draw.fill ?? [0, 0, 0, 0], key: keying,
-                                      correction: colorCorrection)
+                                      correction: correction(for: frame?.layout), hostKey: hostKey.map { ($0, size.width, size.height) },
+                                      dim: dimNow, covered: draw.covered)
                 vkCmdPushConstants(commands, sampling.layout, VK_SHADER_STAGE_FRAGMENT_BIT.rawValue, 0,
                                    UInt32(MemoryLayout<Float>.size * QuadStyle.floats), &style.values)
                 vkCmdDrawIndexed(commands, UInt32(draw.indexCount), 1, UInt32(draw.firstIndex), Int32(draw.firstVertex), 0)
@@ -1425,16 +1454,30 @@ public final class VulkanXRGraphics: XRGraphics {
 
 /// Push-constant block matching `Style` in `quad.frag` (keep layout synchronized with the shader).
 private struct QuadStyle {
-    static let floats = 28
+    static let floats = 32
     var values: [Float]
 
     /// - Parameters:
     ///   - correction: Row-major 3x4 color correction matrix (`ColorProbe.Treatment.correction`).
     ///   - probe: Encode unclamped sampled colors for `ColorProbe` readback instead of normal rendering.
+    ///   - hostKey: Host chroma key and texture dimensions in texels. Overrides `key` and reuses `fill.xy`
+    ///     when `fill.a == 0`.
+    ///   - dim: Passthrough dimming opacity behind a host-keyed frame (`0...1`).
+    ///   - covered: Normalized bounds and feather width of an overlapping feathered quad (`Quad.covered`).
+    ///   - opacity: Overall stream opacity (`0...1`).
     init(feather: Float, hasAlpha: Float, gamma: Float, linearTarget: Float, fill: [Float], key: ChromaKey?, correction: [Float],
-         probe: Bool = false) {
-        values = [feather, hasAlpha, gamma, linearTarget] + fill + (key.map { $0.color + [1, $0.near, $0.far] } ?? [0, 0, 0, 0, 0, 0])
-            + [probe ? 1 : 0, 0] + correction
+         probe: Bool = false, hostKey: (key: FrameLayout.HostKey, width: Int, height: Int)? = nil, dim: Float = 0,
+         covered: (left: Float, top: Float, right: Float, bottom: Float, feather: Float)? = nil, opacity: Float = 1) {
+        var fill = fill, keyed = key.map { $0.color + [1, $0.near, $0.far] } ?? [0, 0, 0, 0, 0, 0]
+        var cover: [Float] = [0, 0, 0, 0]
+        if let hostKey, fill[3] == 0 {
+            fill = [Float(hostKey.width), Float(hostKey.height), covered?.feather ?? 0, 0]
+            // Use `vrlink`'s default threshold (0.04) when the host specifies 0.
+            keyed = hostKey.key.rgb + [2, hostKey.key.noiseFloor > 0 ? hostKey.key.noiseFloor : 0.04, dim]
+            if let covered { cover = [covered.left, covered.top, covered.right, covered.bottom] }
+        }
+        values = [feather, hasAlpha, gamma, linearTarget] + fill + keyed
+            + [probe ? 1 : 0, opacity] + correction + cover
     }
 }
 

@@ -76,4 +76,63 @@ final class ColorProbeTests: XCTestCase {
             XCTAssertEqual(kinds, [32, 33, 34, 20], clip.name)   // VPS, SPS, PPS, IDR
         }
     }
+
+    func testBT2020CorrectionMatchesVRLinkShaderMatrix() {
+        // `_valve1_d2020d709` from `vrlink`'s fragment shader (row-major 3x4). SteamVR hosts encode with
+        // BT.709, and this matrix converts a BT.2020 sampler output back to BT.709 RGB.
+        let valve: [Float] = [1.04988847, -0.04433306, -0.005557, 0,
+                              0.05442289, 0.96052738, -0.01509698, 0,
+                              0.00393458, 0.01122383, 0.98628952, 0]
+        let ours = ColorProbe.Treatment(matrix: .bt2020, stretched: false).correction
+        for (a, b) in zip(ours, valve) { XCTAssertEqual(a, b, accuracy: 0.003) }
+    }
+
+    func testHostChromaKeyCapabilitiesAndFrameMetadata() {
+        var profile = DeviceProfile()
+        XCTAssertEqual(profile.capabilities, [1] + Bytes(repeating: 0, count: 31))
+        XCTAssertNil(profile.startupValues()[DeviceProfile.ValueID.chromaKey])
+        profile.hostChromaKey = true
+        // Sets bits 45 and 47 in the first 64-bit capability word alongside bit 0.
+        XCTAssertEqual(Array(profile.capabilities.prefix(8)), [1, 0, 0, 0, 0, 0xA0, 0, 0])
+        XCTAssertEqual(profile.startupValues()[DeviceProfile.ValueID.chromaKey], [2, 0, 0, 0, 0, 0, 0, 0])
+
+        // Encode green key color (2 in bits 11...13) and room dimming (bit 10) in the u16 flags at +0xEE.
+        var header = Bytes(repeating: 0, count: 0xF0)
+        header[0xEA] = 0x80; header[0xEB] = 0x04; header[0xEC] = 0x80; header[0xED] = 0x04     // 1152 x 1152 tiles
+        header[0xE6] = 0x80; header[0xE7] = 0x04; header[0xE8] = 0x00; header[0xE9] = 0x12     // 1152 x 4608 atlas
+        header[0xEE] = 0x00; header[0xEF] = 0x14
+        // Center each eye's foveal tile inside a 2304 x 2304 virtual base view.
+        for eye in [0xC8, 0xD0] {
+            for (at, value) in [(0, 576), (2, 576), (4, 2304), (6, 2304)] {
+                header[eye + at] = UInt8(value & 0xFF); header[eye + at + 1] = UInt8(value >> 8)
+            }
+        }
+        let metadata = FrameMetadata(header)
+        XCTAssertEqual(metadata.keyColor, 2)
+        XCTAssertTrue(metadata.keyDims)
+        let layout = metadata.layout(profile: profile)
+        XCTAssertEqual(layout.hostKey?.rgb, [0, 1, 0])
+        XCTAssertTrue(layout.transparent)
+        XCTAssertEqual(layout.encodedWith, .bt709)
+        // Host chroma key flags are ignored when hostChromaKey is disabled, and color values 0 and 7 mean disabled.
+        profile.hostChromaKey = false
+        XCTAssertNil(metadata.layout(profile: profile).hostKey)
+        XCTAssertNil(FrameLayout.HostKey(color: 0))
+        XCTAssertNil(FrameLayout.HostKey(color: 7))
+        XCTAssertEqual(FrameLayout.HostKey(color: 5)?.rgb, [1, 0, 1])
+
+        // Keyed layouts populate `covered` on the base quad where the feathered foveal quad overlaps it.
+        profile.hostChromaKey = true
+        let keyed = metadata.layout(profile: profile)
+        let quads = Composition.quads(for: .left, layout: keyed)
+        let covered = try? XCTUnwrap(quads.first?.covered)
+        XCTAssertNil(quads.last?.covered)
+        if let covered, let under = keyed.views.first?.tiles.first?.frustum, let over = keyed.views.first?.tiles.last?.frustum {
+            XCTAssertEqual(covered.left, (over.left - under.left) / (under.right - under.left), accuracy: 1e-5)
+            XCTAssertEqual(covered.bottom, (under.up - over.down) / (under.up - under.down), accuracy: 1e-5)
+            XCTAssertEqual(covered.feather, FrameMetadata.foveaFeather)
+        }
+        profile.hostChromaKey = false
+        XCTAssertNil(Composition.quads(for: .left, layout: metadata.layout(profile: profile)).first?.covered)
+    }
 }

@@ -90,6 +90,18 @@ public final class StreamSession: StreamingSession {
     private var hostInstance: Bytes?
     /// Nil until the host reports it; re-sent when a client reconnects.
     private var applicationRunning: Bool?
+    /// Whether the host wants passthrough shown behind chroma-keyed frames (`ValueID.roomViewRequest`), or
+    /// `nil` if the host has not sent `0x36` (in which case passthrough is enabled whenever a frame carries a
+    /// key). Guarded by `lock`.
+    private var roomViewWanted: Bool?
+    /// Timestamp (`Uptime.nanoseconds`) when `roomViewWanted` last transitioned to `false`. Keying continues
+    /// for `roomViewLinger` so in-flight frames with key-colored pixels do not flash before opaque rendering
+    /// resumes.
+    private var roomViewOffSince: UInt64 = 0
+    static let roomViewLinger: UInt64 = 300_000_000
+    /// Host chroma key threshold scaled to `0...255` (`ValueID.chromaKeyNoiseFloor`). Guarded by `lock`.
+    private var hostNoiseFloor: UInt8 = 0
+    private var hostKeyReported: FrameLayout.HostKey??
     /// Whether a scene application (such as a game, rather than SteamVR's
     /// empty compositor grid) is running on the host. The host only reports a
     /// boolean, not which application is active.
@@ -108,6 +120,15 @@ public final class StreamSession: StreamingSession {
     static let addressListInterval: TimeInterval = 2
     private var running = true
     private var sayGoodbye = false
+    /// Timestamp of the most recent packet from the host (`Uptime.nanoseconds`, or `0` before the first
+    /// packet). Accessed on the session thread.
+    private var lastHeard: UInt64 = 0
+    /// Set under `lock` when the session ends due to a host timeout, suppressing the goodbye packet.
+    private var hostGone = false
+    /// Timeout in seconds after which a previously active host is treated as disconnected (for example, if
+    /// SteamVR exits or the network drops). Before the first packet arrives, the session waits indefinitely
+    /// while SteamVR starts up.
+    static let silenceLimit: Double = 4
 
     private let lock = NSLock()
     private var head = HeadPose(position: Vec3(0, 1.6, 0)).tracked
@@ -559,6 +580,22 @@ public final class StreamSession: StreamingSession {
             case DeviceProfile.ValueID.recenter:
                 onLog?("host requested recenter")
                 onRecenterRequested?()
+            case DeviceProfile.ValueID.roomViewRequest where profile.hostChromaKey:
+                // Host request to enable or disable passthrough behind chroma-keyed frames (0x36), echoed back via 0x34 matching vrlink.
+                let wanted = data.contains { $0 != 0 }
+                lock.lock()
+                if roomViewWanted != false, !wanted { roomViewOffSince = Uptime.nanoseconds }
+                roomViewWanted = wanted
+                lock.unlock()
+                onLog?("host requested room view \(wanted ? "on" : "off")")
+                values.publish(DeviceProfile.ValueID.roomViewEnabled, [wanted ? 1 : 0, 0, 0, 0], force: true)
+            case DeviceProfile.ValueID.chromaKeyNoiseFloor:
+                guard let first = data.first else { break }
+                lock.lock()
+                let changed = hostNoiseFloor != first
+                hostNoiseFloor = first
+                lock.unlock()
+                if changed { onLog?("host chroma key threshold updated to \(first)/255" + (first == 0 ? " (using default)" : "")) }
             case DeviceProfile.ValueID.sceneApplicationRunning:
                 let running = data.contains { $0 != 0 }
                 lock.lock()
@@ -604,7 +641,18 @@ public final class StreamSession: StreamingSession {
             layout.encodingGamma = extensions.encodingGamma(atMilliseconds: Uptime.nanoseconds / 1_000_000)
             let gammaChanged = layout.encodingGamma != gammaReported
             gammaReported = layout.encodingGamma
+            layout.hostKey?.noiseFloor = Float(hostNoiseFloor) / 255
+            // When the host disables room view, clear hostKey after the linger window so frames render opaquely
+            // and passthrough cameras can pause.
+            if roomViewWanted == false, Uptime.nanoseconds &- roomViewOffSince > StreamSession.roomViewLinger { layout.hostKey = nil }
+            let keyChanged = hostKeyReported != .some(layout.hostKey)
+            hostKeyReported = .some(layout.hostKey)
             lock.unlock()
+            if keyChanged, profile.hostChromaKey {
+                let names = ["red", "green", "blue", "cyan", "magenta", "yellow"]
+                onLog?(layout.hostKey.map { "frames now arrive keyed on \(names[$0.color - 1]), threshold \($0.noiseFloor)\($0.dim ? ", room dimmed" : "")" }
+                       ?? "frames now arrive without host chroma key")
+            }
             if gammaChanged {
                 onLog?(layout.encodingGamma > 1 ? "frames now arrive with encoding gamma \(layout.encodingGamma)"
                                                 : "frames now arrive without encoding gamma")
@@ -701,6 +749,23 @@ public final class StreamSession: StreamingSession {
             let wait = max(0, nextTick.timeIntervalSinceNow)
             let began = Uptime.nanoseconds
             let datagram = socket.receive(timeout: wait)
+            if datagram != nil {
+                lastHeard = Uptime.nanoseconds
+            } else if lastHeard != 0 {
+                // SteamVR does not send a disconnect message when it exits or restarts, so end the session
+                // after silenceLimit seconds without packets so the client can reconnect.
+                let quiet = Double(Uptime.nanoseconds &- lastHeard) / 1e9
+                if quiet > StreamSession.silenceLimit {
+                    lock.lock()
+                    hostGone = true
+                    running = false
+                    lock.unlock()
+                    let why = "no packets from host for \(Int(quiet)) seconds"
+                    onLog?("stream ended: \(why)")
+                    onEnded?(why)
+                    break
+                }
+            }
             // Record only scheduling overshoot beyond the requested receive timeout.
             let over = Double(Uptime.nanoseconds &- began) / 1_000_000_000 - wait
             if over > slowest["waiting for a packet", default: 0] { slowest["waiting for a packet"] = over }
@@ -876,7 +941,8 @@ public final class StreamSession: StreamingSession {
             }
         }
         lock.lock()
-        let leaving = sayGoodbye || applicationRunning == false
+        // Skip sending goodbye after a timeout so a restarting SteamVR instance is not told to shut down.
+        let leaving = !hostGone && (sayGoodbye || applicationRunning == false)
         lock.unlock()
         guard leaving else { return }
         let goodbye = link.pack(sequence: StreamSession.goodbyeSequence, elements: [SVLElement(.goodbye, value: [])])

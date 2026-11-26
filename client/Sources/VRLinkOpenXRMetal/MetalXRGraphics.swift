@@ -27,6 +27,7 @@ public final class MetalXRGraphics: XRGraphics {
     private var textures: [[MTLTexture]] = []
 
     public let supportsChromaKey = true
+    public let supportsHostChromaKey = true
     public let supportsDepth = true
     /// Metal stereo downsampler and matcher shared with the visionOS compositor.
     private var stereo: StereoShrink?

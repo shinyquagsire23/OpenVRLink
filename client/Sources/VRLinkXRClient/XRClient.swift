@@ -42,6 +42,8 @@ public struct XRPlatform {
     public var headVelocityFromPoses = false, controllerVelocityFromPoses = false
     /// `HeadsetQuirks.colorSpace`.
     public var colorSpace = "rec709"
+    /// `HeadsetQuirks.layerFilter`.
+    public var layerFilter = "none"
     /// `HeadsetQuirks.encodingGamma`.
     public var encodingGamma = true
 
@@ -69,6 +71,15 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
     private var panelPinned = false
     /// Play-space origin set by the most recent host-initiated recenter during this session, in tracking space.
     private var recentered: FloorFrame?
+    /// Whether the stream to the current target has connected at least once; if it drops afterward, the
+    /// client retries automatically until stopped. Guarded by `lock`.
+    private var hasStreamed = false
+    /// Whether a wired interface was active when the stream started, and the number of consecutive checks
+    /// reporting a change (`followLink`). Guarded by `lock`.
+    private var wiredAtStart = false, linkChanges = 0
+    private var linkWatch: DispatchSourceTimer?
+    /// Interval in seconds between reconnection attempts and network interface checks.
+    static var retryEvery: Double { 2 }
 
     /// - Parameters:
     ///   - model, panel: Shared model and panel instances (which the shell may also render in a 2D launcher
@@ -84,7 +95,7 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
                                 process: process, sharpLayerPixels: platform.sharpLayerPixels, eyeDetail: platform.eyeDetail,
                                 sustainedPerformance: platform.sustainedPerformance,
                                 compositorPlacesLayers: platform.compositorPlacesLayers,
-                                passthroughLayer: platform.passthroughLayer, colorSpace: platform.colorSpace, log: log)
+                                passthroughLayer: platform.passthroughLayer, colorSpace: platform.colorSpace, layerFilter: platform.layerFilter, log: log)
         if let offset = platform.gripOffset, !offset.isNone { display.input.gripOffsets = Side.allCases.map { offset.pose(for: $0) } }
         display.input.systemButton = platform.systemButton
         display.input.headVelocityFromPoses = platform.headVelocityFromPoses
@@ -115,20 +126,37 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
         }
 
         link.onStatus = { [model] in model.show($0) }
-        link.onFailed = { [model] in model.streamEnded($0) }
-        link.onStarted = { [model] session in
+        link.onFailed = { [weak self] in self?.lost($0) }
+        link.onStarted = { [model, weak self] session in
             platform.startAudio(session)
             if model.settings.microphone { platform.startMicrophone(session.microphoneSink) }
             model.streamStarted()
+            guard let self else { return }
+            lock.lock()
+            hasStreamed = true
+            lock.unlock()
         }
         link.onStopped = { platform.stopMicrophone(); platform.stopAudio() }
         model.finder.busy = { [link] in link.active }
-        model.startStream = { [weak self] in self?.start($0) }
+        model.startStream = { [weak self] target in
+            guard let self else { return }
+            // Reset hasStreamed when the user selects a host so an initial connection failure returns to the host list.
+            lock.lock()
+            hasStreamed = false
+            lock.unlock()
+            start(target)
+        }
+        let watch = DispatchSource.makeTimerSource(queue: .global())
+        watch.schedule(deadline: .now() + XRClient.retryEvery, repeating: XRClient.retryEvery)
+        watch.setEventHandler { [weak self] in self?.followLink() }
+        watch.resume()
+        linkWatch = watch
         model.stopStream = { [link] leaving in link.stop(leaving: leaving) }
 
         display.streamingSession = { [link] in link.session }
         if display.graphics.supportsChromaKey, display.canShowRoom {
             panel.features.insert(.chromaKey)
+            // Host chroma keying overrides the client's chroma key on frames that carry `FrameLayout.HostKey`.
             display.chromaKey = { [model, link] in model.settings.chromaKeying(inGame: link.session?.sceneApplicationRunning ?? false) }
         } else {
             panel.features.remove(.chromaKey)
@@ -165,6 +193,14 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
             lock.unlock()
             updatePlaySpace()
         }
+        // Apply system-initiated recenters to the play space the same way as host-requested recenters.
+        display.onRecentered = { [weak self] place in
+            guard let self else { return }
+            lock.lock()
+            recentered = FloorFrame(position: Vec3(place.position.x, 0, place.position.z), yaw: FloorFrame.heading(of: place))
+            lock.unlock()
+            updatePlaySpace()
+        }
         link.onRecenterRequested = { [weak self] in
             guard let self, let head = display.input.head()?.pose else { return }
             lock.lock()
@@ -184,13 +220,52 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
         link.playSpace = PlaySpace(origin: frame.pose, boundary: display.boundary().map { frame.local(Vec3($0.x, 0, $0.z)) })
     }
 
+    /// Handles stream disconnects and connection failures. If the stream had already connected, retries every
+    /// `retryEvery` seconds until it reconnects or the user stops it; otherwise returns to the host list.
+    private func lost(_ why: String) {
+        lock.lock()
+        let again = hasStreamed
+        lock.unlock()
+        guard again, let target = model.state.target else {
+            model.streamEnded(why)
+            return
+        }
+        model.streamInterrupted("\(why)\nReconnecting to \(target.name)")
+        DispatchQueue.global().asyncAfter(deadline: .now() + XRClient.retryEvery) { [weak self] in
+            // Skip retry if the user stopped the stream or selected a different host.
+            guard let self, model.state.target == target, !link.active else { return }
+            start(target, again: true)
+        }
+    }
+
+    /// Restarts a running stream when a wired interface connects or disconnects so `HostConnector` can
+    /// re-select the network path. Polled every `retryEvery` seconds and requires two consecutive checks
+    /// before restarting to debounce transient interface states.
+    private func followLink() {
+        guard link.session != nil, let target = model.state.target else { return }
+        let wired = !platform.preferredInterfaces().isEmpty
+        lock.lock()
+        linkChanges = wired == wiredAtStart ? 0 : linkChanges + 1
+        let moved = linkChanges >= 2
+        if moved { linkChanges = 0 }
+        lock.unlock()
+        guard moved else { return }
+        Log.note(wired ? "wired interface connected; switching stream to wired link" : "wired interface disconnected; switching stream to Wi-Fi")
+        link.stop()
+        model.streamInterrupted(wired ? "Switching to wired link" : "Switching to Wi-Fi")
+        start(target, again: true)
+    }
+
     /// Starts connecting to `target` immediately if the OpenXR session is ready; otherwise `onReady` will
     /// connect once the session starts.
-    private func start(_ target: ClientModel.Target) {
+    private func start(_ target: ClientModel.Target, again: Bool = false) {
         lock.lock()
         let measured = self.measured
         panelPinned = false
-        recentered = nil
+        // Preserve any active recenter offset across automatic reconnections.
+        if !again { recentered = nil }
+        wiredAtStart = !platform.preferredInterfaces().isEmpty
+        linkChanges = 0
         lock.unlock()
         guard var profile = measured else {
             model.show("Waiting for the headset")
@@ -201,6 +276,8 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
         profile.systemName = platform.device.systemName
         profile.leanUplink = platform.leanUplink
         profile.wantsEncodingGamma = platform.encodingGamma
+        // Advertise host chroma-key support whenever passthrough is available; SteamVR enables keying per application.
+        profile.hostChromaKey = display.graphics.supportsHostChromaKey && display.canShowRoom
         profile.playForDreamControllers = platform.playForDreamControllers
         profile.clientVersion = platform.device.clientVersion
         profile.eyeFrusta = profile.eyeFrusta.map { $0.scaled(horizontal: settings.fovScaleHorizontal, vertical: settings.fovScaleVertical) }
@@ -221,6 +298,8 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
         inputs.power = platform.power
         link.start(target.kind, address: target.address, port: target.port, profile: profile, connector: connector, inputs: inputs)
     }
+
+    deinit { linkWatch?.cancel() }
 
     /// Runs the OpenXR session until it exits, then tells the host the client is leaving.
     public func run() throws {

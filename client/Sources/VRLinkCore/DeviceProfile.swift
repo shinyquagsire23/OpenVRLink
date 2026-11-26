@@ -61,6 +61,15 @@ public struct DeviceProfile {
         /// Sent by the host: non-zero while a scene application is running, and zero
         /// when idle in the SteamVR grid (docs/svl-values/vte-id-table.md; inferred).
         static let sceneApplicationRunning: UInt8 = 0x35
+        /// Sent by the client to configure host chroma-key passthrough (`chromaKey(_:)`).
+        static let chromaKey: UInt8 = 0x33
+        /// Sent by the client in reply to `roomViewRequest`: `u32`, non-zero while passthrough is active.
+        static let roomViewEnabled: UInt8 = 0x34
+        /// Sent by the host: `u32`, non-zero to request passthrough behind chroma-keyed frames.
+        static let roomViewRequest: UInt8 = 0x36
+        /// Sent by the host: 8-byte payload whose first byte is the per-application chroma key threshold
+        /// scaled to `0...128` (`round(chromaKeyNoiseFloor * 255)`; `0` uses the client default).
+        static let chromaKeyNoiseFloor: UInt8 = 0x37
     }
 
     /// Serializes `VTE_StaticProps_t` (1161 bytes), which describes a device to SteamVR using nine
@@ -248,9 +257,25 @@ public struct DeviceProfile {
         Bytes(PlaySpace.trackingSpace.chaperone(universe: universe).utf8)
     }
 
-    /// `VTE_CAPABILITIES` 32-byte feature bitfield. `vrlink` sets only bit 0 (meaning unknown).
-    /// Bit 45 advertises chroma-key passthrough according to host logs and is left unset here.
-    static let capabilities: Bytes = [1] + Bytes(repeating: 0, count: 31)
+    /// `VTE_CAPABILITIES` (32 bytes: two 64-bit bitfields at +0 and +16). `vrlink` always sets bit 0, and
+    /// sets bit 45 (host chroma-key passthrough) and bit 47 (per-application threshold via
+    /// `chromaKeyNoiseFloor`) when passthrough is supported.
+    var capabilities: Bytes {
+        var out = Bytes()
+        out.append(integer: UInt64(1) | (hostChromaKey ? UInt64(1) << 45 | UInt64(1) << 47 : 0))
+        out.append(zeros: 24)
+        return out
+    }
+
+    /// `VTE_PROP_CHROMA_KEY` (8 bytes): byte 0 is the requested key color (non-zero enables passthrough;
+    /// `vrlink` sends 2 for green), byte 1 is the client threshold (logged by the host), and byte 2 bit 0
+    /// indicates a translucent optical display. When bit 45 is set in `capabilities`, the host waits for
+    /// this value before starting the stream.
+    static func chromaKey(_ wanted: Bool) -> Bytes { [wanted ? 2 : 0] + Bytes(repeating: 0, count: 7) }
+
+    /// Advertises chroma-key passthrough in `capabilities` and applies per-frame host chroma keys
+    /// (`FrameLayout.HostKey`). Ignored by older hosts that do not implement chroma-key passthrough.
+    public var hostChromaKey = false
 
     /// Serializes the list of supported refresh rates: validity mask (`1`), count, 8 zero bytes, and each rate in Hz.
     func availableRates(_ rates: [Float]) -> Bytes {
@@ -270,14 +295,18 @@ public struct DeviceProfile {
         instanceBytes.append(integer: instance)
         audio.append(integer: UInt32(3))
         var pixels = Bytes()
-        if let eyePixels {
+        // If the display's center pixel density exceeds the runtime's recommended eye resolution, advertise
+        // the higher resolution so the host renders the 1:1 foveal inset at full center sharpness.
+        if let eyePixels = detailEyePixels ?? eyePixels {
             pixels.append(integer: UInt32((Float(eyePixels.width) / DeviceProfile.renderTargetPerDisplayPixel).rounded()))
             pixels.append(integer: UInt32((Float(eyePixels.height) / DeviceProfile.renderTargetPerDisplayPixel).rounded()))
         }
-        return [
+        // Only send 0x33 when host chroma keying is enabled, since older hosts do not recognize that value ID.
+        let keyed: [UInt8: Bytes] = hostChromaKey ? [ValueID.chromaKey: DeviceProfile.chromaKey(true)] : [:]
+        return keyed.merging([
             ValueID.eyePixels: pixels,                   // omitted on the wire when empty
             ValueID.clientInstance: instanceBytes,
-            ValueID.capabilities: DeviceProfile.capabilities,
+            ValueID.capabilities: capabilities,
             ValueID.projection: projection(),
             ValueID.eyeToHead: eyeToHead(),
             ValueID.availableRates: availableRates(([refreshHz] + otherRefreshRates.filter { $0 != refreshHz }).sorted()),
@@ -287,6 +316,6 @@ public struct DeviceProfile {
             ValueID.staticHMD: staticHMDProps(),
             ValueID.powerHMD: DeviceProfile.powerProps(nil, reportsBattery: true),
             ValueID.audioCapabilities: audio,
-        ]
+        ]) { $1 }
     }
 }

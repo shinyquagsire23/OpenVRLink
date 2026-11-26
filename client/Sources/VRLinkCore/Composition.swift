@@ -39,6 +39,10 @@ public struct Quad {
     public var alpha: AlphaSource?
     /// Optional mesh grid used to warp the quad to scene depth instead of drawing a flat plane between `corners`.
     public var grid: Grid?
+    /// Normalized bounds (`0...1`) and feather width of a feathered quad (such as the foveal inset) drawn
+    /// over this quad. When host chroma keying is active, the underlying quad scales down its alpha inside
+    /// this region so standard alpha blending produces uniform passthrough opacity.
+    public var covered: (left: Float, top: Float, right: Float, bottom: Float, feather: Float)?
 
     /// Subdivides a quad into `columns` x `rows` cells, placing each vertex at
     /// its estimated depth along the rendering eye's ray. Texture coordinates are
@@ -165,6 +169,35 @@ public struct FrameLayout {
     /// Encoding gamma applied by the host to this frame's sRGB values (`HostExtensions`).
     /// The renderer restores the original values with `value^encodingGamma` (`1` means no gamma adjustment).
     public var encodingGamma: Float = 1
+    /// Y'CbCr matrix used to encode the frame when omitted from the video bitstream. SteamVR hosts encode
+    /// with BT.709 without setting bitstream VUI matrix tags (`vrlink` configures its decoder for BT.2020 and
+    /// corrects the mismatch with a 3x3 shader matrix). When `nil`, the decoder's color matrix is used as-is.
+    public var encodedWith: ColorProbe.Matrix?
+    /// Per-frame SteamVR chroma key settings, when active.
+    public var hostKey: HostKey?
+
+    /// Per-frame SteamVR chroma key parameters. SteamVR configures the key color, threshold, and room dimming
+    /// per application; the color index and dimming flag arrive in each frame header, while the threshold is
+    /// sent over value transport.
+    public struct HostKey: Equatable {
+        /// Key color index: 1 red, 2 green, 3 blue, 4 cyan, 5 magenta, 6 yellow.
+        public var color: Int
+        /// Key threshold in `0...0.5`; `0` selects the default threshold (`0.04`, matching `vrlink`).
+        public var noiseFloor: Float = 0
+        public var dim = false
+
+        public init?(color: Int, noiseFloor: Float = 0, dim: Bool = false) {
+            guard (1...6).contains(color) else { return nil }
+            self.color = color
+            self.noiseFloor = noiseFloor
+            self.dim = dim
+        }
+
+        /// Linear RGB components of the key color (each `0` or `1`).
+        public var rgb: [Float] {
+            [[1, 0, 0], [0, 1, 0], [0, 0, 1], [0, 1, 1], [1, 0, 1], [1, 1, 0]][color - 1]
+        }
+    }
 
     public init(views: [View], pictures: Int = 1, eyePixels: (width: Int, height: Int)) {
         self.views = views
@@ -182,7 +215,7 @@ public struct FrameLayout {
     }
 
     /// Whether any tile carries an alpha channel for passthrough compositing (skipping the opaque black backdrop).
-    public var transparent: Bool { views.contains { $0.tiles.contains { $0.alpha != nil } } }
+    public var transparent: Bool { hostKey != nil || views.contains { $0.tiles.contains { $0.alpha != nil } } }
 
     /// Empty layout used for tests and initial placeholders.
     public static let empty = FrameLayout(views: [], eyePixels: (0, 0))
@@ -274,6 +307,15 @@ public enum Composition {
             var quad = Quad(corners: tile.frustum.corners(from: view.eye, distance: distance),
                             atlasLeft: tile.left, atlasTop: tile.top, atlasRight: tile.right, atlasBottom: tile.bottom,
                             feather: tile.feather, picture: tile.picture, alpha: tile.alpha)
+            // Compute the region of the base tile overlapped by a feathered foveal tile when host chroma keying is active.
+            if layout.hostKey != nil, index == 0, view.tiles.count == 2, view.tiles[1].feather > 0 {
+                let under = tile.frustum, over = view.tiles[1].frustum
+                let wide = under.right - under.left, tall = under.up - under.down
+                if wide > 0, tall > 0 {
+                    quad.covered = ((over.left - under.left) / wide, (under.up - over.up) / tall,
+                                    (over.right - under.left) / wide, (under.up - over.down) / tall, view.tiles[1].feather)
+                }
+            }
             guard let seen else { return quad }
             // Stereo vertex amplification draws corresponding left and right tiles in a single
             // indexed draw call, so both eyes must share the grid dimensions needed by the wider tile.

@@ -197,6 +197,26 @@ final class ClientModelTests: XCTestCase {
         XCTAssertEqual(model.state.hosts.map(\.id), ["steam 1.1.1.1", "wivrn b.local"])
     }
 
+    func testStreamInterruptedPreservesTargetWhileStreamEndedClearsIt() {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("model-test-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let model = ClientModel(finder: HostFinder(services: nil), folder: folder)
+        let target = ClientModel.Target(kind: .steam, address: "192.0.2.1", name: "PC")
+        // Ignore streamInterrupted while in .choosing when no host is selected.
+        model.streamInterrupted("lost")
+        XCTAssertEqual(model.state.phase, .choosing)
+        model.connect(to: target)
+        model.streamStarted()
+        XCTAssertEqual(model.state.phase, .streaming)
+        model.streamInterrupted("no packets from host")
+        XCTAssertEqual(model.state.phase, .connecting)
+        XCTAssertEqual(model.state.target, target)
+        XCTAssertEqual(model.state.status, "no packets from host")
+        model.streamEnded("could not connect")
+        XCTAssertEqual(model.state.phase, .choosing)
+        XCTAssertNil(model.state.target)
+    }
+
     func testSettingsFormShowsWhatThePlatformHas() {
         XCTAssertEqual(SettingsForm.sections(for: []).map(\.title), ["Field of view"])
         let android = SettingsForm.sections(for: [.microphone, .chromaKey])

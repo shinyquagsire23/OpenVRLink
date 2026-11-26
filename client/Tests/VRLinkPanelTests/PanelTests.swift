@@ -124,7 +124,9 @@ final class PanelTests: XCTestCase {
         // Enabling quirks adds the Quirks tab and renders saved overrides.
         panel.quirks = HeadsetQuirks(.playForDream)
         model.settings.quirkOverrides = ["video_range": "narrow"]
-        XCTAssertTrue(panel.update())
+        // ImGui lays out a newly added tab on the frame after it is first submitted.
+        let first = panel.update(), second = panel.update()
+        XCTAssertTrue(first || second)
         panel.quirks = nil
         model.settings.quirkOverrides = [:]
         for _ in 0..<4 { panel.update() }

@@ -270,6 +270,17 @@ public final class ClientModel {
         }
     }
 
+    /// Transitions a running stream back to `.connecting` and displays `why`, keeping `target` set so the
+    /// client can reconnect automatically (for example, after a SteamVR restart or network interface change).
+    public func streamInterrupted(_ why: String) {
+        change {
+            guard $0.phase != .choosing else { return }
+            $0.phase = .connecting
+            $0.askingForPin = false
+            $0.status = why
+        }
+    }
+
     /// Resets back to the host list and displays `why` after a connection failure or host disconnect.
     public func streamEnded(_ why: String) {
         change {

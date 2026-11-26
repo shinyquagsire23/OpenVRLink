@@ -75,6 +75,7 @@ public final class XRInstance {
         "XR_FB_hand_tracking_aim",           // system hand gestures (such as Quest's left-hand menu pinch)
         "XR_FB_display_refresh_rate",
         "XR_FB_color_space",                 // declare content color primaries on wide-gamut displays
+        "XR_FB_composition_layer_settings",  // ask the compositor to sharpen or supersample the stream's layers
         "XR_FB_passthrough",                 // passthrough layer when alpha-blend mode is unavailable
         "XR_ANDROID_recommended_resolution", // dynamic eye resolution notifications on Android XR
         "XR_EXT_performance_settings",       // sustained clock requests and thermal throttling events

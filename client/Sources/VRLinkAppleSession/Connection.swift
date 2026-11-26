@@ -49,6 +49,19 @@ public final class Connection: ObservableObject {
     /// messages written directly by SwiftUI views are only overwritten when `model.state.status` changes.
     private var mirrored = ClientModel.State()
 
+    /// Closure that restarts the active stream, set by `start` and cleared by `stop`.
+    /// Used to reconnect every `retryEvery` seconds if a running stream drops (for example, when SteamVR
+    /// restarts) or when switching between Wi-Fi and a wired interface. Guarded by `retryLock`.
+    private var again: (() -> Void)?
+    /// Tracks whether the current stream has connected, whether a wired interface was active on the first
+    /// check (`nil` until polled), and the number of consecutive polls reporting a different wired state.
+    /// All three properties are guarded by `retryLock`.
+    private var hasStreamed = false, wiredWhileRunning: Bool?, linkChanges = 0
+    private let retryLock = NSLock()
+    private var linkWatch: DispatchSourceTimer?
+    /// Interval in seconds between reconnection attempts and network interface checks.
+    static var retryEvery: Double { 2 }
+
     /// Decoded frames waiting for the display.
     public var frames: DisplayQueue<DecodedFrame> { link.frames }
 
@@ -102,7 +115,18 @@ public final class Connection: ObservableObject {
             DispatchQueue.main.async { self?.mirror() }
         }
         link.onStatus = { [model] in model.show($0) }
+        link.onFailed = { [weak self] in self?.lost($0) }
+        let watch = DispatchSource.makeTimerSource(queue: .global())
+        watch.schedule(deadline: .now() + Connection.retryEvery, repeating: Connection.retryEvery)
+        watch.setEventHandler { [weak self] in self?.followLink() }
+        watch.resume()
+        linkWatch = watch
         link.onStarted = { [weak self] session in
+            if let self {
+                retryLock.lock()
+                hasStreamed = true
+                retryLock.unlock()
+            }
             DispatchQueue.main.async {
                 guard let self else { return }
                 if let audio = self.audio { audio.resume() } else { self.audio = AudioOutput(buffer: session.audio) }
@@ -166,8 +190,61 @@ public final class Connection: ObservableObject {
         inputs.refreshRateRequested = { hz in DisplayRate.shared.ask(for: hz) }
         #endif
         sendingMicrophone = microphoneWanted
-        link.start(hostKind, address: hostAddress.trimmingCharacters(in: .whitespaces), profile: profile,
-                   connector: connector, inputs: inputs)
+        let kind = hostKind, address = hostAddress.trimmingCharacters(in: .whitespaces)
+        let begin = { [link] in link.start(kind, address: address, profile: profile, connector: connector, inputs: inputs) }
+        retryLock.lock()
+        again = begin
+        hasStreamed = false
+        wiredWhileRunning = nil
+        linkChanges = 0
+        retryLock.unlock()
+        begin()
+    }
+
+    /// Retries a disconnected stream every `retryEvery` seconds until it reconnects or `stop` is called.
+    /// If the stream never connected initially, leaves the error status visible without retrying.
+    private func lost(_ why: String) {
+        retryLock.lock()
+        let retry = hasStreamed ? again : nil
+        retryLock.unlock()
+        guard retry != nil else { return }
+        model.show("\(why)\nReconnecting")
+        DispatchQueue.global().asyncAfter(deadline: .now() + Connection.retryEvery) { [weak self] in
+            guard let self else { return }
+            // Skip retry if stop was called or another connection attempt already started.
+            retryLock.lock()
+            let begin = again
+            wiredWhileRunning = nil
+            linkChanges = 0
+            retryLock.unlock()
+            if let begin, !link.active { begin() }
+        }
+    }
+
+    /// Restarts a running stream when a wired interface connects or disconnects so `HostConnector` can
+    /// re-select the network path. Polled every `retryEvery` seconds and requires two consecutive checks
+    /// before restarting to debounce transient interface changes.
+    private func followLink() {
+        guard link.session != nil else { return }
+        let wired = !WiredInterfaces.names().isEmpty
+        retryLock.lock()
+        guard let before = wiredWhileRunning else {
+            wiredWhileRunning = wired
+            retryLock.unlock()
+            return
+        }
+        linkChanges = wired == before ? 0 : linkChanges + 1
+        let begin = linkChanges >= 2 ? again : nil
+        if begin != nil {
+            linkChanges = 0
+            wiredWhileRunning = nil
+        }
+        retryLock.unlock()
+        guard let begin else { return }
+        Log.note(wired ? "wired interface connected; switching stream to wired link" : "wired interface disconnected; switching stream to Wi-Fi")
+        link.stop()
+        model.show(wired ? "Switching to wired link" : "Switching to Wi-Fi")
+        begin()
     }
 
     /// Whether the stream being started was asked to send the microphone.
@@ -202,6 +279,10 @@ public final class Connection: ObservableObject {
     /// backgrounding the app mid-game), the host keeps the game running briefly
     /// so reconnecting resumes the session.
     public func stop(leaving: Bool = false) {
+        retryLock.lock()
+        again = nil
+        hasStreamed = false
+        retryLock.unlock()
         let session = link.session
         link.stop(leaving: leaving)
         guard let session else { return }

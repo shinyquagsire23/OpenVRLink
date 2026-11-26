@@ -56,6 +56,38 @@ final class ChromaKeyTests: XCTestCase {
         return pixel
     }
 
+    func testHostChromaKeyOverridesClientChromaKey() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let renderer = try XCTUnwrap(QuadRenderer(device: device, colorFormat: .bgra8Unorm))
+        var keyedLayout = FrameLayout.empty
+        keyedLayout.hostKey = FrameLayout.HostKey(color: 2, noiseFloor: 0.3)
+        func marked(_ frame: DecodedFrame) -> DecodedFrame { DecodedFrame(frameID: 0, images: frame.images, layout: keyedLayout) }
+        // Pure BT.709 green renders opaque without a host key and transparent `[0, 0, 0, 0]` when keyed.
+        let clear: [UInt8] = [0, 0, 0, 0]
+        let green = try frame(luma: 182, cb: 30, cr: 12)
+        let drawn = try middlePixel(renderer, green, device: device)
+        XCTAssertGreaterThan(drawn[1], 200, "green \(drawn)")
+        let keyed = try middlePixel(renderer, marked(green), device: device)
+        XCTAssertEqual(keyed, clear, "keyed green pixel should be transparent")
+        // Colors far from the key remain unchanged.
+        let gray = try frame(luma: 128, cb: 128, cr: 128)
+        XCTAssertEqual(try middlePixel(renderer, marked(gray), device: device), try middlePixel(renderer, gray, device: device))
+        let blue = try frame(luma: 60, cb: 220, cr: 110)
+        let plain = try middlePixel(renderer, blue, device: device), kept = try middlePixel(renderer, marked(blue), device: device)
+        for channel in 0..<4 { XCTAssertEqual(Int(kept[channel]), Int(plain[channel]), accuracy: 2, "blue \(kept) against \(plain)") }
+        // Dark green stays opaque below a 0.3 threshold, and becomes partially transparent with green despilled
+        // under `vrlink`'s 0.04 default threshold.
+        let darkGreen = try frame(luma: 91, cb: 79, cr: 70)
+        XCTAssertEqual(try middlePixel(renderer, marked(darkGreen), device: device), try middlePixel(renderer, darkGreen, device: device))
+        keyedLayout.hostKey = FrameLayout.HostKey(color: 2)
+        let partly = try middlePixel(renderer, marked(darkGreen), device: device)
+        XCTAssertLessThan(partly[1], 10, "green spill removed \(partly)")
+        XCTAssertTrue((150...230).contains(partly[3]), "partially transparent \(partly)")
+        // Per-frame host chroma key takes precedence over a configured client chroma key.
+        renderer.chromaKey = ChromaKey(color: [0.9, 0.1, 0.1], near: 0.2, far: 0.4)
+        XCTAssertEqual(try middlePixel(renderer, marked(green), device: device), clear)
+    }
+
     func testTheKeyColourShowsTheBackgroundAndFollowsChangesWithoutARebuild() throws {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let renderer = try XCTUnwrap(QuadRenderer(device: device, colorFormat: .bgra8Unorm))

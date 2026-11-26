@@ -276,3 +276,43 @@ SteamVR has two separate recenter paths:
    normally, so neither is required.
 8. What are the first `u32` and trailing 8 bytes of the 24-byte shader-push
    header (0x1e)?
+
+## Chroma key passthrough (ids 0x33, 0x34, 0x36, 0x37, and bits of 0x06)
+
+All entries below are **static** unless noted otherwise, read from
+`driver_vrlink.dll` (sha256 `9cd7d253…`) on the host and from the unstripped
+`libvrlink_scene.so` bundled in
+`drivers/vrlink/resources/android-steamlinkvr-release.apk`
+(`QSVLClient::UpdateFrameVariables`, `UpdateHostChromaKeyNoiseFloor`,
+`GetChromaKeyPayload`, `SRGBCorrectionPass::SetChromaKey`, and
+`QSVLRendererXR::FlipFrame`).
+
+| id | from | size | contents |
+|---|---|---|---|
+| 0x06 `VTE_CAPABILITIES` | both | 32 | two 64-bit capability bitfields at +0 and +16. `vrlink` always sets bit 0 of the first word, plus bit 45 (host chroma-key passthrough) and bit 47 (host threshold via 0x37) when supported. `vrserver` checks the client's capability bits (bit 46 adjusts the chosen stream width), and `vrlink` checks host bit 47 before reading 0x37. |
+| 0x33 `VTE_PROP_CHROMA_KEY` | client | 8 | byte 0: requested key color, non-zero to enable chroma-key passthrough (`vrlink` sends 2 for green). Byte 1: client threshold (logged by the host). Byte 2 bit 0: translucent optical display flag. When client bit 45 is set in 0x06, the host waits for 0x33 before starting the stream. |
+| 0x34 `VTE_ROOMVIEW_ENABLED` | client | 4 | `u32`, non-zero while passthrough is active behind the stream; sent in reply to 0x36. |
+| 0x36 | host | 4 | `u32`, non-zero requests passthrough on the client (`"Host asked for room view on/off"`). **inferred** from the SteamVR settings description of the key modes: indicates whether passthrough cameras need to run for the current scene. |
+| 0x37 | host | 8 | byte 0: per-application key threshold `round(chromaKeyNoiseFloor * 255)` in `0...128`; `0` means unset, in which case `vrlink` uses `0.04`. |
+
+SteamVR reads `chromaKeyMode` (0 auto, 1 protect content, 2 key content),
+`chromaKeyColor` (1 red, 2 green, 3 blue, 4 cyan, 5 magenta, 6 yellow), and
+`chromaKeyNoiseFloor` (`0...0.5`, labeled "Key Threshold" in the UI, default
+`0.3`) from the active application's settings section, or from `steamvr` when no
+application is running. Only the threshold is sent over value transport (0x37).
+The active key color and room-dimming flag travel in every frame's metadata
+`u16` at +0xEE: bits 11...13 store the color index (0 and 7 disable keying), and
+bit 10 requests passthrough dimming (`vrlink` fades passthrough to 25% brightness
+over 50 ms). Key mode is handled entirely on the host, which shifts scene colors
+away from the key color in the "protect content" modes so only explicitly keyed
+pixels reveal passthrough.
+
+`vrlink` implements chroma keying in the `vChromaKeyColor` fragment shader
+(ported to `hostKeyed` in `quad.frag` and `Quad.metal`). That shader also
+confirms the stream's Y'CbCr matrix: it reconstructs Y'CbCr from sampled RGB
+using BT.2020 constants, while `SetChromaKey` computes the expected sampled key
+color by encoding the RGB key with the BT.709 matrix and decoding it with
+BT.2020. Every `vrlink` stream shader applies the 3x3 `_valve1_d2020d709`
+matrix, which matches the inverse of that BT.709-to-BT.2020 pair to three
+decimal places, confirming that SteamVR hosts encode using the BT.709 matrix and
+should be decoded as BT.709 (`FrameLayout.encodedWith`, `ColorProbe`).

@@ -297,6 +297,17 @@ final class PictureDecoder {
             infoFlagsOut: nil
         ) { [weak self] status, _, image, _, _ in
             if status == noErr, let image {
+                // Streams without bitstream VUI color matrix tags produce pixel buffers with no matrix
+                // attachment, causing Metal's sampler to default to BT.601. Attach the layout's matrix when known.
+                if let matrix = frame.layout.encodedWith {
+                    let named: CFString
+                    switch matrix {
+                    case .bt709: named = kCVImageBufferYCbCrMatrix_ITU_R_709_2
+                    case .bt601: named = kCVImageBufferYCbCrMatrix_ITU_R_601_4
+                    case .bt2020: named = kCVImageBufferYCbCrMatrix_ITU_R_2020
+                    }
+                    CVBufferSetAttachment(image, kCVImageBufferYCbCrMatrixKey, named, .shouldPropagate)
+                }
                 self?.onImage?(frame.frameID, image, frame.layout)
             } else {
                 self?.noteFailure(status)

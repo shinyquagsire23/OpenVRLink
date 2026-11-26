@@ -258,6 +258,35 @@ video decoder.
 | Metal graphics backend (`XR_KHR_metal_enable`) using `QuadRenderer` | `VRLinkOpenXRMetal` |
 | Vulkan graphics backend (`XR_KHR_vulkan_enable2`) sampling `AHardwareBuffer` | `VRLinkVulkan` |
 
+### Reconnecting lost streams
+
+SteamVR does not send a disconnect packet when it closes or restarts; packets
+simply stop arriving. Once a host has sent its first packet, `StreamSession`
+ends the session (`onEnded`) after four seconds of silence (`silenceLimit`)
+without sending a goodbye packet, avoiding shutting down a SteamVR instance that
+is restarting. Before the first packet arrives, the session waits indefinitely
+while SteamVR starts up.
+
+When a session ends in `XRClient`, an initial connection failure returns to the
+host list. If the stream had already connected, `XRClient` retries every two
+seconds (`lost`, `ClientModel.streamInterrupted`) until it reconnects or the
+user presses Stop, displaying the disconnect reason in the panel and preserving
+any active recenter offset.
+
+`XRClient` uses the same restart path to switch between Wi-Fi and a wired
+interface, since `HostConnector` selects the network interface when a session
+starts. Every two seconds, `followLink` checks whether a preferred wired
+interface is available; if the state differs from startup on two consecutive
+checks, `XRClient` stops and restarts the stream over the new interface, briefly
+interrupting video while reconnecting.
+
+On Apple platforms, `Connection` implements the same reconnection and
+link-switching behavior around `StreamLink` while keeping the immersive space
+open: `start` stores a restart closure cleared by `stop`, `lost` retries every
+two seconds after a running stream drops, and `followLink` restarts the stream
+when `WiredInterfaces` detects Ethernet (such as the developer strap) connecting
+or disconnecting.
+
 ### Runtime loading
 
 `VRLinkOpenXR` does not link an OpenXR loader at build time. Instead, it
@@ -317,7 +346,15 @@ runtime posts a reference-space change event; once its change timestamp arrives,
 them to the host. When the host requests a recenter, `XRClient` moves the
 play-space origin beneath the user's head for the rest of the session (matching
 visionOS) and transforms the boundary corners so the chaperone stays in the same
-physical spot.
+physical spot. System-initiated recenters (such as holding the headset's home
+button) update the play-space origin the same way. When tracking in `STAGE`
+space, a system recenter moves the runtime's `LOCAL` space while leaving `STAGE`
+fixed to the physical room. `XRDisplay` polls the `LOCAL` origin in stage
+coordinates twice per second (`followSystemRecenter`), and when it shifts by
+more than 5 cm or roughly 3 degrees, `XRClient` updates the play-space origin to
+match. Polling avoids relying on reference-space change events, which runtimes
+emit inconsistently on recenter (for example, Android XR posts change events for
+every space, including `STAGE`).
 
 Eye gaze uses `XR_EXT_eye_gaze_interaction`. Because that extension provides a
 gaze ray in view space without a convergence distance, `XRInput` projects a
@@ -422,6 +459,67 @@ render target according to SteamVR's render resolution setting.
 
 When the sharp layer activates, `XRDisplay` logs `openxr: sharp layer on: ...`
 with the effective pixels per degree of both layers.
+
+### Host chroma key
+
+In addition to the client's local HSV chroma key (configured in the app with an
+arbitrary target color and near/far tolerances), the client supports SteamVR's
+per-application host chroma key (`docs/svl-values/vte-id-table.md`). SteamVR
+stores a key mode, one of six primary/secondary key colors, and a key threshold
+per application, optionally shifts scene colors away from the key to prevent
+accidental cutouts, and tags each frame header with the active key color and
+dimming flag. Whenever passthrough is available (on OpenXR and visionOS across
+all renderers), the client advertises host chroma-key support in
+`DeviceProfile.capabilities` and `chromaKey`, receives the threshold over value
+transport and the color and dimming flag in each frame header
+(`FrameLayout.HostKey`), and keys the frame using a port of `vrlink`'s shader
+(`hostKeyed` in `quad.frag` and `Quad.metal`). Frames carrying `HostKey` use the
+host's chroma key, while untagged frames fall back to the client's local chroma
+key if enabled.
+
+Host chroma keying coordinates passthrough state, dimming, and foveated blending
+to match `vrlink`:
+
+- **Room view.** Value `0x36` tells the client whether the current scene needs
+  passthrough behind the stream (enabled whenever key-colored geometry is
+  visible, or continuously in "key content" mode). `StreamSession` echoes the
+  state back in `0x34` and clears `hostKey` from frame layouts when room view is
+  off so frames render opaquely; if the host never sends `0x36`, passthrough is
+  enabled whenever a frame carries a key. Keying continues for 300 ms after room
+  view turns off (`roomViewLinger`) so in-flight frames with key-colored pixels
+  do not flash. In `XRDisplay`, passthrough only runs while the background can
+  show through (before the first frame arrives, when local chroma keying is
+  enabled, or when a frame has alpha or `hostKey`); otherwise the environment
+  blend mode switches to opaque and any `XR_FB_passthrough` layer and camera
+  feed are paused.
+- **Dimming.** When a frame's dimming flag is set, both renderers blend
+  passthrough behind keyed regions toward black up to 75% opacity, ramping in
+  over 50 ms and out over 100 ms (`dimNow`).
+- **Foveal tile blending.** When rendering with standard premultiplied "over"
+  blending in Vulkan, overlapping opaque or semi-transparent tiles would double
+  up passthrough occlusion across the foveal fade band. Given a foveal tile
+  blended at alpha `a * c` (for feather weight `c`), `quad.frag` scales the
+  underlying base tile's alpha in the overlap region (`Quad.covered`) to
+  `a * (1 - c) / (1 - a * c)` so the combined alpha equals `a`. The same math
+  applies when the runtime composites the sharp layer over the base projection
+  layer. On Metal, dual-source blending cross-fades the foveal tile directly
+  against the base tile (`cover = feather`), preserving combined alpha `a`
+  without adjusting the base tile.
+
+SteamVR hosts encode video frames using the BT.709 matrix without writing VUI
+matrix coefficients in the bitstream, while `vrlink` configures its decoder for
+BT.2020 and applies a 3x3 correction matrix (`_valve1_d2020d709`) in its
+fragment shader (`docs/svl-values/vte-id-table.md`). `FrameMetadata` sets
+`FrameLayout.encodedWith = .bt709` on Steam frames accordingly. On Android,
+`ColorProbe` targets full-range BT.709 (producing `_valve1_d2020d709` when a
+decoder converts using BT.2020) and re-probes the test frame with the correction
+enabled at startup to verify the output colors. On Apple platforms, VideoToolbox
+leaves the color matrix attachment unset on untagged bitstreams—which causes
+Metal's sampler to default to BT.601—so `VideoDecoder` attaches the matrix from
+`FrameLayout.encodedWith` to each decoded `CVPixelBuffer` (verified at 8-bit and
+10-bit by `ColorPathTests`). Streams that specify color metadata in their
+bitstream headers (such as WiVRn) leave `encodedWith` unset and use the
+decoder's color conversion directly.
 
 ### Probing the video color pipeline
 
@@ -640,6 +738,7 @@ MediaCodec do not report. Defaults follow ALVR's OpenXR client:
 | `shaderColorConversion` | off | Configures the Vulkan sampler with `RGB_IDENTITY` and converts Y'CbCr to RGB (full-range BT.2020, non-constant luminance) in `quad.frag` instead of using the GPU driver's Y'CbCr conversion. |
 | `undoRangeStretch` | on for Play For Dream | Inverts a narrow-range expansion (16...235 to 0...255) applied by the decoder or GPU driver to full-range frames, matching the range fix ALVR applies on most standalone headsets. |
 | `headVelocityFromPoses`, `controllerVelocityFromPoses` | head: Pico, Vive, YVR, Play For Dream; controllers: Pico, Vive | Derives linear and angular velocities by finite-differencing poses 20 ms apart instead of using the runtime's reported velocity vectors. These runtimes report velocities in the wrong coordinate frame, causing misdirected host pose prediction (matching ALVR's `get_head_data` workaround). |
+| `layerFilter` | `none` (`sharpen_quality` on Galaxy XR) | Projection layer scaling filter requested via `XR_FB_composition_layer_settings` when supported (sharpening when upscaling, supersampling when downscaling, or runtime auto-selection, matching `vrlink`). |
 | `colorSpace` | `rec709` | Color space declared to the compositor via `XR_FB_color_space` when supported (matching ALVR). Leaving wide-gamut displays unmanaged oversaturates the sRGB-rendered stream. |
 | `decoderWidth`, `decoderHeight` | 2048 x 2048 | Initial decoder dimensions used when parameter sets are not parsed beforehand (currently AV1). `PictureSize` parses H.264 and HEVC dimensions from the SPS. |
 | `decoderLowLatency` | on | Enables the Android 11 `low-latency` key and Qualcomm's vendor low-latency extension. |

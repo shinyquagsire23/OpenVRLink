@@ -53,6 +53,11 @@ public struct HeadsetQuirks: Equatable {
     /// displays unmanaged oversaturates colors.
     public var colorSpace = "rec709"
     public static let colorSpaces = ["rec709", "p3", "rec2020", "unmanaged"]
+    /// Projection layer scaling filter requested via `XR_FB_composition_layer_settings` when supported:
+    /// `none` for the runtime default, `sharpen` or `sharpen_quality` when upscaling layers to the display,
+    /// `supersample` or `supersample_quality` when downscaling, or `auto` to let the runtime choose.
+    public var layerFilter = "none"
+    public static let layerFilters = ["none", "sharpen", "sharpen_quality", "supersample", "supersample_quality", "auto"]
     /// Invert narrow-range expansion (16...235 to 0...255) applied by the decoder or GPU driver to full-range
     /// video, preventing crushed and tinted shadows (matching ALVR's range fix on standalone headsets).
     public var undoRangeStretch = false
@@ -148,8 +153,9 @@ public struct HeadsetQuirks: Equatable {
         self.headset = headset
         gripOffset = GripOffset.towardQuest(from: headset)
         floatTargetIsEncoded = headset == .pico || headset == .galaxyXR
-        // Galaxy XR recommends 1856 x 2160 swapchains for 3552 x 3840 panels.
-        if headset == .galaxyXR { eyeDetail = 1.9; leanUplink = true }
+        // Galaxy XR upscales 1856 x 2160 swapchains to 3552 x 3840 panels with a soft default filter unless
+        // sharpening is requested.
+        if headset == .galaxyXR { eyeDetail = 1.9; leanUplink = true; layerFilter = "sharpen_quality" }
         // Match ALVR's workarounds for YVR and Play For Dream (`use_custom_reprojection` and `passthrough_fb.rs`).
         if headset == .yvr || headset == .playForDream {
             compositorPlacesLayers = false
@@ -217,6 +223,7 @@ public struct HeadsetQuirks: Equatable {
         if let value = flag("decoder_color_keys") { decoderColorKeys = value }
         if let value = flag("encoding_gamma") { encodingGamma = value }
         if let value = override("color_space"), HeadsetQuirks.colorSpaces.contains(value) { colorSpace = value }
+        if let value = override("layer_filter"), HeadsetQuirks.layerFilters.contains(value) { layerFilter = value }
         if let value = flag("head_velocity_from_poses") { headVelocityFromPoses = value }
         if let value = flag("controller_velocity_from_poses") { controllerVelocityFromPoses = value }
         if let value = override("video_range") {
@@ -254,6 +261,7 @@ public struct HeadsetQuirks: Equatable {
         Option(key: "shader_color_conversion", title: "Convert video colors in shader", kind: .flag),
         Option(key: "undo_range_stretch", title: "Undo narrow-range stretch on video colors", kind: .flag),
         Option(key: "color_space", title: "Display color space", kind: .choice(colorSpaces)),
+        Option(key: "layer_filter", title: "Compositor layer filter", kind: .choice(layerFilters)),
         Option(key: "video_range", title: "Video range", kind: .choice(["auto", "narrow", "full"])),
         Option(key: "compositor_places_layers", title: "Use compositor layer placement", kind: .flag),
         Option(key: "sharp_layer", title: "Sharp layer size (0 for none)", kind: .number(0...4096, step: 256)),
@@ -279,6 +287,7 @@ public struct HeadsetQuirks: Equatable {
         case "shader_color_conversion": return flag(shaderColorConversion)
         case "undo_range_stretch": return flag(undoRangeStretch)
         case "color_space": return colorSpace
+        case "layer_filter": return layerFilter
         case "video_range": return videoRange?.rawValue ?? "auto"
         case "compositor_places_layers": return flag(compositorPlacesLayers)
         case "sharp_layer": return String(sharpLayerPixels)

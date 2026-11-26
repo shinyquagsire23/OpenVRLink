@@ -35,6 +35,9 @@ public final class XRDisplay<Graphics: XRGraphics> {
     public var onPaused: (() -> Void)?
     /// Invoked on the render thread when a pending OpenXR reference-space or boundary change takes effect.
     public var onSpaceChanged: (() -> Void)?
+    /// Invoked on the render thread when a system-initiated recenter is detected while tracking in stage
+    /// space, passing the updated `LOCAL` origin in stage coordinates (`followSystemRecenter`).
+    public var onRecentered: ((Pose) -> Void)?
 
     /// Reference space used for pose tracking and projection layer submission.
     public enum Origin: String {
@@ -54,6 +57,12 @@ public final class XRDisplay<Graphics: XRGraphics> {
     private let session: XrSession
     private var space: XrSpace?
     private var headSpace: XrSpace?
+    /// Projection layer scaling filter chained via `XR_FB_composition_layer_settings`, or `nil` for the runtime default.
+    private var layerFilter: UnsafeMutablePointer<XrCompositionLayerSettingsFB>?
+    private let layerFilterName: String
+    /// `LOCAL` reference space and its last observed pose in stage coordinates, used by `followSystemRecenter`.
+    private var localSpace: XrSpace?
+    private var localSeen: Pose?, localChecked: UInt64 = 0
     /// Per-eye base swapchains, followed by the two sharp-layer swapchains when enabled.
     private var swapchains: [XRSwapchain] = []
     private var hasSharpLayer: Bool { swapchains.count == 4 }
@@ -114,9 +123,10 @@ public final class XRDisplay<Graphics: XRGraphics> {
     public init(applicationName: String, graphics: Graphics, frames: DisplayQueue<Graphics.Frame>, panel: XRPanelLayer? = nil,
                 process: XRProcess = XRProcess(), sharpLayerPixels: Int = 0, eyeDetail: Float = 1,
                 sustainedPerformance: Bool = true, compositorPlacesLayers: Bool = true, passthroughLayer: Bool = false,
-                colorSpace: String = "rec709", log: @escaping (String) -> Void) throws {
+                colorSpace: String = "rec709", layerFilter: String = "none", log: @escaping (String) -> Void) throws {
         self.eyeDetail = eyeDetail
         self.compositorPlacesLayers = compositorPlacesLayers
+        self.layerFilterName = layerFilter
         self.sustainedPerformance = sustainedPerformance
         self.graphics = graphics
         self.panel = panel
@@ -148,6 +158,27 @@ public final class XRDisplay<Graphics: XRGraphics> {
             log("openxr: color space set to \(colorSpace)" + (result.rawValue < 0 ? " refused (\(XRFailure.name(of: result)))" : ""))
         }
 
+        // Request projection layer sharpening or supersampling when configured (matching `vrlink`).
+        let filters: [String: XrCompositionLayerSettingsFlagsFB] = [
+            "sharpen": XR_COMPOSITION_LAYER_SETTINGS_NORMAL_SHARPENING_BIT_FB,
+            "sharpen_quality": XR_COMPOSITION_LAYER_SETTINGS_QUALITY_SHARPENING_BIT_FB,
+            "supersample": XR_COMPOSITION_LAYER_SETTINGS_NORMAL_SUPER_SAMPLING_BIT_FB,
+            "supersample_quality": XR_COMPOSITION_LAYER_SETTINGS_QUALITY_SUPER_SAMPLING_BIT_FB,
+            "auto": XR_COMPOSITION_LAYER_SETTINGS_AUTO_LAYER_FILTER_BIT_META,
+        ]
+        if let flags = filters[layerFilter] {
+            if instance.extensions.contains("XR_FB_composition_layer_settings") {
+                let settings = UnsafeMutablePointer<XrCompositionLayerSettingsFB>.allocate(capacity: 1)
+                settings.initialize(to: XrCompositionLayerSettingsFB())
+                settings.pointee.type = XR_TYPE_COMPOSITION_LAYER_SETTINGS_FB
+                settings.pointee.layerFlags = flags
+                self.layerFilter = settings
+                log("openxr: layer filter set to \(layerFilter)")
+            } else {
+                log("openxr: layer filter \(layerFilter) unavailable (missing XR_FB_composition_layer_settings)")
+            }
+        }
+
         // Prefer STAGE for guardian bounds and floor height, falling back to LOCAL_FLOOR and then LOCAL.
         var count: UInt32 = 0
         try check(calls.enumerateReferenceSpaces(made, 0, &count, nil), "xrEnumerateReferenceSpaces")
@@ -166,6 +197,10 @@ public final class XRDisplay<Graphics: XRGraphics> {
         try check(calls.createReferenceSpace(made, &place, &space), "xrCreateReferenceSpace")
         place.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW
         try check(calls.createReferenceSpace(made, &place, &headSpace), "xrCreateReferenceSpace(view)")
+        if origin == .stage, kinds.contains(XR_REFERENCE_SPACE_TYPE_LOCAL) {
+            place.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL
+            _ = calls.createReferenceSpace(made, &place, &localSpace)
+        }
         log("openxr: tracking in the \(origin.rawValue) space")
 
         input = try XRInput(instance: instance, session: made, log: log)
@@ -307,7 +342,8 @@ public final class XRDisplay<Graphics: XRGraphics> {
         for swapchain in swapchains + [panel?.swapchain].compactMap({ $0 }) { _ = calls.destroySwapchain(swapchain.handle) }
         if let passthroughLayer { _ = calls.destroyPassthroughLayer?(passthroughLayer) }
         if let passthrough { _ = calls.destroyPassthrough?(passthrough) }
-        for space in [space, headSpace] { if let space { _ = calls.destroySpace(space) } }
+        for space in [space, headSpace, localSpace] { if let space { _ = calls.destroySpace(space) } }
+        layerFilter?.deallocate()
         _ = calls.destroySession(session)
     }
 
@@ -403,6 +439,33 @@ public final class XRDisplay<Graphics: XRGraphics> {
         applyRefreshRate()
     }
 
+    /// Detects system-initiated recenters (such as holding the headset's home button) while tracking in stage
+    /// space.
+    ///
+    /// Because stage space stays fixed to the physical room, a system recenter only moves the runtime's
+    /// `LOCAL` space rather than the stage poses sent to the host. Polling `LOCAL` inside stage space twice
+    /// per second detects shifts larger than 5 cm or ~3 degrees and forwards the updated origin via
+    /// `onRecentered`. Reference-space change events are not used because runtime behavior varies (for
+    /// example, Android XR posts change events for all spaces, including stage, on every recenter).
+    private func followSystemRecenter(at time: XrTime, now: UInt64) {
+        guard let localSpace, let space, now >= localChecked + 500_000_000 else { return }
+        localChecked = now
+        var location = XrSpaceLocation()
+        location.type = XR_TYPE_SPACE_LOCATION
+        let needed = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT
+        guard instance.calls.locateSpace(localSpace, space, time, &location).rawValue >= 0, location.locationFlags & needed == needed
+        else { return }
+        let found = Pose(location.pose)
+        defer { localSeen = found }
+        guard let before = localSeen else { return }
+        let moved = found.position - before.position
+        // Ignore tracking drift below 5 cm horizontally or ~3 degrees of yaw.
+        guard (moved.x * moved.x + moved.z * moved.z).squareRoot() > 0.05 || found.forward.dot(before.forward) < 0.9986 else { return }
+        log(String(format: "openxr: system recenter detected: local origin at (%.2f, %.2f) m in stage, forward (%.2f, %.2f)",
+                   found.position.x, found.position.z, found.forward.x, found.forward.z))
+        onRecentered?(found)
+    }
+
     /// Interval in seconds between thermal refresh-rate adjustments.
     static var heatStep: Double { 30 }
 
@@ -450,7 +513,10 @@ public final class XRDisplay<Graphics: XRGraphics> {
                 input.noteControllers()
             case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:
                 let change = withUnsafeBytes(of: &event) { $0.load(as: XrEventDataReferenceSpaceChangePending.self) }
-                log("openxr: \(origin.rawValue) reference space change pending")
+                let kinds = [XR_REFERENCE_SPACE_TYPE_VIEW: "view", XR_REFERENCE_SPACE_TYPE_LOCAL: "local", XR_REFERENCE_SPACE_TYPE_STAGE: "stage",
+                             XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR: "local floor"]
+                log("openxr: \(kinds[change.referenceSpaceType] ?? "type \(change.referenceSpaceType.rawValue)") reference space change pending"
+                    + " (tracking in the \(origin.rawValue) space)")
                 spaceChangesAt = max(spaceChangesAt ?? 0, change.changeTime)
             case XR_TYPE_EVENT_DATA_RECOMMENDED_RESOLUTION_CHANGED_ANDROID:
                 // Log Android XR's dynamic swapchain resolution recommendation (allocated swapchains keep their initial size).
@@ -620,6 +686,7 @@ public final class XRDisplay<Graphics: XRGraphics> {
         }
 
         followHeat(at: waited)
+        followSystemRecenter(at: time, now: waited)
         let picked = frames.next()
         if let stream = streamingSession() {
             // Fall back to one refresh period ahead when XR_KHR_convert_timespec_time is unavailable.
@@ -638,6 +705,8 @@ public final class XRDisplay<Graphics: XRGraphics> {
         let key = chromaKey()
         if graphics.chromaKey != key { graphics.chromaKey = key }
         let frame = picked?.frame
+        // Enable passthrough only when the background can show through (before the first frame arrives, when
+        // client chroma keying is enabled, or when the frame has alpha or a host chroma key).
         let transparent = frame == nil || key != nil || frame?.layout.transparent == true
         // Use alpha blending for passthrough when the stream is transparent and the headset supports it;
         // otherwise use the runtime's preferred blend mode.
@@ -793,6 +862,7 @@ public final class XRDisplay<Graphics: XRGraphics> {
         room.type = XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB
         room.flags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
         room.layerHandle = passthroughLayer
+        if let layerFilter { layer.next = UnsafeRawPointer(layerFilter) }
         var sharpLayer = layer
         if sharpAlone { sharpLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT }
         try projected.withUnsafeBufferPointer { views in

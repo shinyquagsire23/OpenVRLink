@@ -193,8 +193,10 @@ public enum ColorProbe {
             self.stretched = stretched
         }
 
-        /// Expected stream interpretation: full-range BT.2020.
-        public static let right = Treatment(matrix: .bt2020, stretched: false)
+        /// Expected SteamVR stream encoding: full-range BT.709. Stream headers omit color matrix metadata, and
+        /// `vrlink` configures its decoder for BT.2020 before inverting the mismatch with a 3x3 shader matrix
+        /// (`_valve1_d2020d709`, matching `correction` for a BT.2020 decode).
+        public static let right = Treatment(matrix: .bt709, stretched: false)
 
         static var all: [Treatment] {
             [false, true].flatMap { stretched in ([nil] + Matrix.allCases.map { Optional($0) }).map { Treatment(matrix: $0, stretched: stretched) } }
@@ -224,13 +226,13 @@ public enum ColorProbe {
             return (0..<3).map { rows[$0][0] * input[0] + rows[$0][1] * input[1] + rows[$0][2] * input[2] + offset[$0] }
         }
 
-        /// Row-major 3x4 affine matrix mapping a sampled `(r, g, b, 1)` vector back to full-range BT.2020 RGB.
+        /// Row-major 3x4 affine matrix mapping a sampled `(r, g, b, 1)` vector back to full-range BT.709 RGB.
         public var correction: [Float] { correction(bits: 10) }
 
         public func correction(bits: Int) -> [Float] {
             let (rows, offset) = affine(bits: bits)
             guard let back = ColorProbe.inverse(rows) else { return ColorProbe.noCorrection }
-            let wanted = Matrix.bt2020.rows
+            let wanted = Matrix.bt709.rows
             // wanted * back * (color - offset)
             let both = (0..<3).map { row in (0..<3).map { column in (0..<3).reduce(Float(0)) { $0 + wanted[row][$1] * back[$1][column] } } }
             return (0..<3).flatMap { row in both[row] + [-(0..<3).reduce(Float(0)) { $0 + both[row][$1] * offset[$1] }] }
