@@ -217,6 +217,26 @@ final class ClientModelTests: XCTestCase {
         XCTAssertNil(model.state.target)
     }
 
+    func testResettingSettingsKeepsCalibrationsAndQuirks() {
+        var settings = Settings()
+        XCTAssertFalse(settings.differsFromDefaults)
+        settings.chromaKey = true
+        settings.fovScaleHorizontal = 1.3
+        settings.microphone = true
+        settings.quirkOverrides = ["video_range": "narrow"]
+        XCTAssertTrue(settings.differsFromDefaults)
+        let fresh = settings.resetToDefaults()
+        XCTAssertFalse(fresh.chromaKey)
+        XCTAssertEqual(fresh.fovScaleHorizontal, 1)
+        XCTAssertFalse(fresh.microphone)
+        XCTAssertEqual(fresh.quirkOverrides, ["video_range": "narrow"])
+        XCTAssertFalse(fresh.differsFromDefaults)
+        // Quirk overrides alone do not mark standard settings as modified.
+        var onlyQuirks = Settings()
+        onlyQuirks.quirkOverrides = ["wait_for_gpu": "0"]
+        XCTAssertFalse(onlyQuirks.differsFromDefaults)
+    }
+
     func testSettingsFormShowsWhatThePlatformHas() {
         XCTAssertEqual(SettingsForm.sections(for: []).map(\.title), ["Field of view"])
         let android = SettingsForm.sections(for: [.microphone, .chromaKey])

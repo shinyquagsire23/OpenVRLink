@@ -138,12 +138,15 @@ public struct DeviceProfile {
     /// Request encoding gamma when connected to a host with OpenVRLink extensions (`HostExtensions.Features.encodingGamma`).
     public var wantsEncodingGamma = true
 
-    /// Whether this headset uses Play For Dream controllers and whether the host's `driver_openvrlink` has
-    /// their render models installed (`HostExtensions.Features.playForDreamModels`, cached from the previous
-    /// session in `KnownHosts`). When both are true, the client reports Play For Dream controller models
-    /// instead of Quest Touch models.
-    public var playForDreamControllers = false, hostHasPlayForDreamModels = false
-    var showsPlayForDreamControllers: Bool { playForDreamControllers && hostHasPlayForDreamModels && !senseControllerModels }
+    /// Custom controller model set for this headset, if it has one. When the host also has this set installed,
+    /// OpenVRLink reports those render models instead of the Quest 2 Touch models.
+    public var ownControllerModels: ControllerModelSet?
+    /// Bitmask of `ControllerModelSet` values installed on the host, received in `oxModels` and cached in `KnownHosts`.
+    public var hostControllerModels: UInt32 = 0
+    var shownControllerModels: ControllerModelSet? {
+        guard let own = ownControllerModels, hostControllerModels & own.bit != 0, !senseControllerModels else { return nil }
+        return own
+    }
 
     /// Returns the native `(model, manufacturer)` pair for this device. Windows builds of
     /// `driver_vrlink` (SteamVR 2.19.4) recognize `"Apple Vision Pro M2"` and `"Apple Vision Pro M5"`
@@ -186,13 +189,10 @@ public struct DeviceProfile {
             ? staticProps(["oculus", "OpenVRLink_Sense_\(name)", "Sony", "PlayStation VR2 Sense (\(name))",
                            "{openvrlink_sense}playstation_vr2_sense_\(name.lowercased())", "openvrlink_sense",
                            "{oculus}/input/touch_profile.json", "oculus_touch", "oculus/OpenVRLink_Sense_\(name)"], 0)
-            : showsPlayForDreamControllers
-            // Uses the Play For Dream render model while keeping the Oculus Touch input profile.
-            ? staticProps(["oculus", "OpenVRLink_PFD_\(name)", "Play For Dream", "Play For Dream MR (\(name) Controller)",
-                           "{openvrlink}pfd_mr_controller_\(name.lowercased())", "openvrlink",
-                           "{oculus}/input/touch_profile.json", "oculus_touch", "oculus/OpenVRLink_PFD_\(name)"], 0)
+            // Use the headset's custom render model while keeping the Oculus Touch input profile.
+            : shownControllerModels.map { staticProps($0.staticStrings(side), 0) }
             // Static controller properties sent by vrlink for the active OpenXR interaction profile.
-            : staticProps(model.staticStrings(side), 0)
+            ?? staticProps(model.staticStrings(side), 0)
         let identity = isController
             ? controller
             : staticProps(["vrlink", "VRLINKQ_Hand_\(name)", "VRLink", "VRLink Hand Tracker (\(name) Hand)",

@@ -28,6 +28,8 @@ public enum SettingsForm {
         public static let senseControllers = Features(rawValue: 1 << 7)
         /// Supports estimating scene depth from decoded stereo video frames.
         public static let depthFromPicture = Features(rawValue: 1 << 8)
+        /// Supports dynamic thermal refresh-rate stepping across multiple display refresh rates.
+        public static let rateSteps = Features(rawValue: 1 << 9)
     }
 
     public enum Control {
@@ -72,6 +74,10 @@ public enum SettingsForm {
                     + "as your head moves between frames", items: [
             Item(title: "Estimate depth from stereo video", control: .toggle(\.depthFromPicture), needs: .depthFromPicture),
             Item(title: "Display estimated depth (debug)", control: .toggle(\.showDepth), needs: .depthFromPicture),
+        ]),
+        Section(title: "Heat", footer: "Reduces the display refresh rate during thermal throttling and restores it once "
+                    + "the headset cools, at the cost of a brief hitch on each change", items: [
+            Item(title: "Lower refresh rate when hot", control: .toggle(\.lowerRateWhenHot), needs: .rateSteps),
         ]),
         Section(title: "Field of view", footer: "Increase FoV for timewarp comfort, or sacrifice FoV for sharpness", items: [
             Item(title: "Across", control: .slider(\.fovScaleHorizontal, in: Settings.fovScaleRange, step: 0.05)),

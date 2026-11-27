@@ -201,8 +201,8 @@ final class InstallTests: XCTestCase {
         }
         XCTAssertEqual(defaults["vrlink_Apple Vision Pro (OpenVRLink)"]?["modelNumber"], .string("Apple Vision Pro (OpenVRLink)"))
         XCTAssertTrue(Steam.isFile(driver.appendingPathComponent("resources/settings/settingsschema.vrsettings")))
-        // Installing the driver writes the Play For Dream controller models and enables playForDreamModels in defaults.
-        XCTAssertEqual(defaults[Install.section]?[PlayForDreamModel.settingsKey], .bool(true))
+        // Installing the driver writes the Play For Dream controller models and sets controllerModels in defaults.
+        XCTAssertEqual(defaults[Install.section]?[ControllerModels.settingsKey], .number("1"))
         XCTAssertTrue(PlayForDreamModel.isPresent(inDriver: driver))
         for model in PlayForDreamModel.models {
             let folder = driver.appendingPathComponent("resources/rendermodels").appendingPathComponent(model)
@@ -521,5 +521,118 @@ final class ReleaseTests: XCTestCase {
         XCTAssertTrue(SelfUpdate.clearLeftovers(beside: program))
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted(), ["companion-notes.txt", "companion.exe"])
         XCTAssertFalse(SelfUpdate.looksRunnable(Data("<html>".utf8), windows: true))
+    }
+
+    /// Builds a minimal two-part glTF fixture with a static body mesh and a trigger node that rotates 10 deg around X.
+    private func smallController() -> (gltf: Data, files: [String: Data]) {
+        var bytes = Data()
+        func floats(_ values: [Float]) { for value in values { withUnsafeBytes(of: value.bitPattern.littleEndian) { bytes.append(contentsOf: $0) } } }
+        floats([0, 0, 0, 0.01, 0, 0, 0, 0.01, 0])            // positions, at 0
+        floats([0, 0, 1, 0, 0, 1, 0, 0, 1])                  // normals, at 36
+        floats([0, 0, 1, 0, 0, 1])                           // texture coordinates, at 72
+        for index: UInt16 in [0, 1, 2] { withUnsafeBytes(of: index.littleEndian) { bytes.append(contentsOf: $0) } }   // at 96
+        bytes.append(contentsOf: [0, 0])
+        floats([0, 1])                                       // times, at 104
+        let half = Float(5 * Double.pi / 180)
+        floats([0, 0, 0, 1, sin(half), 0, 0, cos(half)])     // rotations, at 112
+        let gltf = """
+        {"asset":{"version":"2.0"},"buffers":[{"uri":"c.bin","byteLength":\(bytes.count)}],
+         "bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":36},{"buffer":0,"byteOffset":36,"byteLength":36},
+            {"buffer":0,"byteOffset":72,"byteLength":24},{"buffer":0,"byteOffset":96,"byteLength":6},
+            {"buffer":0,"byteOffset":104,"byteLength":8},{"buffer":0,"byteOffset":112,"byteLength":32}],
+         "accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"},{"bufferView":1,"componentType":5126,"count":3,"type":"VEC3"},
+            {"bufferView":2,"componentType":5126,"count":3,"type":"VEC2"},{"bufferView":3,"componentType":5123,"count":3,"type":"SCALAR"},
+            {"bufferView":4,"componentType":5126,"count":2,"type":"SCALAR"},{"bufferView":5,"componentType":5126,"count":2,"type":"VEC4"}],
+         "images":[{"uri":"color.png"}],"textures":[{"source":0}],
+         "materials":[{"pbrMetallicRoughness":{"baseColorTexture":{"index":0}}}],
+         "meshes":[{"primitives":[{"attributes":{"POSITION":0,"NORMAL":1,"TEXCOORD_0":2},"indices":3,"material":0}]}],
+         "nodes":[{"name":"body","mesh":0},{"name":"t","mesh":0},{"name":"Trigger","children":[1],"translation":[0,0.02,0.03]},
+                  {"name":"Root","children":[0,2]}],
+         "animations":[{"name":"Trigger_Press","channels":[{"sampler":0,"target":{"node":2,"path":"rotation"}}],
+                        "samplers":[{"input":4,"output":5,"interpolation":"LINEAR"}]}]}
+        """
+        return (Data(gltf.utf8), ["c.bin": bytes, "color.png": Data([1, 2, 3])])
+    }
+
+    func testConvertsGLTFControllerModelToSteamVRRenderModel() throws {
+        let source = smallController()
+        XCTAssertEqual(GLTFControllerModel.references(of: source.gltf), ["c.bin", "color.png"])
+        // Using an identity placement transform preserves the glTF's local coordinates.
+        let files = try GLTFControllerModel.convert(gltf: source.gltf, files: source.files, side: .left, name: "m", place: .init())
+        XCTAssertEqual(Set(files.map(\.path)), ["m.obj", "m.mtl", "m_body.obj", "m_body.mtl", "m_trigger.obj", "m_trigger.mtl", "m.png", "m.json"])
+        let trigger = String(decoding: try XCTUnwrap(files.first { $0.path == "m_trigger.obj" }).data, as: UTF8.self)
+        // Trigger vertices include the node translation, and V texture coordinates are flipped for OBJ.
+        XCTAssertTrue(trigger.contains("v 0.010000 0.020000 0.030000\n"), trigger)
+        XCTAssertTrue(trigger.contains("vt 0.000000 0.000000\n") && trigger.contains("vt 0.000000 1.000000\n"))
+        XCTAssertTrue(trigger.contains("f 1/1/1 2/2/2 3/3/3\n"))
+        let whole = String(decoding: try XCTUnwrap(files.first { $0.path == "m.obj" }).data, as: UTF8.self)
+        XCTAssertTrue(whole.contains("f 4/4/4 5/5/5 6/6/6\n"))
+        let described = try JSON(parsing: String(decoding: try XCTUnwrap(files.first { $0.path == "m.json" }).data, as: UTF8.self))
+        let motion = try XCTUnwrap(described["components"]?["trigger"]?["motion"])
+        XCTAssertEqual(motion["type"], .string("rotate"))
+        XCTAssertEqual(motion["trigger_path"], .string("/input/trigger"))
+        XCTAssertEqual(motion["pivot"], .array([.number("0"), .number("0.02"), .number("0.03")]))
+        XCTAssertEqual(motion["axis"], .array([.number("1"), .number("0"), .number("0")]))
+        XCTAssertEqual(motion["value_mapping"]?.array?.last?.number.flatMap(Double.init) ?? 0, 10, accuracy: 0.001)
+        XCTAssertEqual(described["components"]?["body"]?["filename"], .string("m_body.obj"))
+        XCTAssertNotNil(described["components"]?["openxr_grip"])
+
+        // Default placement maps the glTF origin onto the Quest 2 model's openxr_grip transform.
+        let placed = try GLTFControllerModel.convert(gltf: source.gltf, files: source.files, side: .left, name: "m")
+        let body = String(decoding: try XCTUnwrap(placed.first { $0.path == "m_body.obj" }).data, as: UTF8.self)
+        XCTAssertTrue(body.contains("v 0.007000 -0.001829 0.101948\n"), body)
+
+        // galaxyXRPlace inverts the client's GripOffset.towardQuest transform (+5 mm X, +5 mm Y, +56 mm Z, and
+        // +15 deg pitch relative to galaxyXRGrip) so the adjusted grip pose lands on questGrip.
+        let galaxy = GLTFControllerModel.galaxyXRPlace(.left), quest = GLTFControllerModel.questGrip(.left)
+        let pitch = GLTFControllerModel.Transform(degrees: [15, 0, 0], translation: [0, 0, 0])
+        // Offset of Samsung's reported grip pose along the handle axis in glTF coordinates.
+        let grip = GLTFControllerModel.galaxyXRGrip(.left)
+        XCTAssertEqual(grip, [-0.008, 0, -0.014])
+        for (got, expected) in zip(galaxy.applied(to: [0.005 + grip[0], 0.005 + grip[1], 0.056 + grip[2]]), quest.applied(to: [0, 0, 0])) { XCTAssertEqual(got, expected, accuracy: 1e-9) }
+        for (got, expected) in zip(galaxy.turned(pitch.turned([0, 0, -1])), quest.turned([0, 0, -1])) { XCTAssertEqual(got, expected, accuracy: 1e-9) }
+        XCTAssertEqual(GLTFControllerModel.galaxyXRPlace(.right).translation[0], -galaxy.translation[0], accuracy: 1e-9)
+
+        // Truncated buffers and empty glTF documents throw an error instead of reading out of bounds.
+        XCTAssertThrowsError(try GLTFControllerModel.convert(gltf: source.gltf, files: ["c.bin": Data(count: 40)], side: .left, name: "m"))
+        XCTAssertThrowsError(try GLTFControllerModel.convert(gltf: Data("{}".utf8), files: [:], side: .left, name: "m"))
+    }
+
+    func testInstallingControllerModelsUpdatesDriverDefaults() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("ovrl-models-\(UInt32.random(in: 0...UInt32.max))")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let driver = root.appendingPathComponent("driver"), sources = root.appendingPathComponent("from")
+        try FileManager.default.createDirectory(at: sources, withIntermediateDirectories: true)
+        try Install.writeDriver(to: driver, library: Data([1]), windows: true, ownTab: true)
+        let source = smallController()
+        for name in ["L.gltf", "R.gltf"] { try source.gltf.write(to: sources.appendingPathComponent(name)) }
+        for (name, data) in source.files { try data.write(to: sources.appendingPathComponent(name)) }
+        XCTAssertEqual(HeadsetModel.setsPresent(inDriver: driver), ControllerModels.playForDream)
+        try HeadsetModel.installGalaxyXR(left: sources.appendingPathComponent("L.gltf"), right: sources.appendingPathComponent("R.gltf"), toDriver: driver)
+        XCTAssertEqual(HeadsetModel.setsPresent(inDriver: driver), ControllerModels.playForDream | ControllerModels.galaxyXR)
+        func noted() throws -> JSON? {
+            try JSON(parsing: String(contentsOf: driver.appendingPathComponent("resources/settings/default.vrsettings"), encoding: .utf8))[Install.section]?[ControllerModels.settingsKey]
+        }
+        XCTAssertEqual(try noted(), .number("3"))
+        XCTAssertTrue(Steam.isFile(driver.appendingPathComponent("resources/rendermodels/galaxy_xr_controller_right/galaxy_xr_controller_right_trigger.obj")))
+        // Completed uploads in incoming/ are converted during driver installation while keeping the source files.
+        let other = root.appendingPathComponent("other"), sent = other.appendingPathComponent("incoming/galaxy_xr")
+        for side in ["Left", "Right"] {
+            try FileManager.default.createDirectory(at: sent.appendingPathComponent(side), withIntermediateDirectories: true)
+            try source.gltf.write(to: sent.appendingPathComponent("\(side)/\(side)Controller.gltf"))
+            for (name, data) in source.files { try data.write(to: sent.appendingPathComponent("\(side)/\(name)")) }
+        }
+        try Install.writeDriver(to: other, library: Data([1]), windows: true, ownTab: true)
+        XCTAssertEqual(HeadsetModel.setsPresent(inDriver: other), ControllerModels.playForDream, "incomplete upload should be skipped until complete marker exists")
+        try Data("1\n".utf8).write(to: sent.appendingPathComponent("complete"))
+        try Install.writeDriver(to: other, library: Data([1]), windows: true, ownTab: true)
+        XCTAssertEqual(HeadsetModel.setsPresent(inDriver: other), ControllerModels.playForDream | ControllerModels.galaxyXR)
+        XCTAssertTrue(Steam.isFile(sent.appendingPathComponent("Left/LeftController.gltf")))
+        let told = try JSON(parsing: String(contentsOf: other.appendingPathComponent("resources/settings/default.vrsettings"), encoding: .utf8))[Install.section]
+        XCTAssertEqual(told?["folder"], .string(Steam.nativePath(other)))
+        XCTAssertEqual(told?[ControllerModels.settingsKey], .number("3"))
+        // Reinstalling the driver preserves converted headset models and their controllerModels bitmask.
+        try Install.writeDriver(to: driver, library: Data([2]), windows: true, ownTab: true)
+        XCTAssertEqual(try noted(), .number("3"))
     }
 }

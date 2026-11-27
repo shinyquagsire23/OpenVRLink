@@ -48,6 +48,7 @@ public final class VulkanXRGraphics: XRGraphics {
     /// Per-eye Vulkan image views and framebuffers for the OpenXR swapchains.
     private var targets: [[Target]] = []
     public private(set) var lastGPUWait: UInt64 = 0
+    public private(set) var lastDrawSteps: [(name: String, nanoseconds: UInt64)] = []
     private var sizes: [VkExtent2D] = []
 
     private struct Target {
@@ -842,7 +843,7 @@ public final class VulkanXRGraphics: XRGraphics {
                 corners += [x * 2 - 1, y * 2 - 1, 0, 1, x, y, x, y, 0.5, 0.5, 1]
             }
             try reserve(&shrinkVertices, bytes: corners.count * MemoryLayout<Float>.size, usage: VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)
-            try reserve(&shrinkPixels, bytes: side * side * 4, usage: VK_BUFFER_USAGE_TRANSFER_DST_BIT)
+            try reserve(&shrinkPixels, bytes: side * side * readbackPixelBytes, usage: VK_BUFFER_USAGE_TRANSFER_DST_BIT)
             guard let mapped = shrinkVertices.mapped else {
                 asked.done(nil)
                 return false
@@ -927,6 +928,19 @@ public final class VulkanXRGraphics: XRGraphics {
             // Average the center quarter of each patch to avoid chroma bleed from neighboring patches.
             var sums = [0, 0, 0], count = 0
             let left = (index % ColorProbe.across) * patch + patch * 3 / 8, top = (index / ColorProbe.across) * patch + patch * 3 / 8
+            if readsFloats {
+                let halves = mapped.assumingMemoryBound(to: UInt16.self)
+                var totals: [Float] = [0, 0, 0]
+                for row in top..<(top + patch / 4) {
+                    for column in left..<(left + patch / 4) {
+                        let (red, green, blue) = floatPixel(halves, row * side + column)
+                        totals[0] += red; totals[1] += green; totals[2] += blue
+                        count += 1
+                    }
+                }
+                colors.append(totals.map { ($0 / Float(count) - 0.25) * 2 })
+                continue
+            }
             for row in top..<(top + patch / 4) {
                 for column in left..<(left + patch / 4) {
                     let at = (row * side + column) * 4
@@ -940,8 +954,29 @@ public final class VulkanXRGraphics: XRGraphics {
         drawn.done((colors, drawn.format))
     }
 
-    /// Stereo depth readback requires an 8-bit RGBA/BGRA swapchain format.
-    public var supportsDepth: Bool { VulkanXRGraphics.formats.contains(targetFormat) }
+    /// Stereo depth estimation and `ColorProbe` read back an offscreen render target matching the swapchain
+    /// format (8-bit RGBA/BGRA or 16-bit float).
+    public var supportsDepth: Bool { VulkanXRGraphics.formats.contains(targetFormat) || readsFloats }
+    private var readsFloats: Bool { targetFormat == VK_FORMAT_R16G16B16A16_SFLOAT }
+    /// Bytes per pixel in the offscreen readback buffer.
+    private var readbackPixelBytes: Int { readsFloats ? 8 : 4 }
+
+    /// Reads an `R16G16B16A16_SFLOAT` pixel and returns unclamped sRGB-encoded `(R, G, B)` values, applying the
+    /// linear-to-sRGB transfer function when the render target stores linear light.
+    private func floatPixel(_ halves: UnsafePointer<UInt16>, _ index: Int) -> (Float, Float, Float) {
+        VulkanXRGraphics.floatPixel(halves, index, linear: linearTarget)
+    }
+
+    private static func floatPixel(_ halves: UnsafePointer<UInt16>, _ index: Int, linear: Bool) -> (Float, Float, Float) {
+        func value(_ channel: Int) -> Float {
+            let stored = Float(Float16(bitPattern: halves[index * 4 + channel]))
+            guard linear else { return stored }
+            let size = abs(stored)
+            let encoded = size <= 0.0031308 ? size * 12.92 : 1.055 * Float(pow(Double(size), 1 / 2.4)) - 0.055
+            return stored < 0 ? -encoded : encoded
+        }
+        return (value(0), value(1), value(2))
+    }
 
     /// Vulkan downsamples on the GPU via `shrink` and runs stereo matching on the CPU.
     public var measure: StereoDepthEstimator<HardwareFrame>.Measure? { nil }
@@ -1069,7 +1104,7 @@ public final class VulkanXRGraphics: XRGraphics {
                 return
             }
             try reserve(&shrinkVertices, bytes: corners.count * MemoryLayout<Float>.size, usage: VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)
-            let bytes = plan.width * 2 * plan.height * 4
+            let bytes = plan.width * 2 * plan.height * readbackPixelBytes
             try reserve(&shrinkPixels, bytes: bytes, usage: VK_BUFFER_USAGE_TRANSFER_DST_BIT)
             guard let mapped = shrinkVertices.mapped else {
                 asked.done(nil)
@@ -1149,6 +1184,9 @@ public final class VulkanXRGraphics: XRGraphics {
         }
     }
 
+    /// Background queue that converts downsampled readback buffers into grayscale `LumaPicture` pairs off the render thread.
+    private static let readbackQueue = DispatchQueue(label: "openvrlink.depth.readback", qos: .userInitiated)
+
     /// Converts the completed `shrinkPixels` readback buffer into a `StereoPair` of Rec. 709 luma images and
     /// invokes its completion handler.
     private func finishShrink() {
@@ -1159,23 +1197,45 @@ public final class VulkanXRGraphics: XRGraphics {
             return
         }
         let width = drawn.plan.width, height = drawn.plan.height
-        let bytes = mapped.assumingMemoryBound(to: UInt8.self)
+        // Copy the mapped GPU buffer in a single bulk read on the render thread and convert to grayscale on
+        // readbackQueue (per-pixel reads from mapped memory on the render thread took ~7 ms per frame on Quest Pro).
+        let floats = readsFloats, linear = linearTarget
+        let copied = [UInt8](UnsafeRawBufferPointer(start: mapped, count: width * 2 * height * readbackPixelBytes))
         // Compute Rec. 709 luma, swapping R and B weights for BGRA vs RGBA target formats.
         let blueFirst = targetFormat == VK_FORMAT_B8G8R8A8_SRGB || targetFormat == VK_FORMAT_B8G8R8A8_UNORM
         let (first, last) = blueFirst ? (18, 54) : (54, 18)
-        var eyes = [LumaPicture(width: width, height: height), LumaPicture(width: width, height: height)]
-        for eye in 0..<2 {
-            eyes[eye].pixels.withUnsafeMutableBufferPointer { out in
-                for row in 0..<height {
-                    var at = (row * width * 2 + eye * width) * 4
-                    for column in 0..<width {
-                        out[row * width + column] = UInt8((Int(bytes[at]) * first + Int(bytes[at + 1]) * 183 + Int(bytes[at + 2]) * last) >> 8)
-                        at += 4
+        VulkanXRGraphics.readbackQueue.async {
+            var eyes = [LumaPicture(width: width, height: height), LumaPicture(width: width, height: height)]
+            copied.withUnsafeBytes { raw in
+                if floats {
+                    let halves = raw.bindMemory(to: UInt16.self).baseAddress!
+                    for eye in 0..<2 {
+                        eyes[eye].pixels.withUnsafeMutableBufferPointer { out in
+                            for row in 0..<height {
+                                for column in 0..<width {
+                                    let (red, green, blue) = VulkanXRGraphics.floatPixel(halves, row * width * 2 + eye * width + column, linear: linear)
+                                    out[row * width + column] = UInt8(max(0, min(255, (red * 0.2126 + green * 0.7152 + blue * 0.0722) * 255)))
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let bytes = raw.bindMemory(to: UInt8.self).baseAddress!
+                    for eye in 0..<2 {
+                        eyes[eye].pixels.withUnsafeMutableBufferPointer { out in
+                            for row in 0..<height {
+                                var at = (row * width * 2 + eye * width) * 4
+                                for column in 0..<width {
+                                    out[row * width + column] = UInt8((Int(bytes[at]) * first + Int(bytes[at + 1]) * 183 + Int(bytes[at + 2]) * last) >> 8)
+                                    at += 4
+                                }
+                            }
+                        }
                     }
                 }
             }
+            drawn.done(drawn.plan.pair(left: eyes[0], right: eyes[1]))
         }
-        drawn.done(drawn.plan.pair(left: eyes[0], right: eyes[1]))
     }
 
     // MARK: Panel
@@ -1286,6 +1346,14 @@ public final class VulkanXRGraphics: XRGraphics {
     }
 
     private func record(_ eyes: [XREyeDraw], frame: HardwareFrame?, transparent: Bool) throws {
+        var mark = Uptime.nanoseconds
+        var steps: [(name: String, nanoseconds: UInt64)] = []
+        func stepDone(_ name: String) {
+            let now = Uptime.nanoseconds
+            steps.append((name, now &- mark))
+            mark = now
+        }
+        defer { lastDrawSteps = steps }
         // Wait for the previous frame's command buffer to complete before reusing vertex buffers or releasing frames.
         if submitted {
             var waiting = fence
@@ -1295,8 +1363,10 @@ public final class VulkanXRGraphics: XRGraphics {
         }
         retired.forEach(destroy)
         retired = []
+        stepDone("draw: previous frame fence")
         finishShrink()
         finishProbe()
+        stepDone("draw: depth readback")
         drawing = frame
         // Ramp passthrough dimming toward the target opacity for this frame.
         let now = Uptime.nanoseconds, seconds = dimMoved == 0 ? 0 : min(0.25, Float(now &- dimMoved) / 1e9)
@@ -1330,13 +1400,16 @@ public final class VulkanXRGraphics: XRGraphics {
             }
         }
 
+        stepDone("draw: importing frames")
         let meshes = eyes.map { QuadMesh($0.quads, from: $0.view, yDown: true) }
+        stepDone("draw: building meshes")
         let floats = meshes.reduce(0) { $0 + $1.vertices.count }, indexCount = meshes.reduce(0) { $0 + $1.indices.count }
         try reserve(&vertexBuffer, bytes: floats * MemoryLayout<Float>.size, usage: VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)
         try reserve(&indexBuffer, bytes: indexCount * MemoryLayout<UInt16>.size, usage: VK_BUFFER_USAGE_INDEX_BUFFER_BIT)
         if let sampling { vkResetDescriptorPool(device, sampling.descriptors, 0) }
         var sets: [Int: VkDescriptorSet?] = [:]
         if !recordProbe(&sets) { recordShrink(&sets) }
+        stepDone("draw: depth downsample")
 
         var vertexBase = 0, indexBase = 0
         for (eye, mesh) in zip(eyes, meshes) {
@@ -1409,8 +1482,10 @@ public final class VulkanXRGraphics: XRGraphics {
         submit.commandBufferCount = 1
         try withUnsafePointer(to: &commands) {
             submit.pCommandBuffers = $0
+            stepDone("draw: eye passes")
             try Vulkan.check(vkQueueSubmit(queue, 1, &submit, fence), "vkQueueSubmit")
         }
+        stepDone("draw: queue submit")
         submitted = true
         lastGPUWait = 0
         if quirks.waitForGPU {

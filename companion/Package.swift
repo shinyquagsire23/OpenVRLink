@@ -46,11 +46,12 @@ let package = Package(
                 .unsafeFlags(windowsProgramFlags, .when(platforms: [.windows])),
             ]),
         // C interface declarations for OpenVR vtables, ID3DBlob, and OS calls.
-        .target(name: "DriverABI"),
+        .target(name: "DriverABI", linkerSettings: [.linkedLibrary("ws2_32", .when(platforms: [.windows]))]),
         // SteamVR driver loaded into vrserver alongside driver_vrlink.
         // Build with `--static-swift-stdlib` so the Swift runtime is statically linked into
         // a single shared library. (PatchCore and driver_openvrlink also avoid constructs
         // unsupported by Embedded Swift, once the Windows Swift toolchain ships embedded stdlib.)
         .target(name: "driver_openvrlink", dependencies: ["PatchCore", "DriverABI"]),
+        .testTarget(name: "DriverTests", dependencies: ["driver_openvrlink", "PatchCore", "DriverABI"]),
     ]
 )

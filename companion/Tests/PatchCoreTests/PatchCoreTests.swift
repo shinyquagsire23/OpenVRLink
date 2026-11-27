@@ -137,8 +137,63 @@ final class HostSideTests: XCTestCase {
         XCTAssertEqual(host.active(atMilliseconds: 4000), 0)
     }
 
+    func testReadsClientDataLinkEndpointWhenHeartbeatAdvances() {
+        var host = HostSide()
+        let keys: [(StaticString, Double)] = [("oxAddr", Double(0xC0A8_0432)), ("oxPort", 40123), ("oxKey0", Double(0x0605_0403_0201)), ("oxKey1", 7), ("oxOffer", 2)]
+        // Ignore echoed data-link keys when the client heartbeat is not advancing.
+        for step in 0..<10 { observe(&host, [("oxClient", Handshake.heartbeat(atMilliseconds: 0))] + keys, at: UInt64(step * 100)) }
+        XCTAssertNil(host.link(atMilliseconds: 1000))
+        for step in 10..<20 {
+            let now = UInt64(step * 100)
+            observe(&host, [("oxClient", Handshake.heartbeat(atMilliseconds: now))] + keys, at: now)
+        }
+        let link = host.link(atMilliseconds: 1900)
+        XCTAssertEqual(link?.address, 0xC0A8_0432)
+        XCTAssertEqual(link?.port, 40123)
+        XCTAssertEqual(link?.token, [1, 2, 3, 4, 5, 6, 7, 0, 0, 0, 0, 0])
+        XCTAssertEqual(link?.offer, 2)
+        // Reject out-of-range TCP port numbers.
+        observe(&host, [("oxClient", Handshake.heartbeat(atMilliseconds: 2000)), ("oxPort", 70000)], at: 2000)
+        XCTAssertNil(host.link(atMilliseconds: 2000))
+    }
+
+    func testDataLinkParserReassemblesMessagesAndSkipsUnknownKinds() {
+        XCTAssertEqual(DataLink.hello(token: Array(1...12)).count, DataLink.helloSize)
+        XCTAssertNil(DataLink.token(-1, 0))
+        XCTAssertNil(DataLink.token(0, 281_474_976_710_656))
+        let name = Array("Left/a.bin".utf8)
+        let stream = DataLink.message(.file, [1, UInt8(name.count)] + name + [9, 8, 7]) + [0xFF, 0x7F, 0, 0, 1, 0, 0, 0, 5] + DataLink.message(.done, [1, 0])
+        var parser = DataLink.Parser()
+        var got: [(DataLink.Kind, [UInt8])] = []
+        // Feed the stream one byte at a time and verify that unknown message kinds are skipped.
+        for byte in stream {
+            [byte].withUnsafeBytes { parser.add($0) }
+            while let message = parser.next() { got.append((message.kind, message.payload)) }
+        }
+        XCTAssertEqual(got.map(\.0), [.file, .done])
+        let file = DataLink.file(in: got[0].1)
+        XCTAssertEqual(file?.set, 1)
+        XCTAssertEqual(file.map { Array($0.name) }, name)
+        XCTAssertEqual(file.map { Array($0.bytes) }, [9, 8, 7])
+        // Reject messages whose declared payload length exceeds longestMessage.
+        var greedy = DataLink.Parser()
+        [UInt8]([2, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF]).withUnsafeBytes { greedy.add($0) }
+        XCTAssertNil(greedy.next())
+        XCTAssertTrue(greedy.failed)
+    }
+
+    func testDataLinkRejectsUnsafeFileNames() {
+        for good in ["a.bin", "Left/LeftController.gltf", "Normal_OpenGL.png", "a-b/c.d"] { XCTAssertTrue(DataLink.isSafe(name: Array(good.utf8)[...]), good) }
+        for bad in ["", "..", "../a", "a/../b", "/a", "a/", "a//b", "a/b/c", ".hidden", "a/.b", "a\\b", "C:a", "a b", String(repeating: "a", count: 97)] {
+            XCTAssertFalse(DataLink.isSafe(name: Array(bad.utf8)[...]), bad)
+        }
+        XCTAssertNil(DataLink.file(in: [1, 3] + Array("../".utf8)))
+        XCTAssertNil(DataLink.file(in: [1, 9, 0x61]))
+    }
+
     func testALiveClientGetsGammaAndTheHostKeys() {
         var host = HostSide(available: 1, enabled: 1, gamma: 1.8)
+        host.models = 2
         var seen: [String: Double] = [:]
         for step in 0..<40 {
             let now = UInt64(step * 100)
@@ -148,12 +203,13 @@ final class HostSideTests: XCTestCase {
             host.fill(out, count: 3, atMilliseconds: now)
             XCTAssertTrue(Handshake.record(out + 32, hasKey: "dCurBW") && Handshake.record(out + 64, hasKey: "dCurBW"))
             XCTAssertEqual(Handshake.time(of: out), 9)
-            for key in ["oxHost", "oxAvail", "oxOn", "oxGamma"] as [StaticString] where Handshake.record(out, hasKey: key) {
+            for key in ["oxHost", "oxAvail", "oxOn", "oxGamma", "oxModels"] as [StaticString] where Handshake.record(out, hasKey: key) {
                 seen["\(key)"] = Handshake.value(of: out)
             }
         }
         XCTAssertEqual(host.active(atMilliseconds: 3900), Handshake.gammaFeature)
         XCTAssertEqual(host.activeGamma(atMilliseconds: 3900), 1.8, accuracy: 1e-6)
+        XCTAssertEqual(seen["oxModels"], 2)
         XCTAssertEqual(seen["oxAvail"], 1)
         XCTAssertEqual(seen["oxOn"], 1)
         XCTAssertEqual(seen["oxGamma"] ?? 0, 1.8, accuracy: 1e-6)

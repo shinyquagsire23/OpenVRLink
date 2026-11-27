@@ -75,12 +75,20 @@ public final class StreamSession: StreamingSession {
     /// Called on the session thread when the host reports its available `HostExtensions`
     /// features (and whenever that set changes), or with `nil` if the host streams for
     /// `extensionsWait` seconds without sending extension records.
-    public var onHostFeatures: ((HostExtensions.Features?) -> Void)?
-    private var featuresTold: HostExtensions.Features??
+    public var onHostFeatures: ((HostExtensions.Told?) -> Void)?
+    private var featuresTold: HostExtensions.Told??
+    /// TCP data link listener, opened when a live `driver_openvrlink` host is missing controller models this
+    /// headset can upload.
+    private var dataLink: DataLink?
+    private var dataLinkTried = false
     private var streamingSince: Date?
     static let extensionsWait: TimeInterval = 15
     private var gammaReported: Float = 1
     private let started = Uptime.nanoseconds
+    /// Latest `oxModels` bitmask received from the host, or `nil` until received. Guarded by `lock`.
+    private var hostModelsHeard: UInt32?
+    /// Maximum time in nanoseconds to delay initial controller registration while waiting for `oxModels`.
+    static let modelsWait: UInt64 = 1_500_000_000
     private var sequence: UInt16 = 0
     private var frameCounter: Int32 = 0
     private var frameDisplayTime: Int32 = 0
@@ -120,15 +128,16 @@ public final class StreamSession: StreamingSession {
     static let addressListInterval: TimeInterval = 2
     private var running = true
     private var sayGoodbye = false
-    /// Timestamp of the most recent packet from the host (`Uptime.nanoseconds`, or `0` before the first
-    /// packet). Accessed on the session thread.
+    /// Timestamp of the most recently reassembled video frame (`Uptime.nanoseconds`, or `0` before the first
+    /// frame). Accessed on the session thread.
     private var lastHeard: UInt64 = 0
     /// Set under `lock` when the session ends due to a host timeout, suppressing the goodbye packet.
     private var hostGone = false
-    /// Timeout in seconds after which a previously active host is treated as disconnected (for example, if
-    /// SteamVR exits or the network drops). Before the first packet arrives, the session waits indefinitely
-    /// while SteamVR starts up.
-    static let silenceLimit: Double = 4
+    /// Timeout in seconds without a video frame after which a previously active stream is treated as
+    /// disconnected (for example, if SteamVR exits or the network drops). Control packets are ignored because
+    /// the Steam client continues sending them after SteamVR closes. Before the first video frame arrives, the
+    /// session waits indefinitely while SteamVR starts up.
+    static let silenceLimit: Double = 5
 
     private let lock = NSLock()
     private var head = HeadPose(position: Vec3(0, 1.6, 0)).tracked
@@ -431,7 +440,7 @@ public final class StreamSession: StreamingSession {
             case .controller(let controller):
                 inputBlocks.append(contentsOf: controller.inputBlock())
                 poses.append(contentsOf: packedPose(controller.gripForHost, offset: ControllerState.gripOffset(side, senseModel: profile.senseControllerModels,
-                                                                                                              playForDream: profile.playForDreamControllers, model: controller.model)))
+                                                                                                              own: profile.ownControllerModels, model: controller.model)))
             case .hand(let hand, let gestures, let aim):
                 let offset = TrackedHand.wristOffset(side)
                 inputBlocks.append(contentsOf: gestures.inputBlock())
@@ -608,6 +617,23 @@ public final class StreamSession: StreamingSession {
         }
     }
 
+    /// Returns the `DeviceProfile` to use when registering controllers, or `nil` while waiting for `oxModels`.
+    /// SteamVR creates each controller device from the initial static properties and keeps that model until
+    /// `vrserver` restarts, so headsets with custom controller models wait up to `modelsWait` (1.5 s) for a live
+    /// `oxModels` bitmask from `driver_openvrlink` before falling back to the cached value from `KnownHosts`.
+    private func profileForControllers() -> DeviceProfile? {
+        guard profile.ownControllerModels != nil else { return profile }
+        lock.lock()
+        let heard = hostModelsHeard
+        lock.unlock()
+        if let heard {
+            var now = profile
+            now.hostControllerModels = heard
+            return now
+        }
+        return Uptime.nanoseconds &- started < StreamSession.modelsWait ? nil : profile
+    }
+
     /// Feeds the host's extension records to the handshake and logs when a patched host is first recognized.
     private func receive(extensionRecords: [(key: String, value: Double)]) {
         let time = Uptime.nanoseconds / 1_000_000
@@ -616,11 +642,22 @@ public final class StreamSession: StreamingSession {
         let version = extensions.hostPresent(atMilliseconds: time) ? extensions.hostVersion : nil
         let report = version != nil && version != extensionsReported
         if report { extensionsReported = version }
+        // Start the TCP data link if the host is missing controller models that this headset can provide.
+        // Refresh linkRecords each tick because DataLink rotates its single-use token after each connection.
+        if version != nil, dataLink == nil, !dataLinkTried, let own = profile.ownControllerModels, let has = extensions.controllerModels,
+           has & own.bit == 0, ControllerModelSource.source(of: own) != nil, let local = localEndpoint {
+            dataLinkTried = true
+            dataLink = DataLink(address: local.address, offers: [own], log: { [weak self] in self?.onLog?($0) })
+        }
+        if let dataLink { extensions.linkRecords = dataLink.records }
+        if version != nil, let has = extensions.controllerModels { hostModelsHeard = has }
         let available = extensions.available
-        let tell = version != nil && extensions.availableHeard && featuresTold != .some(.some(available))
-        if tell { featuresTold = .some(.some(available)) }
+        // Wait until both oxAvail and oxModels have arrived before updating KnownHosts.
+        let told = extensions.controllerModels.map { HostExtensions.Told(features: available, controllerModels: $0) }
+        let tell = version != nil && extensions.availableHeard && told != nil && featuresTold != .some(told)
+        if tell { featuresTold = .some(told) }
         lock.unlock()
-        if tell { onHostFeatures?(available) }
+        if tell { onHostFeatures?(told) }
         if report, let version {
             onLog?("the host has the OpenVRLink extensions (version \(version)); encoding gamma "
                    + (available.contains(.encodingGamma) ? "available" : "not available"))
@@ -636,6 +673,7 @@ public final class StreamSession: StreamingSession {
             lastFrame = (frame.frameID, time, UInt64(Date().timeIntervalSince1970 * 1_000_000))
             handedToDecoder[Int(frame.frameID) % StreamSession.framesRemembered] = time
             framesReceived += 1
+            lastHeard = Uptime.nanoseconds
             var layout = frame.metadata.layout(profile: profile)
             lock.lock()
             layout.encodingGamma = extensions.encodingGamma(atMilliseconds: Uptime.nanoseconds / 1_000_000)
@@ -749,18 +787,17 @@ public final class StreamSession: StreamingSession {
             let wait = max(0, nextTick.timeIntervalSinceNow)
             let began = Uptime.nanoseconds
             let datagram = socket.receive(timeout: wait)
-            if datagram != nil {
-                lastHeard = Uptime.nanoseconds
-            } else if lastHeard != 0 {
-                // SteamVR does not send a disconnect message when it exits or restarts, so end the session
-                // after silenceLimit seconds without packets so the client can reconnect.
+            // SteamVR does not send a disconnect notice when it exits or restarts, and the Steam client keeps
+            // sending non-video packets afterward. Once video has started, end the session if no complete video
+            // frame arrives for `silenceLimit` seconds so the client can reconnect.
+            if lastHeard != 0 {
                 let quiet = Double(Uptime.nanoseconds &- lastHeard) / 1e9
                 if quiet > StreamSession.silenceLimit {
                     lock.lock()
                     hostGone = true
                     running = false
                     lock.unlock()
-                    let why = "no packets from host for \(Int(quiet)) seconds"
+                    let why = "no video from the host for \(Int(quiet)) seconds"
                     onLog?("stream ended: \(why)")
                     onEnded?(why)
                     break
@@ -834,7 +871,12 @@ public final class StreamSession: StreamingSession {
                 let resolved = handResolver.resolve(tracked, head: head.pose, seconds: Double(now()) / 1_000_000,
                                                     bareHands: hostVersion >= StreamSession.firstVersionWithHands)
                 for note in resolved.notes + resolved.gestureNotes { onLog?(note) }
-                let hands = resolved.hands
+                var hands = resolved.hands
+                // Hold back controller registration until profileForControllers() resolves the controller model set.
+                let describing = profileForControllers()
+                if describing == nil {
+                    for index in hands.indices { if case .controller = hands[index] { hands[index] = nil } }
+                }
                 for side in Side.allCases {
                     var isController: Bool?, model = handModel[side] ?? .touch
                     switch hands[side.rawValue] {
@@ -853,7 +895,7 @@ public final class StreamSession: StreamingSession {
                             handModel[side] = model
                         }
                         powerPublished[DeviceProfile.ValueID.powerController(side)] = nil
-                        for (id, value) in profile.handValues(side, isController: isController, model: model) {
+                        for (id, value) in (describing ?? profile).handValues(side, isController: isController, model: model) {
                             values.publish(id, value, force: true)
                         }
                     }
@@ -940,6 +982,7 @@ public final class StreamSession: StreamingSession {
                 nextReport = nextReport.addingTimeInterval(1)
             }
         }
+        dataLink?.stop()
         lock.lock()
         // Skip sending goodbye after a timeout so a restarting SteamVR instance is not told to shut down.
         let leaving = !hostGone && (sayGoodbye || applicationRunning == false)

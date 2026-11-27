@@ -16,8 +16,8 @@ enum Server {
     static let gammaValueKey: StaticString = "encodingGammaValue"
     static let gammaAvailableKey: StaticString = "gammaAvailable"
     static let statusKey: StaticString = "status"
-    /// `PlayForDreamModel.settingsKey`: true in `default.vrsettings` when the Play For Dream controller models are installed.
-    static let playForDreamModelsKey: StaticString = "playForDreamModels"
+    /// Settings key holding the bitmask of controller model sets installed in `default.vrsettings`.
+    static let controllerModelsKey: StaticString = "controllerModels"
     static let defaultGamma: Float = 1.6
     /// Settings sections installed by `openvrlink-companion` for OpenVRLink's native HMD models (`Install.headsets`).
     static let headsetSections: [StaticString] = ["vrlink_Apple Vision Pro (OpenVRLink)", "vrlink_OpenVRLink Headset"]
@@ -51,6 +51,26 @@ enum Server {
         var error: Int32 = 0
         let value = settings.pointee.vtable.pointee.get_bool(settings, cString(section), cString(key), &error)
         return error == 0 ? value : fallback
+    }
+
+    static func int(_ key: StaticString, default fallback: Int32) -> Int32 {
+        guard let settings else { return fallback }
+        var error: Int32 = 0
+        let value = settings.pointee.vtable.pointee.get_int32(settings, cString(section), cString(key), &error)
+        return error == 0 ? value : fallback
+    }
+
+    /// Reads a non-empty string key from this driver's settings section, or returns `nil` if unset or empty.
+    static func string(_ key: StaticString) -> Message? {
+        guard let settings else { return nil }
+        var error: Int32 = 0
+        var text = [CChar](repeating: 0, count: 1024)
+        settings.pointee.vtable.pointee.get_string(settings, cString(section), cString(key), &text, UInt32(text.count), &error)
+        text[text.count - 1] = 0
+        guard error == 0, text[0] != 0 else { return nil }
+        var out = Message("")
+        out.add(cString: text)
+        return out
     }
 
     static func float(_ key: StaticString, default fallback: Float) -> Float {

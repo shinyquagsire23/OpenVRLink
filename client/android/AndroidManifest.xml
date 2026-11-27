@@ -49,6 +49,9 @@
     <uses-permission android:name="com.oculus.permission.HAND_TRACKING" />
     <uses-feature android:name="oculus.software.handtracking" android:required="false" />
     <uses-feature android:name="com.oculus.feature.PASSTHROUGH" android:required="false" />
+    <!-- Required by XR_FB_render_model to query controller render models on Quest headsets. -->
+    <uses-permission android:name="com.oculus.permission.RENDER_MODEL" />
+    <uses-feature android:name="com.oculus.feature.RENDER_MODEL" android:required="false" />
 
     <!-- Permissions and package-visibility queries required by the Khronos OpenXR Android loader. -->
     <uses-permission android:name="org.khronos.openxr.permission.OPENXR" />

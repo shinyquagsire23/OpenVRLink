@@ -32,11 +32,17 @@ public enum Handshake {
     /// sets this bit); because the client sends its HMD model before receiving `oxAvail`,
     /// it saves this flag for the next session.
     public static let headsetFeature: UInt32 = 1 << 1
-    /// Advertised in `oxAvail` when `driver_openvrlink` includes the Play For Dream controller render models
-    /// (`{openvrlink}pfd_mr_controller_left` and `{openvrlink}pfd_mr_controller_right`). Like `headsetFeature`,
-    /// this bit is only set in `oxAvail`; because the client sends controller static properties before receiving
-    /// `oxAvail`, it caches this flag for the next session.
-    public static let playForDreamModelsFeature: UInt32 = 1 << 2
+    /// Key carrying the bitmask of controller model sets installed in `driver_openvrlink/resources/rendermodels`.
+    /// Bit 0 is Play For Dream MR (`{openvrlink}pfd_mr_controller_left` and `_right`) and bit 1 is Galaxy XR
+    /// (`{openvrlink}galaxy_xr_controller_left` and `_right`).
+    public static let modelsKey: StaticString = "oxModels"
+
+    /// Keys carrying the client's data link IPv4 address (packed big-endian in 32 bits) and TCP port.
+    public static let addressKey: StaticString = "oxAddr", portKey: StaticString = "oxPort"
+    /// Keys carrying the low and high 48-bit halves of the client's 96-bit data link connection token.
+    public static let firstTokenKey: StaticString = "oxKey0", secondTokenKey: StaticString = "oxKey1"
+    /// Key carrying the bitmask of controller model sets the client can upload over the data link, using the same bits as `modelsKey`.
+    public static let offerKey: StaticString = "oxOffer"
 
     /// Milliseconds between changes of a heartbeat value.
     public static let beat: UInt64 = 250
@@ -98,10 +104,13 @@ public struct HostSide {
     public var enabled: UInt32 = 0
     /// Gamma to use while the gamma feature is active.
     public var gamma: Float = 1
+    /// Bitmask of controller model sets installed in the driver (`Handshake.modelsKey`).
+    public var models: UInt32 = 0
     private var lastBeat: Double = 0
     private var beatSeen = false
     private var beatChanged: UInt64?
     private var wants: UInt32 = 0
+    private var linkAddress: Double?, linkPort: Double?, firstToken: Double?, secondToken: Double?, offer: Double = 0
     private var fills: UInt32 = 0
     private var next = 0
 
@@ -124,6 +133,17 @@ public struct HostSide {
             } else if Handshake.record(record, hasKey: Handshake.wantKey) {
                 let value = Handshake.value(of: record)
                 if value >= 0, value < 4_294_967_296 { wants = UInt32(value) }
+            } else if Handshake.record(record, hasKey: Handshake.addressKey) {
+                linkAddress = Handshake.value(of: record)
+            } else if Handshake.record(record, hasKey: Handshake.portKey) {
+                linkPort = Handshake.value(of: record)
+            } else if Handshake.record(record, hasKey: Handshake.firstTokenKey) {
+                firstToken = Handshake.value(of: record)
+            } else if Handshake.record(record, hasKey: Handshake.secondTokenKey) {
+                secondToken = Handshake.value(of: record)
+            } else if Handshake.record(record, hasKey: Handshake.offerKey) {
+                let value = Handshake.value(of: record)
+                if value >= 0, value < 4_294_967_296 { offer = value }
             }
         }
     }
@@ -131,6 +151,16 @@ public struct HostSide {
     public func clientPresent(atMilliseconds now: UInt64) -> Bool {
         guard let beatChanged else { return false }
         return now >= beatChanged ? now - beatChanged <= Handshake.alive : true
+    }
+
+    /// Returns the client's data link endpoint, authentication token, and offered model bitmask once all keys
+    /// have been received from a client with an advancing heartbeat (ignoring stale keys echoed by stock clients).
+    public func link(atMilliseconds now: UInt64) -> (address: UInt32, port: UInt16, token: [UInt8], offer: UInt32)? {
+        guard clientPresent(atMilliseconds: now), let linkAddress, let linkPort, let firstToken, let secondToken,
+              linkAddress >= 1, linkAddress < 4_294_967_296, linkAddress == linkAddress.rounded(.towardZero),
+              linkPort >= 1, linkPort < 65536, linkPort == linkPort.rounded(.towardZero),
+              let token = DataLink.token(firstToken, secondToken) else { return nil }
+        return (UInt32(linkAddress), UInt16(linkPort), token, UInt32(offer))
     }
 
     /// Features to apply to the frame being prepared now.
@@ -157,8 +187,9 @@ public struct HostSide {
         case 0: Handshake.write(records, key: Handshake.hostKey, value: Handshake.heartbeat(atMilliseconds: now), time: time)
         case 1: Handshake.write(records, key: Handshake.availableKey, value: Double(available), time: time)
         case 2: Handshake.write(records, key: Handshake.activeKey, value: Double(active(atMilliseconds: now)), time: time)
-        default: Handshake.write(records, key: Handshake.gammaKey, value: Double(activeGamma(atMilliseconds: now)), time: time)
+        case 3: Handshake.write(records, key: Handshake.gammaKey, value: Double(activeGamma(atMilliseconds: now)), time: time)
+        default: Handshake.write(records, key: Handshake.modelsKey, value: Double(models), time: time)
         }
-        next = (next + 1) % 4
+        next = (next + 1) % 5
     }
 }

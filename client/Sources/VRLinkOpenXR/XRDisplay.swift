@@ -29,12 +29,19 @@ public final class XRDisplay<Graphics: XRGraphics> {
     public var chromaKey: () -> ChromaKey? = { nil }
     /// Returns whether stereo depth estimation (`use`) and the debug depth overlay (`show`) are enabled.
     public var depthFromPicture: () -> (use: Bool, show: Bool) = { (false, false) }
+    /// Returns whether thermal refresh-rate stepping is enabled (`Settings.lowerRateWhenHot`).
+    public var lowersRateWhenHot: () -> Bool = { false }
+    /// True when the runtime offers multiple display refresh rates.
+    public var canStepRefreshRate: Bool { refreshRates.count > 1 }
     /// Invoked on the render thread once the session starts and initial eye geometry is measured.
     public var onReady: ((DeviceProfile) -> Void)?
     /// Invoked on the render thread when the OpenXR session stops or exits.
     public var onPaused: (() -> Void)?
     /// Invoked on the render thread when a pending OpenXR reference-space or boundary change takes effect.
     public var onSpaceChanged: (() -> Void)?
+    /// Optional directory path where `XRModelDump` saves OpenXR controller model binaries; set before calling `run()`.
+    public var keepControllerModelsIn: String?
+    private var modelDump: XRModelDump?
     /// Invoked on the render thread when a system-initiated recenter is detected while tracking in stage
     /// space, passing the updated `LOCAL` origin in stage coordinates (`followSystemRecenter`).
     public var onRecentered: ((Pose) -> Void)?
@@ -60,12 +67,26 @@ public final class XRDisplay<Graphics: XRGraphics> {
     /// Projection layer scaling filter chained via `XR_FB_composition_layer_settings`, or `nil` for the runtime default.
     private var layerFilter: UnsafeMutablePointer<XrCompositionLayerSettingsFB>?
     private let layerFilterName: String
+    /// Initial layer configuration passed at startup.
+    private let layerChoicesAtStart: XRLayerChoices
+    /// Returns the current live layer configuration each frame so panel changes take effect immediately.
+    /// Called on the render thread.
+    public var layerChoices: (() -> XRLayerChoices)?
+    private var layerChoicesNoted: XRLayerChoices?
+    /// Exponential moving average of GPU draw time in seconds, and whether the GPU has headroom to re-render
+    /// every display refresh.
+    private var drawTakes: Double = 0, drawsEveryRefresh = true
     /// `LOCAL` reference space and its last observed pose in stage coordinates, used by `followSystemRecenter`.
     private var localSpace: XrSpace?
     private var localSeen: Pose?, localChecked: UInt64 = 0
     /// Per-eye base swapchains, followed by the two sharp-layer swapchains when enabled.
     private var swapchains: [XRSwapchain] = []
     private var hasSharpLayer: Bool { swapchains.count == 4 }
+    /// Android `Surface` swapchain and `ANativeWindow` for the transparent overlay quad (`HeadsetQuirks.emptyTopLayer`),
+    /// and whether the initial transparent buffer has been posted.
+    private var topLayer: XrSwapchain?, topLayerWindow: UnsafeMutableRawPointer?, topLayerFilled = false
+    private var topLayerTried = false
+    private let javaVM: UnsafeMutableRawPointer?
     private let eyeDetail: Float
     /// Host-requested refresh rate and active thermal refresh-rate cap. Guarded by `lock`.
     private var wantedHz: Float?, heatCapHz: Float?
@@ -75,6 +96,8 @@ public final class XRDisplay<Graphics: XRGraphics> {
     private var heat: Int32 = 0, heatSince: UInt64 = 0, heatChecked: UInt64 = 0
     private var heatByDomain: [UInt32: Int32] = [:]
     private let sustainedPerformance: Bool
+    /// Request `XR_PERF_SETTINGS_LEVEL_BOOST_EXT` instead of `SUSTAINED_HIGH` for the GPU (`HeadsetQuirks.boostGPU`); set before calling `run()`.
+    public var boostGPU = false
     private let compositorPlacesLayers: Bool
     /// Active `XR_FB_passthrough` instance and layer handle when passthrough uses a composition layer.
     private var passthrough: XrPassthroughFB?, passthroughLayer: XrPassthroughLayerFB?
@@ -119,20 +142,35 @@ public final class XRDisplay<Graphics: XRGraphics> {
     ///   - compositorPlacesLayers: Whether the runtime honors per-layer poses and fields of view
     ///     (`HeadsetQuirks.compositorPlacesLayers`). When false, the sharp layer and frame reuse are disabled.
     ///   - passthroughLayer: Prefer an `XR_FB_passthrough` layer over alpha-blend environment mode.
+    ///   - emptyTopLayer: Submit a transparent Android `Surface` overlay quad on top of all other layers (`HeadsetQuirks.emptyTopLayer`).
     ///   - colorSpace: Color space declared via `XR_FB_color_space` (`rec709`, `rec2020`, `p3`, or `unmanaged`).
     public init(applicationName: String, graphics: Graphics, frames: DisplayQueue<Graphics.Frame>, panel: XRPanelLayer? = nil,
                 process: XRProcess = XRProcess(), sharpLayerPixels: Int = 0, eyeDetail: Float = 1,
                 sustainedPerformance: Bool = true, compositorPlacesLayers: Bool = true, passthroughLayer: Bool = false,
-                colorSpace: String = "rec709", layerFilter: String = "none", log: @escaping (String) -> Void) throws {
+                emptyTopLayer: Bool = false,
+                colorSpace: String = "rec709", layerFilter: String = "none", blendTest: String = "none",
+                skipEmptyProjection: Bool = false, streamQuads: String = "never", quadDistance: Float = 50,
+                reuseFrames: Bool = true,
+                log: @escaping (String) -> Void) throws {
         self.eyeDetail = eyeDetail
         self.compositorPlacesLayers = compositorPlacesLayers
         self.layerFilterName = layerFilter
+        self.javaVM = process.javaVM
+        var atStart = XRLayerChoices()
+        atStart.blendTest = blendTest
+        atStart.topLayer = emptyTopLayer
+        atStart.skipEmptyProjection = skipEmptyProjection
+        atStart.streamQuads = streamQuads
+        atStart.quadDistance = quadDistance
+        atStart.reuseFrames = reuseFrames
+        layerChoicesAtStart = atStart
         self.sustainedPerformance = sustainedPerformance
         self.graphics = graphics
         self.panel = panel
         self.frames = frames
         self.log = log
-        let instance = try XRInstance(applicationName: applicationName, required: Graphics.extensions, process: process, log: log)
+        let instance = try XRInstance(applicationName: applicationName, required: Graphics.extensions,
+                                      unlisted: emptyTopLayer ? ["XR_KHR_android_surface_swapchain"] : [], process: process, log: log)
         self.instance = instance
         let calls = instance.calls
         log("openxr: \(instance.runtimeName), headset \"\(instance.systemName())\"")
@@ -340,6 +378,10 @@ public final class XRDisplay<Graphics: XRGraphics> {
         tracking.stop()
         let calls = instance.calls
         for swapchain in swapchains + [panel?.swapchain].compactMap({ $0 }) { _ = calls.destroySwapchain(swapchain.handle) }
+        if let topLayer { _ = calls.destroySwapchain(topLayer) }
+        #if os(Android)
+        if let topLayerWindow { ovrl_xr_release_window(topLayerWindow) }
+        #endif
         if let passthroughLayer { _ = calls.destroyPassthroughLayer?(passthroughLayer) }
         if let passthrough { _ = calls.destroyPassthrough?(passthrough) }
         for space in [space, headSpace, localSpace] { if let space { _ = calls.destroySpace(space) } }
@@ -417,7 +459,11 @@ public final class XRDisplay<Graphics: XRGraphics> {
         let current = cap ?? (hz > 0 ? hz : wanted ?? refreshRates.max() ?? 0)
         let rates = rateSteps.map(\.shown)
         var next = cap
-        if heat >= 75, seconds >= (cap == nil ? 3 : XRDisplay.heatStep), let lower = rates.filter({ $0 < current - 0.5 }).max() {
+        if !lowersRateWhenHot() {
+            // When thermal stepping is disabled, clear any active thermal cap immediately.
+            guard cap != nil else { return }
+            next = nil
+        } else if heat >= 75, seconds >= (cap == nil ? 3 : XRDisplay.heatStep), let lower = rates.filter({ $0 < current - 0.5 }).max() {
             next = lower
         } else if heat < 25, seconds >= XRDisplay.heatStep, let cap {
             let higher = rates.filter { $0 > cap + 0.5 }.min()
@@ -571,7 +617,9 @@ public final class XRDisplay<Graphics: XRGraphics> {
             // Request sustained high CPU and GPU clock levels rather than default power-saving clocks.
             if sustainedPerformance, let setLevel = calls.setPerformanceLevel {
                 for domain in [XR_PERF_SETTINGS_DOMAIN_CPU_EXT, XR_PERF_SETTINGS_DOMAIN_GPU_EXT] {
-                    let result = setLevel(session, domain, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT)
+                    let boost = boostGPU && domain == XR_PERF_SETTINGS_DOMAIN_GPU_EXT
+                    let result = setLevel(session, domain, boost ? XR_PERF_SETTINGS_LEVEL_BOOST_EXT : XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT)
+                    if boost { log("openxr: requested boost GPU performance level") }
                     if result.rawValue < 0 { log("openxr: could not set the performance level (XrResult \(result.rawValue))") }
                 }
             }
@@ -687,6 +735,10 @@ public final class XRDisplay<Graphics: XRGraphics> {
 
         followHeat(at: waited)
         followSystemRecenter(at: time, now: waited)
+        if let folder = keepControllerModelsIn {
+            if modelDump == nil { modelDump = XRModelDump(instance: instance, session: session, folder: folder, log: log) }
+            modelDump?.save(now: waited)
+        }
         let picked = frames.next()
         if let stream = streamingSession() {
             // Fall back to one refresh period ahead when XR_KHR_convert_timespec_time is unavailable.
@@ -710,10 +762,21 @@ public final class XRDisplay<Graphics: XRGraphics> {
         let transparent = frame == nil || key != nil || frame?.layout.transparent == true
         // Use alpha blending for passthrough when the stream is transparent and the headset supports it;
         // otherwise use the runtime's preferred blend mode.
+        let choices = layerChoices?() ?? layerChoicesAtStart
+        if choices.topLayer, !topLayerTried { makeTopLayer() }
+        if layerChoicesNoted != choices {
+            layerChoicesNoted = choices
+            log("openxr: surface overlay quad \(choices.topLayer ? (topLayer == nil ? "unavailable" : "on") : "off"), "
+                + "empty projection layer \(choices.skipEmptyProjection ? "omitted" : "submitted"), stream quads \(choices.streamQuads) "
+                + "at \(choices.quadDistance) m, blend test \(choices.blendTest), "
+                + (choices.reuseFrames ? "reusing unchanged frames" : "re-rendering every refresh"))
+        }
+        let blendTest = choices.blendTest
         let alphaBlend = XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
         let opaque = blendModes.contains(XR_ENVIRONMENT_BLEND_MODE_OPAQUE) ? XR_ENVIRONMENT_BLEND_MODE_OPAQUE : blendModes.first
         let blend = passthroughLayer != nil ? (opaque ?? XR_ENVIRONMENT_BLEND_MODE_OPAQUE)
-            : transparent && blendModes.contains(alphaBlend) ? alphaBlend : (blendModes.first ?? XR_ENVIRONMENT_BLEND_MODE_OPAQUE)
+            : (transparent && blendTest != "no_env" || blendTest == "env" || blendTest == "both") && blendModes.contains(alphaBlend)
+            ? alphaBlend : (blendTest == "no_env" ? opaque : blendModes.first) ?? XR_ENVIRONMENT_BLEND_MODE_OPAQUE
         runPassthrough(transparent && timing.shouldRender != 0)
 
         var end = XrFrameEndInfo()
@@ -734,9 +797,18 @@ public final class XRDisplay<Graphics: XRGraphics> {
         // Whether the sharp layer renders a standalone alpha-feathered tile over a transparent background.
         var sharpAlone = true
         var acquired: [XRSwapchain] = []
-        // Reuse the previous frame's swapchain images and render poses when no new video frame has arrived,
-        // letting the OpenXR compositor reproject them to the current head pose.
-        let reuse = compositorPlacesLayers && picked?.isNew == false && drawnFor != nil && field.show == nil
+        // Reuse the previous frame's swapchain images and render poses when no new video frame has arrived so
+        // the OpenXR compositor can reproject them. When stereo depth warping is active, we re-render every
+        // refresh because compositor reprojection is rotation-only and mixing it with depth-warped frames causes
+        // translational judder. However, if GPU draw time exceeds 60% of the refresh period (such as during
+        // passthrough on a warm Galaxy XR), we fall back to compositor frame reuse to avoid dropped refreshes.
+        if drawsEveryRefresh ? drawTakes > period * 0.6 : drawTakes < period * 0.4 {
+            drawsEveryRefresh.toggle()
+            log(String(format: "openxr: GPU draw time %.1f ms / %.1f ms refresh; ", drawTakes * 1000, period * 1000)
+                + (drawsEveryRefresh ? "resuming per-refresh rendering" : "reusing unchanged frames"))
+        }
+        let reuse = compositorPlacesLayers && choices.reuseFrames && picked?.isNew == false && drawnFor != nil && field.show == nil
+            && (field.use == nil || !drawsEveryRefresh)
             && drawnFor?.key == key && drawnFor?.transparent == transparent
         if reuse {
             projected = drawnFor?.eyes ?? []
@@ -840,6 +912,8 @@ public final class XRDisplay<Graphics: XRGraphics> {
         if !reuse {
             graphics.draw(draws, frame: frame, transparent: transparent)
             pace.note("waiting for the GPU", graphics.lastGPUWait)
+            for step in graphics.lastDrawSteps { pace.note(step.name, step.nanoseconds) }
+            drawTakes += (Double(graphics.lastGPUWait) / 1e9 - drawTakes) / 20
             drawnFor = frame == nil ? nil : (projected, sharpProjected, sharpAlone, key, transparent)
         }
         let drawn = Uptime.nanoseconds
@@ -857,7 +931,7 @@ public final class XRDisplay<Graphics: XRGraphics> {
         var layer = XrCompositionLayerProjection()
         layer.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION
         layer.space = space
-        if transparent { layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT }
+        if transparent && blendTest != "no_flag" || blendTest == "flag" || blendTest == "both" { layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT }
         var room = XrCompositionLayerPassthroughFB()
         room.type = XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB
         room.flags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
@@ -865,25 +939,71 @@ public final class XRDisplay<Graphics: XRGraphics> {
         if let layerFilter { layer.next = UnsafeRawPointer(layerFilter) }
         var sharpLayer = layer
         if sharpAlone { sharpLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT }
+        // Post a single transparent buffer to the Android Surface swapchain on its first rendered frame.
+        #if os(Android)
+        if let topLayerWindow, !topLayerFilled, choices.topLayer {
+            if ovrl_xr_fill_window(topLayerWindow, 2, 2) == 0 {
+                topLayerFilled = true
+            } else {
+                log("openxr: failed to post transparent buffer to Android Surface overlay; disabling")
+                ovrl_xr_release_window(topLayerWindow)
+                self.topLayerWindow = nil
+            }
+        }
+        #endif
+        var topQuad = XrCompositionLayerQuad()
+        topQuad.type = XR_TYPE_COMPOSITION_LAYER_QUAD
+        topQuad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
+        topQuad.space = headSpace
+        topQuad.eyeVisibility = XR_EYE_VISIBILITY_BOTH
+        topQuad.subImage.swapchain = topLayer
+        topQuad.subImage.imageRect.extent = XrExtent2Di(width: 2, height: 2)
+        topQuad.pose.orientation.w = 1
+        topQuad.pose.position.z = -1
+        topQuad.size = XrExtent2Df(width: 0.001, height: 0.001)
+        // On Galaxy XR, submitting a projection layer during passthrough causes the compositor to downscale all
+        // layers, whereas quad layers remain sharp. When `streamQuads` is active, convert each eye's projection
+        // view into an equivalent quad layer placed `quadDistance` meters ahead of the eye.
+        let onQuads = frame != nil && (choices.streamQuads == "always" || choices.streamQuads == "room" && transparent)
+        var streamQuads: [XrCompositionLayerQuad] = []
+        if onQuads {
+            for (views, like) in [(projected, layer), (sharpProjected, sharpLayer)] {
+                for (eye, view) in views.enumerated() {
+                    streamQuads.append(XRDisplay.quad(showing: view, eye: eye, like: like, metersAhead: choices.quadDistance))
+                }
+            }
+        }
+        try streamQuads.withUnsafeBufferPointer { streamQuads in
         try projected.withUnsafeBufferPointer { views in
             layer.viewCount = UInt32(views.count)
             layer.views = views.baseAddress
             try sharpProjected.withUnsafeBufferPointer { sharpViews in
             sharpLayer.viewCount = UInt32(sharpViews.count)
             sharpLayer.views = sharpViews.baseAddress
+            try withUnsafeBytes(of: &topQuad) { topBytes in
             try withUnsafeBytes(of: &sharpLayer) { sharpBytes in
             try withUnsafeBytes(of: &layer) { bytes in
                 try withUnsafeBytes(of: &quad) { quadBytes in
                 try withUnsafeBytes(of: &room) { roomBytes in
                     var layers = [bytes.baseAddress?.assumingMemoryBound(to: XrCompositionLayerBaseHeader.self)]
+                    // Omit the projection layer when rendering stream views as quads or when idle with skipEmptyProjection.
+                    if onQuads || choices.skipEmptyProjection && frame == nil { layers.removeAll() }
                     // The room goes under everything, seen wherever the picture over it is see-through.
                     if passthroughLayer != nil, transparent {
                         layers.insert(roomBytes.baseAddress?.assumingMemoryBound(to: XrCompositionLayerBaseHeader.self), at: 0)
                     }
                     // The sharp layer goes over the eye layer and shows the same picture, only finer.
-                    if !sharpProjected.isEmpty { layers.append(sharpBytes.baseAddress?.assumingMemoryBound(to: XrCompositionLayerBaseHeader.self)) }
+                    if onQuads {
+                        for index in streamQuads.indices {
+                            layers.append(UnsafeRawPointer(streamQuads.baseAddress! + index).assumingMemoryBound(to: XrCompositionLayerBaseHeader.self))
+                        }
+                    } else if !sharpProjected.isEmpty {
+                        layers.append(sharpBytes.baseAddress?.assumingMemoryBound(to: XrCompositionLayerBaseHeader.self))
+                    }
                     // Composite the panel quad in front of the projection layer.
                     if panelShown != nil { layers.append(quadBytes.baseAddress?.assumingMemoryBound(to: XrCompositionLayerBaseHeader.self)) }
+                    // Submit the transparent Android Surface overlay quad on top of all other layers.
+                    if topLayer != nil, topLayerFilled, choices.topLayer { layers.append(topBytes.baseAddress?.assumingMemoryBound(to: XrCompositionLayerBaseHeader.self)) }
                     try layers.withUnsafeBufferPointer {
                         end.layerCount = UInt32($0.count)
                         end.layers = $0.baseAddress
@@ -894,6 +1014,8 @@ public final class XRDisplay<Graphics: XRGraphics> {
             }
             }
             }
+            }
+        }
         }
         if frame != nil {
             let ended = Uptime.nanoseconds
@@ -901,6 +1023,65 @@ public final class XRDisplay<Graphics: XRGraphics> {
                      end: ended - drawn, at: ended)
             if let line = pace.report(at: ended, period: period) { log(line) }
         }
+    }
+
+    /// Creates the 2 x 2 Android `Surface` swapchain for `HeadsetQuirks.emptyTopLayer` on first use. On Galaxy XR,
+    /// including a `Surface`-backed layer prevents the compositor from downscaling opaque projection layers.
+    /// Creation is deferred until enabled so other headsets never call `xrCreateSwapchainAndroidSurfaceKHR`.
+    private func makeTopLayer() {
+        topLayerTried = true
+        #if os(Android)
+        let calls = instance.calls
+        do {
+            if instance.extensions.contains(XR_KHR_ANDROID_SURFACE_SWAPCHAIN_EXTENSION_NAME),
+               let create = try? instance.function("xrCreateSwapchainAndroidSurfaceKHR", as: PFN_xrCreateSwapchainAndroidSurfaceKHR.self) {
+                // XR_KHR_android_surface_swapchain requires format and sample/face/array/mip counts to be zero.
+                var info = XrSwapchainCreateInfo()
+                info.type = XR_TYPE_SWAPCHAIN_CREATE_INFO
+                info.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT
+                info.width = 2
+                info.height = 2
+                var swapchain: XrSwapchain?
+                var surface: jobject?
+                let result = create(session, &info, &swapchain, &surface)
+                if result.rawValue >= 0, let swapchain, let surface, let window = ovrl_xr_window(javaVM, surface) {
+                    topLayer = swapchain
+                    topLayerWindow = window
+                    log("openxr: created Android Surface swapchain for transparent overlay quad")
+                } else {
+                    log("openxr: failed to create Android Surface swapchain (\(XRFailure.name(of: result)))")
+                    if let swapchain { _ = calls.destroySwapchain(swapchain) }
+                }
+            } else {
+                log("openxr: XR_KHR_android_surface_swapchain is unavailable; skipping overlay quad")
+            }
+        }
+        #endif
+    }
+
+    /// Builds a single-eye `XrCompositionLayerQuad` matching a projection view by intersecting the view frustum
+    /// with a plane `metersAhead` in front of the eye, preserving the projection layer's space, flags, and settings.
+    private static func quad(showing view: XrCompositionLayerProjectionView, eye: Int, like layer: XrCompositionLayerProjection,
+                             metersAhead: Float) -> XrCompositionLayerQuad {
+        let left = tan(view.fov.angleLeft), right = tan(view.fov.angleRight), up = tan(view.fov.angleUp), down = tan(view.fov.angleDown)
+        // Quad center in eye space rotated into layer space via v + 2w(q x v) + 2q x (q x v).
+        let middle = (x: metersAhead * (left + right) / 2, y: metersAhead * (up + down) / 2, z: -metersAhead)
+        let q = view.pose.orientation
+        let once = (x: q.y * middle.z - q.z * middle.y, y: q.z * middle.x - q.x * middle.z, z: q.x * middle.y - q.y * middle.x)
+        let twice = (x: q.y * once.z - q.z * once.y, y: q.z * once.x - q.x * once.z, z: q.x * once.y - q.y * once.x)
+        var quad = XrCompositionLayerQuad()
+        quad.type = XR_TYPE_COMPOSITION_LAYER_QUAD
+        quad.next = layer.next
+        quad.layerFlags = layer.layerFlags
+        quad.space = layer.space
+        quad.eyeVisibility = eye == 0 ? XR_EYE_VISIBILITY_LEFT : XR_EYE_VISIBILITY_RIGHT
+        quad.subImage = view.subImage
+        quad.pose.orientation = q
+        quad.pose.position = XrVector3f(x: view.pose.position.x + middle.x + 2 * (q.w * once.x + twice.x),
+                                        y: view.pose.position.y + middle.y + 2 * (q.w * once.y + twice.y),
+                                        z: view.pose.position.z + middle.z + 2 * (q.w * once.z + twice.z))
+        quad.size = XrExtent2Df(width: metersAhead * (right - left), height: metersAhead * (up - down))
+        return quad
     }
 
     /// Feeds newly decoded frames to the stereo depth estimator when enabled and returns the reprojected depth

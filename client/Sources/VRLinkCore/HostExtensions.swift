@@ -24,14 +24,19 @@ public struct HostExtensions {
         /// (advertised in `oxAvail` only). Because the client sends its static HMD properties
         /// before receiving `oxAvail`, this flag is saved in `KnownHosts` for the next session.
         public static let headsetSettings = Features(rawValue: 1 << 1)
-        /// Host's `driver_openvrlink` was installed with the Play For Dream controller render models
-        /// (advertised in `oxAvail` only, and saved in `KnownHosts` for the next session like `headsetSettings`).
-        public static let playForDreamModels = Features(rawValue: 1 << 2)
+    }
+
+    /// Host capability state cached in `KnownHosts` across sessions, since the client sends its static HMD
+    /// properties before receiving the host's extension records.
+    public struct Told: Equatable, Sendable {
+        public var features: Features
+        /// Bitmask of installed `ControllerModelSet` values reported in `oxModels`.
+        public var controllerModels: UInt32
     }
 
     enum Key {
         static let client = "oxClient", want = "oxWant"
-        static let host = "oxHost", available = "oxAvail", active = "oxOn", gamma = "oxGamma"
+        static let host = "oxHost", available = "oxAvail", active = "oxOn", gamma = "oxGamma", models = "oxModels"
     }
 
     /// Interval in milliseconds at which a heartbeat value advances.
@@ -48,6 +53,8 @@ public struct HostExtensions {
     public private(set) var available: Features = []
     /// True once at least one `oxAvail` record has been received (which arrives shortly after the first `oxHost` heartbeats).
     public private(set) var availableHeard = false
+    /// Bitmask of controller model sets installed on the host (`oxModels`), or `nil` until received.
+    public private(set) var controllerModels: UInt32?
     private var active: Features = []
     private var gamma: Float = 1
     private var lastBeat: Double?
@@ -62,9 +69,12 @@ public struct HostExtensions {
         Double(version) * 65536 + Double((now / beat) & 0xFFFF)
     }
 
-    /// Returns the two extension records this client sends on the key-value channel.
+    /// Data link endpoint and offer records (`DataLink.records`) when a listener is active.
+    public var linkRecords: [(key: String, value: Double)] = []
+
+    /// Returns the extension records this client sends on the key-value channel.
     public func records(atMilliseconds now: UInt64) -> [(key: String, value: Double)] {
-        [(Key.client, HostExtensions.heartbeat(atMilliseconds: now)), (Key.want, Double(wants.rawValue))]
+        [(Key.client, HostExtensions.heartbeat(atMilliseconds: now)), (Key.want, Double(wants.rawValue))] + linkRecords
     }
 
     /// Applies one key-value record received from the host.
@@ -83,6 +93,7 @@ public struct HostExtensions {
             availableHeard = true
         case Key.active: active = Features(rawValue: UInt32(value))
         case Key.gamma: gamma = Float(value)
+        case Key.models: controllerModels = UInt32(value)
         default: break
         }
     }

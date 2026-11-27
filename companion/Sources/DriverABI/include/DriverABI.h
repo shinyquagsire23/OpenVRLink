@@ -47,6 +47,7 @@ struct ovr_settings_vtable {
     bool (*get_bool)(ovr_settings *self, const char *section, const char *key, int32_t *error);
     int32_t (*get_int32)(ovr_settings *self, const char *section, const char *key, int32_t *error);
     float (*get_float)(ovr_settings *self, const char *section, const char *key, int32_t *error);
+    void (*get_string)(ovr_settings *self, const char *section, const char *key, char *value, uint32_t size, int32_t *error);
 };
 struct ovr_settings { const struct ovr_settings_vtable *vtable; };
 
@@ -81,6 +82,27 @@ struct d3d_blob {
     uint8_t *bytes;
     size_t size;
 };
+
+// MARK: Data link (link.c)
+
+// Helpers for non-blocking TCP sockets, directory creation, and spawning subprocesses from vrserver's
+// frame callback.
+
+// Initiates a non-blocking TCP connection to a host-order IPv4 address and port. Returns a socket
+// handle, or -1 on error.
+intptr_t ovrl_link_connect(uint32_t address, uint16_t port);
+// Checks whether a non-blocking connect has finished, returning 1 when connected, 0 while still in
+// progress, or -1 on failure.
+int ovrl_link_ready(intptr_t link);
+// Sends up to `count` bytes without blocking. Returns bytes sent (0 if the socket would block), or -1 on error.
+ptrdiff_t ovrl_link_send(intptr_t link, const void *bytes, size_t count);
+// Receives up to `capacity` bytes without blocking. Returns bytes read (0 if none available), or -1 on EOF/error.
+ptrdiff_t ovrl_link_receive(intptr_t link, void *bytes, size_t capacity);
+void ovrl_link_close(intptr_t link);
+// Creates `path` if it does not exist. Returns 0 if the directory exists afterward, or -1 on error.
+int ovrl_make_folder(const char *path);
+// Spawns `program` asynchronously with two arguments and no console window. Returns 0 on success, or -1 on error.
+int ovrl_start_program(const char *program, const char *first, const char *second);
 
 // MARK: Operating system
 

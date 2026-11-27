@@ -14,6 +14,17 @@ public struct XRSwapchain {
     public var width: Int, height: Int
 }
 
+/// Layer composition options from `HeadsetQuirks` that can be updated per frame from the panel.
+public struct XRLayerChoices: Equatable {
+    public var blendTest = "none"
+    public var topLayer = false
+    public var skipEmptyProjection = false
+    public var streamQuads = "never", quadDistance: Float = 50
+    public var reuseFrames = true
+
+    public init() {}
+}
+
 /// Per-eye render target, view pose, and world-space quads for a single frame.
 public struct XREyeDraw {
     /// Eye swapchain index matching the array passed to `XRGraphics.adopt`.
@@ -46,6 +57,7 @@ public struct XREyeDraw {
 /// `Frame` textures.
 extension XRGraphics {
     public var supportsHostChromaKey: Bool { false }
+    public var lastDrawSteps: [(name: String, nanoseconds: UInt64)] { [] }
 }
 
 public protocol XRGraphics: AnyObject {
@@ -84,6 +96,8 @@ public protocol XRGraphics: AnyObject {
 
     /// Time spent waiting on the GPU fence during the most recent `draw` call, in nanoseconds.
     var lastGPUWait: UInt64 { get }
+    /// Per-stage CPU timing breakdown from the most recent `draw` call for `FramePace` logging.
+    var lastDrawSteps: [(name: String, nanoseconds: UInt64)] { get }
 
     /// Optional chroma-key filter applied during quad rendering.
     var chromaKey: ChromaKey? { get set }

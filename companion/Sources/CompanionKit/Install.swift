@@ -125,6 +125,11 @@ public enum Install {
         return ((try? editingVRLinkSchema(text, present: false)) ?? nil) != nil
     }
 
+    /// Settings keys read by `driver_openvrlink`'s data link for the driver directory and `openvrlink-companion` executable.
+    static let folderKey = "folder", companionKey = "companion"
+    /// Path to the running `openvrlink-companion` executable so the driver can invoke it (`nil` in tests).
+    public static var companionProgram: URL?
+
     /// Writes the `driver_openvrlink` directory, including its manifest, default settings,
     /// primary driver binary, and any companion runtime libraries. When `ownTab` is true,
     /// writes a standalone OpenVRLink settings schema instead of using the VR Link tab.
@@ -141,10 +146,18 @@ public enum Install {
         try manifest.text.write(to: driver.appendingPathComponent("driver.vrdrivermanifest"), atomically: true, encoding: .utf8)
         var defaults = JSON.object([section: .object([
             "enable": .bool(true), gammaOnKey: .bool(true), gammaValueKey: .of(defaultGamma), gammaAvailableKey: .bool(false),
-            statusKey: .string("not loaded"), PlayForDreamModel.settingsKey: .bool(true),
+            statusKey: .string("not loaded"),
         ])])
-        // Write the controller models before default.vrsettings advertises them.
+        // Write bundled controller models before advertising sets in default.vrsettings; any previously
+        // converted headset models in resources/rendermodels are preserved.
         try PlayForDreamModel.write(toDriver: driver)
+        // Record the driver directory and companion executable paths in default.vrsettings so `driver_openvrlink`
+        // knows where to save uploaded model files and invoke `openvrlink-companion import-models pending`.
+        defaults[section]?[folderKey] = .string(Steam.nativePath(driver))
+        if let companionProgram { defaults[section]?[companionKey] = .string(Steam.nativePath(companionProgram)) }
+        try defaults.text.write(to: settings.appendingPathComponent("default.vrsettings"), atomically: true, encoding: .utf8)
+        HeadsetModel.convertPending(inDriver: driver)
+        defaults[section]?[ControllerModels.settingsKey] = .of(Double(HeadsetModel.setsPresent(inDriver: driver)))
         // SteamVR merges default.vrsettings across all active drivers, so driver_vrlink reads these vrlink_<model> sections too.
         for (model, manufacturer) in headsets { defaults["vrlink_\(model)"] = headsetSection(model: model, manufacturer: manufacturer) }
         try defaults.text.write(to: settings.appendingPathComponent("default.vrsettings"), atomically: true, encoding: .utf8)

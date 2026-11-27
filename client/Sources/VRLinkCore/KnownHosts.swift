@@ -21,7 +21,7 @@ public struct KnownHosts {
     private struct Host: Codable {
         var knowsHeadset = false
         /// Optional for backward compatibility with older `hosts.json` files.
-        var playForDreamModels: Bool?
+        var controllerModels: UInt32?
     }
 
     private func read() -> [String: Host] {
@@ -33,16 +33,15 @@ public struct KnownHosts {
         read()[String(clientID)]?.knowsHeadset ?? false
     }
 
-    /// Whether the host's companion driver carries the Play For Dream controller render models
-    /// (`DeviceProfile.hostHasPlayForDreamModels`).
-    public func hasPlayForDreamModels(_ clientID: UInt64) -> Bool {
-        read()[String(clientID)]?.playForDreamModels ?? false
+    /// Returns the cached bitmask of `ControllerModelSet` values installed on `driver_openvrlink` for `clientID`.
+    public func controllerModels(_ clientID: UInt64) -> UInt32 {
+        read()[String(clientID)]?.controllerModels ?? 0
     }
 
-    public func set(_ clientID: UInt64, knowsHeadset: Bool? = nil, playForDreamModels: Bool? = nil) {
+    public func set(_ clientID: UInt64, knowsHeadset: Bool? = nil, controllerModels: UInt32? = nil) {
         var hosts = read()
         if let knowsHeadset { hosts[String(clientID), default: Host()].knowsHeadset = knowsHeadset }
-        if let playForDreamModels { hosts[String(clientID), default: Host()].playForDreamModels = playForDreamModels }
+        if let controllerModels { hosts[String(clientID), default: Host()].controllerModels = controllerModels }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
         guard let data = try? encoder.encode(hosts) else { return }

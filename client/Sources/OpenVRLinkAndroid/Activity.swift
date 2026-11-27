@@ -94,6 +94,28 @@ final class App: @unchecked Sendable {
 
     // MARK: Startup
 
+    /// Loads `quirks` from the detected headset defaults, applies any overrides saved in the panel, and finally
+    /// applies `debug.openvrlink.*` system properties. Returns the base headset defaults. This runs at the start
+    /// of every immersive session because closing the app destroys the activity without killing the process, so
+    /// settings read only at process startup would go stale.
+    @discardableResult
+    private func readQuirks() -> HeadsetQuirks {
+        let named = App.property("ro.product.model")
+        let usual = HeadsetQuirks(HeadsetQuirks.identify(manufacturer: App.property("ro.product.manufacturer"), model: named,
+                                                         device: App.property("ro.product.device"), product: App.property("ro.product.name")))
+        let chosen = Settings.load().quirkOverrides
+        var now = usual.overridden(by: chosen)
+        if !chosen.isEmpty { Log.note("quirks changed in the panel: " + chosen.sorted { $0.key < $1.key }.map { "\($0.key) = \($0.value)" }.joined(separator: ", ")) }
+        now.apply { name in
+            let value = App.property("debug.openvrlink." + name)
+            return value.isEmpty ? nil : value
+        }
+        Log.note("headset \(App.property("ro.product.manufacturer")) \(named) (\(App.property("ro.product.device"))): \(now.summary)")
+        quirks = now
+        panel?.quirksInEffect = now
+        return usual
+    }
+
     /// Sets up data directories, logging, device info, `ClientModel`, and `Panel` the first time an activity is
     /// created.
     private func setUp(_ activity: UnsafeMutablePointer<ANativeActivity>) {
@@ -119,18 +141,7 @@ final class App: @unchecked Sendable {
 
         let named = App.property("ro.product.model")
         let modelName = named.isEmpty ? "Android XR headset" : named
-        quirks = HeadsetQuirks(HeadsetQuirks.identify(manufacturer: App.property("ro.product.manufacturer"), model: named,
-                                                      device: App.property("ro.product.device"), product: App.property("ro.product.name")))
-        // Apply headset defaults first, then saved panel overrides, and finally debug.openvrlink.* system properties.
-        let usualQuirks = quirks
-        let chosen = Settings.load().quirkOverrides
-        quirks = quirks.overridden(by: chosen)
-        if !chosen.isEmpty { Log.note("quirks changed in the panel: " + chosen.sorted { $0.key < $1.key }.map { "\($0.key) = \($0.value)" }.joined(separator: ", ")) }
-        quirks.apply { name in
-            let value = App.property("debug.openvrlink." + name)
-            return value.isEmpty ? nil : value
-        }
-        Log.note("headset \(App.property("ro.product.manufacturer")) \(named) (\(App.property("ro.product.device"))): \(quirks.summary)")
+        let usualQuirks = readQuirks()
         let version = with(activity) { $0.versionName() } ?? nil
         device = DeviceIdentity(name: (with(activity) { $0.deviceName() } ?? nil) ?? modelName, model: modelName, systemName: "Android",
                                 systemVersion: "Android " + App.property("ro.build.version.release"),
@@ -377,6 +388,7 @@ final class App: @unchecked Sendable {
 
     private func runImmersive(_ activity: UnsafeMutablePointer<ANativeActivity>) {
         guard let model, let panel else { return }
+        readQuirks()
         // Request hand, eye, and face tracking permissions before creating the OpenXR instance, since the runtime
         // checks granted permissions at instance creation.
         ask(for: [App.handTracking, App.eyeTracking, App.faceTracking, App.questEyeTracking, App.questFaceTracking, App.picoEyeTracking], from: activity)
@@ -386,13 +398,26 @@ final class App: @unchecked Sendable {
         platform.sharpLayerPixels = quirks.sharpLayerPixels
         platform.eyeDetail = quirks.eyeDetail
         platform.sustainedPerformance = quirks.sustainedPerformance
+        platform.boostGPU = quirks.boostGPU
         platform.leanUplink = quirks.leanUplink
         platform.compositorPlacesLayers = quirks.compositorPlacesLayers
         platform.passthroughLayer = quirks.passthroughLayer
-        platform.playForDreamControllers = quirks.headset == .playForDream
+        platform.emptyTopLayer = quirks.emptyTopLayer
+        platform.ownControllerModels = quirks.headset == .playForDream ? .playForDream : quirks.headset == .galaxyXR ? .galaxyXR : nil
+        // Register a loader for Galaxy XR's built-in glTF controller models so DataLink can upload them to the host.
+        if quirks.headset == .galaxyXR { ControllerModelSource.register(.galaxyXR) { ControllerModelSource.galaxyXR() } }
         platform.headVelocityFromPoses = quirks.headVelocityFromPoses
         platform.colorSpace = quirks.colorSpace
         platform.layerFilter = quirks.layerFilter
+        platform.blendTest = quirks.blendTest
+        platform.skipEmptyProjection = quirks.skipEmptyProjection
+        platform.streamQuads = quirks.streamQuads
+        platform.quadDistance = quirks.quadDistance
+        platform.reuseFrames = quirks.reuseFrames
+        // Setting debug.openvrlink.keep_models=1 dumps any OpenXR controller models to the app's external files directory.
+        if App.property("debug.openvrlink.keep_models") == "1", let outside = activity.pointee.externalDataPath {
+            platform.keepControllerModelsIn = String(cString: outside)
+        }
         platform.encodingGamma = quirks.encodingGamma
         platform.controllerVelocityFromPoses = quirks.controllerVelocityFromPoses
         platform.systemButton = { [weak self] in
@@ -456,6 +481,24 @@ final class App: @unchecked Sendable {
             model.show("Could not start OpenXR: \(error)")
             return
         }
+        // Apply live layer-quirk overrides immediately from the panel; other quirks take effect on restart.
+        if let usual = panel.quirks {
+            var chosen: [String: String]?, now = XRLayerChoices()
+            client.display.layerChoices = { [model] in
+                let overrides = model.settings.quirkOverrides
+                if overrides != chosen {
+                    chosen = overrides
+                    let quirks = usual.overridden(by: overrides)
+                    now.blendTest = quirks.blendTest
+                    now.topLayer = quirks.emptyTopLayer
+                    now.skipEmptyProjection = quirks.skipEmptyProjection
+                    now.streamQuads = quirks.streamQuads
+                    now.quadDistance = quirks.quadDistance
+                    now.reuseFrames = quirks.reuseFrames
+                }
+                return now
+            }
+        }
         if quirks.measureColors { measureColors(with: client.display.graphics) }
         lock.lock()
         quitImmersive = { client.quit() }
@@ -475,6 +518,11 @@ final class App: @unchecked Sendable {
         } catch {
             Log.note("OpenXR session failed: \(error)")
         }
+        // Clear quitImmersive immediately so client, its MediaCodec decoders, and its OpenXR swapchains are
+        // released when the activity exits rather than lingering in the surviving process until the next session.
+        lock.lock()
+        quitImmersive = nil
+        lock.unlock()
     }
 
     /// Requests `RECORD_AUDIO` permission if needed, then starts capturing microphone audio into `sink`.

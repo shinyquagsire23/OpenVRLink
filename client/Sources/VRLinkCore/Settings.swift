@@ -79,6 +79,10 @@ public struct Settings: Codable, Equatable {
     /// Overlay a translucent color-coded depth grid (red near, blue far) to visualize `depthFromPicture`.
     public var showDepth = false
 
+    /// Step the display refresh rate down during thermal throttling and restore it once the headset cools.
+    /// This is off by default because changing refresh rates causes a brief hitch and resets the host's video encoder.
+    public var lowerRateWhenHot = false
+
     /// Per-option `HeadsetQuirks` overrides keyed by `HeadsetQuirks.options` key, formatted for
     /// `HeadsetQuirks.apply`. Omitted keys use the headset's defaults; changes take effect on next app launch.
     public var quirkOverrides: [String: String] = [:]
@@ -115,10 +119,24 @@ public struct Settings: Codable, Equatable {
         read(.realityKitRenderer, into: &realityKitRenderer)
         read(.depthFromPicture, into: &depthFromPicture)
         read(.showDepth, into: &showDepth)
+        read(.lowerRateWhenHot, into: &lowerRateWhenHot)
         read(.quirkOverrides, into: &quirkOverrides)
         if let found = try? saved.decodeIfPresent(GazeCalibration.self, forKey: .gazeCalibration) { gazeCalibration = found }
         self = tidied()
     }
+
+    /// Returns a copy with all standard settings reset to their defaults while keeping eye and face calibrations
+    /// and per-headset quirk overrides.
+    public func resetToDefaults() -> Settings {
+        var fresh = Settings()
+        fresh.gazeCalibration = gazeCalibration
+        fresh.faceCalibration = faceCalibration
+        fresh.quirkOverrides = quirkOverrides
+        return fresh
+    }
+
+    /// Whether any setting affected by `resetToDefaults()` differs from its default value.
+    public var differsFromDefaults: Bool { self != resetToDefaults() }
 
     /// Returns a copy with all numeric settings clamped to valid ranges.
     public func tidied() -> Settings {

@@ -21,8 +21,6 @@ public enum PlayForDreamModel {
     public static let models = ["pfd_mr_controller_left", "pfd_mr_controller_right"]
     /// Legacy YVR D1 controller model directories cleaned up during installation.
     static let retired = ["yvr_d1_left_controller", "yvr_d1_right_controller"]
-    /// Key in `driver_openvrlink`'s settings section indicating that the controller models are installed.
-    public static let settingsKey = "playForDreamModels"
 
     /// Returns all bundled model files with their paths relative to `resources/rendermodels`.
     public static var files: [(path: String, data: Data)] {

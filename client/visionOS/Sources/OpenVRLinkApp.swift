@@ -657,6 +657,13 @@ struct SettingsView: View {
             }
 
             Section {
+                Button("Reset Settings to Defaults") { store.settings = store.settings.resetToDefaults() }
+                    .disabled(!store.settings.differsFromDefaults)
+            } footer: {
+                Text("Resets all settings on this page and under Experiments to their defaults. Eye and face calibrations and saved rooms are preserved.")
+            }
+
+            Section {
                 Button("Delete All Rooms") { askingToDeleteRooms = true }
                     .foregroundStyle(.red)
                     .disabled(connection.immersed || connection.waitingForPicture)

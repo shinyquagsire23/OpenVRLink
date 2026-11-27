@@ -37,7 +37,12 @@ packet captures or static analysis of `vrlink` and `driver_vrlink`.
 | `oxClient` | client | heartbeat: `version * 65536 + tick`, `tick` = milliseconds / 250, low 16 bits |
 | `oxWant` | client | bitmask of features supported by the client |
 | `oxHost` | host | heartbeat, using the same encoding |
-| `oxAvail` | host | bitmask of available host features: bit 0 = encoding gamma (section 2), bit 1 = native OpenVRLink headset settings (section 3), bit 2 = Play For Dream controller models (section 3a) |
+| `oxAvail` | host | bitmask of available host features: bit 0 = encoding gamma (section 2), bit 1 = native OpenVRLink headset settings (section 3) |
+| `oxModels` | host | bitmask of installed controller model sets, with bit 0 for Play For Dream MR and bit 1 for Galaxy XR |
+| `oxAddr` | client | client IPv4 address for the data link, packed big-endian as a 32-bit integer |
+| `oxPort` | client | TCP port the client's data link listens on |
+| `oxKey0`, `oxKey1` | client | low and high 48-bit halves of the 96-bit data link authentication token |
+| `oxOffer` | client | bitmask of controller model sets the client can upload over the data link, using the same bits as `oxModels` |
 | `oxOn` | host | bitmask of features applied to outgoing frames |
 | `oxGamma` | host | active encoding gamma (`1` when gamma is inactive) |
 
@@ -245,38 +250,152 @@ With the macOS viewer (**live**), the first session recorded support for the
 host and the second session connected under its native model name; this has not
 been verified on a Vision Pro yet.
 
-## 3a. Play For Dream controller models (feature bit 2)
+## 3a. Controller model sets (`oxModels`)
 
-`openvrlink-companion` bundles the Play For Dream MR controller render models
-(`pfd_mr_controller_left` and `pfd_mr_controller_right`, extracted from the
-`vrlink_pfd_mr` resource driver in Play For Dream's "MR SteamLink Driver"
-1.0.1.0 installer and redistributed with Play For Dream's permission) and writes
-them into `driver_openvrlink`'s `resources/rendermodels` directory during
-driver installation. (The `yvr_d1_*` models installed in `SteamVR/drivers/pfd`
-by older Play For Dream software belong to an earlier YVR headset.) Because the
-component JSON files already animate from Oculus Touch input paths
-(`/input/trigger`, `/input/joystick`, `/input/a/click`, `/input/grip`,
-`/input/system/click`), the models require no input remapping.
+`driver_openvrlink` can serve custom controller render models from its
+`resources/rendermodels` directory so SteamVR displays the headset's physical
+controllers instead of Quest 2 Touch controllers. Each supported controller
+family has a bit in `oxModels` (`ControllerModelSet` on the client and
+`ControllerModels` in `openvrlink-companion`):
 
-Installing the driver sets `driver_openvrlink/playForDreamModels` to `true` in
-`default.vrsettings`, and `driver_openvrlink` advertises bit 2 of `oxAvail`
-whenever that key is enabled. As with bit 1, the client publishes controller
-static properties before `oxAvail` arrives, so it caches bit 2 per host in
-`hosts.json` and applies it starting on the next session. When connected to a
-host with bit 2 cached, a Play For Dream headset reports render model
-`{openvrlink}pfd_mr_controller_<side>` with resource root `openvrlink`;
-otherwise it falls back to Quest 2 Touch models. In both cases, the input
-profile and controller type remain `oculus_touch` (**tested**:
-`HostExtensionsTests`, `CompanionKitTests`).
+| bit | set | models | source |
+|---|---|---|---|
+| 0 | Play For Dream MR | `pfd_mr_controller_left`, `_right` | bundled with `openvrlink-companion` |
+| 1 | Galaxy XR | `galaxy_xr_controller_left`, `_right` | converted by `openvrlink-companion` from the headset's glTF assets |
 
-`ControllerState.gripOffset` uses the grip-to-model transform from Play For
-Dream's official SteamVR driver settings. In Play For Dream's setup for stock
-`vrlink`, `driver_vrlink` reads `vrlink_<device>` and
-`vrlink_<device>_controller_left`/`_right` sections (`vrlink_yvr_d3`, matching
-the headset's Android device name), where each controller section can override
-the render model, input profile, controller type, and—when
-`providesOffsetOverride` is true—the client's grip offset (`offsetPosX/Y/Z` in
-meters and `offsetDegX/Y/Z`).
+`openvrlink-companion` writes the bitmask of installed sets to
+`driver_openvrlink/controllerModels` in `default.vrsettings`, and
+`driver_openvrlink` sends that bitmask in `oxModels`. SteamVR creates each
+controller device once from the first static properties it receives and keeps
+that render model until `vrserver` restarts. Because of that, headsets with
+custom controller models wait up to 1.5 s at session startup for `oxModels` to
+arrive (which usually takes about 0.5 s) before falling back to the value cached
+for that host in `hosts.json` (`StreamSession.profileForControllers`).
+
+If the host has the headset's model set installed, the client reports
+`{openvrlink}<model>_<side>` with resource root `openvrlink`; otherwise it falls
+back to the Quest 2 Touch models. Either way, the input profile and controller
+type stay `oculus_touch`, and each model's component JSON binds its animations
+to the Oculus Touch input paths (`/input/trigger`, `/input/joystick`,
+`/input/a/click`, `/input/grip`, and `/input/system/click`) (**tested**:
+`HostExtensionsTests`, `CompanionKitTests`, `PatchCoreTests`).
+
+To add another controller model set, add a case to `ControllerModelSet` on the
+client, add a bit to `ControllerModels` in `openvrlink-companion`, install the
+model files into `resources/rendermodels`, and include the set in
+`HeadsetModel.setsPresent`.
+
+### Play For Dream MR
+
+`openvrlink-companion` bundles the Play For Dream MR controller models extracted
+from the `vrlink_pfd_mr` resource driver in Play For Dream's "MR SteamLink
+Driver" 1.0.1.0 installer (redistributed with Play For Dream's permission) and
+writes them into `driver_openvrlink` during driver installation. Older Play For
+Dream software also installs `yvr_d1_*` models in `SteamVR/drivers/pfd`, which
+belong to an earlier YVR headset.
+
+### Galaxy XR
+
+Android XR's OpenXR runtime does not implement any controller render-model
+extensions, but Galaxy XR ships glTF controller models inside a preinstalled
+system APK at `/system/priv-app/ImmersiveAvatarEditor/ImmersiveAvatarEditor.apk`
+under `assets/models/Left` and `Right`. The Android client reads each side's
+`.gltf`, `.bin` buffer, and base color PNG directly from that APK using
+`ZipArchive` (`ControllerModelSource.galaxyXR`), so OpenVRLink does not need to
+redistribute Samsung's assets. Those files are uploaded to the host over the
+data link, where `openvrlink-companion` converts them into SteamVR render models
+with `GLTFControllerModel`. You can also convert manually copied files with
+`openvrlink-companion import-models galaxy-xr LEFT.gltf RIGHT.gltf`.
+
+Each glTF defines a node per moving part (`Trigger`, `Grip`, `ThumbStick`,
+`UpperButton`, `LowerButton`, and `MenuButton`) and a keyframe animation per
+control (`Trigger_Press`, `ThumbStick_Left`, and so on). `GLTFControllerModel`
+exports each part as a Wavefront OBJ in model space and builds its SteamVR
+component motion from those animation channels. Rotation channels become
+`rotate` motions around the node's pivot, and translation channels become
+`translate` motions. For the thumbstick, it uses the two tilt axes to build a
+`joystick` frame with +Y along the shaft and +Z toward the user instead of
+relying on the clip names (`"ThumbStick_Up"` in Samsung's asset tilts the stick
+backward).
+
+OpenVRLink reports Galaxy XR controllers to SteamVR as Oculus Touch controllers,
+so the client offsets Samsung's reported grip pose to match the Quest Touch grip
+frame (`HeadsetQuirks.GripOffset.towardQuest`). Samsung's glTF mesh is authored
+around the unadjusted runtime pose, so `GLTFControllerModel.galaxyXRPlace`
+starts from the Quest 2 model's `openxr_grip` transform and applies the inverse
+of the client's translation and pitch offset. It also shifts the origin 8 mm
+outboard onto the handle axis and 14 mm forward (`galaxyXRGrip`); the 8 mm
+offset comes from the handle mesh geometry, and the 14 mm offset was tuned
+visually so touching the physical controllers together lines up in VR. If the
+client's Galaxy XR grip offset changes, `galaxyXRPlace` needs to be updated to
+match.
+
+## 3b. Data link
+
+The SVLRoot key/value channel only carries a few hundred bytes per second, so
+OpenVRLink opens a separate TCP connection alongside the session for larger
+transfers. Right now this connection uploads custom controller model assets,
+though the message format can also carry other bulk data later, such as camera
+or tracking streams.
+
+### Connection and authentication
+
+When connected to a live `driver_openvrlink` host that is missing controller
+models the client can provide, the client opens a TCP listener on its session
+IPv4 address using an ephemeral port and closes the listener when the session
+ends. The headset listens and `driver_openvrlink` connects out from `vrserver`
+so the PC does not have to open a listening port or trigger a Windows Firewall
+prompt.
+
+The client sends its listener address and port in `oxAddr` and `oxPort`, along
+with a random 96-bit token split across `oxKey0` and `oxKey1`. Because those
+records travel over the encrypted SVL session transport, only the paired host
+receives the token. The host must send a 20-byte handshake containing that token
+before any messages. The client closes unauthenticated connections without
+replying and rotates the token as soon as a valid connection is accepted so each
+token is single-use. After that initial token check, the TCP stream itself is
+**unencrypted and unauthenticated**, so any private data sent over this link in
+the future will need stream encryption and authentication.
+
+### Wire format
+
+All multi-byte integers are little-endian.
+
+| part | bytes |
+|---|---|
+| hello (host first) | `OVRL`, version `1`, three zero bytes, 12-byte token |
+| message | kind `u16`, flags `u16` (zero), payload length `u32`, payload |
+
+Payloads are limited to 32 MiB, and unrecognized message kinds are skipped.
+
+| kind | from | payload | meaning |
+|---|---|---|---|
+| 1 `wantModels` | host | set `u8` | request all files for this controller model set |
+| 2 `file` | client | set `u8`, name length `u8`, name, bytes | one file belonging to the set |
+| 3 `done` | client | set `u8`, status `u8` | transfer complete (`0`) or unavailable (non-zero) |
+| 4 `result` | host | set `u8`, status `u8` | files stored (`0`) or write failed (non-zero) |
+
+File names must consist of one or two `/` path components containing only ASCII
+letters, digits, `_`, `-`, and `.`, with no component starting with a dot
+(`DataLink.isSafe`). Both sides reject any other file name.
+
+### Host handling
+
+On the host, `Link.swift` drives a non-blocking socket (`DriverABI/link.c`)
+directly from `vrserver`'s frame callback without spawning background threads.
+When a live client offers a model set that the driver has not yet installed or
+requested during the current `vrserver` run, the driver connects, requests the
+set, and writes up to 32 files (64 MiB total) under `incoming/<set>/` inside the
+driver directory, followed by a `complete` marker file. Using the `folder` and
+`companion` paths that `openvrlink-companion` writes to `default.vrsettings`,
+the driver then runs `openvrlink-companion import-models pending` to convert the
+downloaded files into SteamVR render models. Running
+`openvrlink-companion install` also converts any completed uploads in
+`incoming/` so converter updates reprocess cached files. Once the converted
+render model appears on disk, `driver_openvrlink` adds its bit to `oxModels`, so
+the headset learns about it during the current session and uses the models
+starting on the next session (**tested**: `LinkTests`, `DataLinkTests`,
+`PatchCoreTests`).
 
 ## 4. Settings
 
@@ -289,7 +408,8 @@ Extension settings use a dedicated `driver_openvrlink` section in
 | `encodingGammaValue` | user | gamma exponent |
 | `gammaAvailable` | driver | whether `driver_openvrlink` patched `driver_vrlink` for gamma |
 | `status` | driver | one-line patch status summary |
-| `playForDreamModels` | companion (driver defaults) | whether Play For Dream controller render models are installed in `driver_openvrlink` |
+| `controllerModels` | `openvrlink-companion` (driver defaults) | bitmask of controller model sets installed in `driver_openvrlink/resources/rendermodels` |
+| `folder`, `companion` | `openvrlink-companion` (driver defaults) | paths to the driver directory and `openvrlink-companion` executable used by the data link |
 
 By default, `openvrlink-companion install` adds UI controls for these keys to
 SteamVR's VR Link settings tab by editing `driver_vrlink`'s
@@ -315,3 +435,5 @@ the handshake version; peers ignore heartbeats with an unrecognized version.
   only verified that both ends negotiate and apply the gamma curve.
 - Does the SteamVR dashboard render the injected `requires` and `label` settings
   entries as expected?
+- The data link uses unencrypted TCP after the single-use token handshake. Before carrying camera or tracking data, it should encrypt and authenticate the stream end-to-end (for example, using a session key exchanged over `ox` records).
+- The data link assumes the client's session address is IPv4 and directly reachable from the host, which works on a local network but not across NAT.

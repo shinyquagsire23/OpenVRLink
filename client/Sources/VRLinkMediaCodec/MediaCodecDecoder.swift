@@ -79,13 +79,39 @@ public final class MediaCodecDecoder: StreamDecoder {
         self.quirks = quirks
     }
 
+    /// Synchronizes `decode`, `reset`, and `close` across threads so stopping a session cannot race with an
+    /// in-flight frame delivery on the session thread.
+    private let gate = NSLock()
+    private var closed = false
+
     public func reset() {
+        gate.lock()
+        defer { gate.unlock() }
+        closed = false
+        releaseDecoders()
+    }
+
+    /// Stops and releases all active `AMediaCodec` instances and ignores further frames until `reset()`.
+    /// Leaving an `AMediaCodec` instance alive after a stream ends holds onto hardware decoder resources; on
+    /// Quest Pro, any new codec created after reopening the activity in the same process stalled with no
+    /// available input buffers.
+    public func close() {
+        gate.lock()
+        defer { gate.unlock() }
+        closed = true
+        releaseDecoders()
+    }
+
+    private func releaseDecoders() {
         decoders.forEach { $0.stop() }
         decoders = []
         assembler.reset()
     }
 
     public func decode(_ frame: EncodedFrame) {
+        gate.lock()
+        defer { gate.unlock() }
+        guard !closed else { return }
         while decoders.count <= frame.picture {
             let picture = decoders.count
             let decoder = PictureCodec(picture: picture, quirks: quirks)

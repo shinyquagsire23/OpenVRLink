@@ -19,6 +19,9 @@ public struct TrackedHand {
     /// Whether the platform reports a menu gesture or system button on this hand (used on the left hand to open
     /// the SteamVR dashboard when no controller is held).
     public var menu = false
+    /// Set by `ButtonGate` to suppress pinch, grip, and menu gestures sent to the host while still forwarding
+    /// the hand's joint poses.
+    public var gesturesHeld = false
 
     /// 26 joints: palm, wrist, then metacarpal-to-tip for thumb (4 joints)
     /// and index, middle, ring, little (5 each).
@@ -100,6 +103,7 @@ struct HandGestures {
 
     /// Evaluates gestures from joint poses, using `previous` for hysteresis to prevent flickering near thresholds.
     init(_ hand: TrackedHand, previous: HandGestures?) {
+        if hand.gesturesHeld { return }
         let thumb = hand.joints[TrackedHand.thumbTip].position
         // Finger curl in degrees, measured between the proximal phalanx and fingertip forward vectors.
         var curl: [Float] = []

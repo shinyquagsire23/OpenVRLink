@@ -177,8 +177,8 @@ public struct ControllerState {
     /// or Play For Dream's host-driver override (`offsetPos*` and `offsetDegX` under
     /// `vrlink_yvr_d3_controller_left` in "MR SteamLink Driver" 1.0.1.0: 2.5 cm up, 3.5 cm forward, +25 deg
     /// pitch, since Play For Dream's grip pose aligns with the aim ray rather than the handle).
-    static func gripOffset(_ side: Side, senseModel: Bool, playForDream: Bool = false, model: ControllerModel = .touch) -> [Float] {
-        if playForDream, !senseModel {
+    static func gripOffset(_ side: Side, senseModel: Bool, own: ControllerModelSet? = nil, model: ControllerModel = .touch) -> [Float] {
+        if own == .playForDream, !senseModel {
             let pitch = 25 * Float.pi / 180
             return [0, 0.025, -0.035, cos(pitch / 2), sin(pitch / 2), 0, 0]
         }
@@ -188,6 +188,35 @@ public struct ControllerState {
         // 11 cm forward along the pitched -z axis expressed in the unpitched grip frame.
         let position = [0.002, sin(pitch) * forward, -0.01 - cos(pitch) * forward]
         return position + [cos(pitch / 2), sin(pitch / 2), 0, 0]
+    }
+}
+
+/// Custom controller render model sets that `driver_openvrlink` can serve on the host, either bundled with
+/// `openvrlink-companion` or converted from the headset's glTF assets. The host sends its installed sets as a
+/// bitmask in `oxModels`.
+public enum ControllerModelSet: Int, CaseIterable, Sendable {
+    /// Play For Dream MR controllers, bundled with `openvrlink-companion`.
+    case playForDream = 0
+    /// Samsung Galaxy XR controllers, converted by `openvrlink-companion` from the headset's glTF models.
+    case galaxyXR = 1
+
+    public var bit: UInt32 { 1 << UInt32(rawValue) }
+    public var title: String { self == .playForDream ? "Play For Dream" : "Galaxy XR" }
+
+    /// Returns the static controller property strings for this model set, using custom model names while
+    /// keeping the Oculus Touch input profile and controller type expected by the host.
+    func staticStrings(_ side: Side) -> [String] {
+        let name = side == .left ? "Left" : "Right", lower = name.lowercased()
+        switch self {
+        case .playForDream:
+            return ["oculus", "OpenVRLink_PFD_\(name)", "Play For Dream", "Play For Dream MR (\(name) Controller)",
+                    "{openvrlink}pfd_mr_controller_\(lower)", "openvrlink",
+                    "{oculus}/input/touch_profile.json", "oculus_touch", "oculus/OpenVRLink_PFD_\(name)"]
+        case .galaxyXR:
+            return ["oculus", "OpenVRLink_GalaxyXR_\(name)", "Samsung", "Galaxy XR (\(name) Controller)",
+                    "{openvrlink}galaxy_xr_controller_\(lower)", "openvrlink",
+                    "{oculus}/input/touch_profile.json", "oculus_touch", "oculus/OpenVRLink_GalaxyXR_\(name)"]
+        }
     }
 }
 

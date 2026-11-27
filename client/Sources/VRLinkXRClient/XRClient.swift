@@ -32,18 +32,30 @@ public struct XRPlatform {
     public var eyeDetail: Float = 1
     /// Request sustained high CPU and GPU performance levels (`HeadsetQuirks.sustainedPerformance`).
     public var sustainedPerformance = true
+    /// Request `XR_PERF_SETTINGS_LEVEL_BOOST_EXT` for the GPU instead of `SUSTAINED_HIGH`.
+    public var boostGPU = false
     /// Start sessions with a reduced uplink packet rate (`HeadsetQuirks.leanUplink`).
     public var leanUplink = false
     /// `HeadsetQuirks.compositorPlacesLayers` and `HeadsetQuirks.passthroughLayer`.
     public var compositorPlacesLayers = true, passthroughLayer = false
-    /// Whether the headset uses Play For Dream controllers (`DeviceProfile.playForDreamControllers`).
-    public var playForDreamControllers = false
+    /// Submit a transparent Android `Surface` overlay quad on top of all other layers.
+    public var emptyTopLayer = false
+    /// Blend mode and layer alpha diagnostic override (`HeadsetQuirks.blendTest`).
+    public var blendTest = "none"
+    /// Initial values for skipping empty projection layers and submitting stream views as quads.
+    public var skipEmptyProjection = false, streamQuads = "never", quadDistance: Float = 50
+    /// Resubmit unchanged swapchain images for compositor reprojection when no new frame arrives.
+    public var reuseFrames = true
+    /// Custom controller model set for this headset, if it has one.
+    public var ownControllerModels: ControllerModelSet?
     /// `HeadsetQuirks.headVelocityFromPoses` and `controllerVelocityFromPoses`.
     public var headVelocityFromPoses = false, controllerVelocityFromPoses = false
     /// `HeadsetQuirks.colorSpace`.
     public var colorSpace = "rec709"
     /// `HeadsetQuirks.layerFilter`.
     public var layerFilter = "none"
+    /// Optional directory path for dumping OpenXR controller models to disk (`XRModelDump`).
+    public var keepControllerModelsIn: String?
     /// `HeadsetQuirks.encodingGamma`.
     public var encodingGamma = true
 
@@ -77,6 +89,8 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
     /// Whether a wired interface was active when the stream started, and the number of consecutive checks
     /// reporting a change (`followLink`). Guarded by `lock`.
     private var wiredAtStart = false, linkChanges = 0
+    /// Suppresses button and gesture inputs from reaching the host while interacting with the panel or starting a stream.
+    private let buttonGate = ButtonGate()
     private var linkWatch: DispatchSourceTimer?
     /// Interval in seconds between reconnection attempts and network interface checks.
     static var retryEvery: Double { 2 }
@@ -95,9 +109,12 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
                                 process: process, sharpLayerPixels: platform.sharpLayerPixels, eyeDetail: platform.eyeDetail,
                                 sustainedPerformance: platform.sustainedPerformance,
                                 compositorPlacesLayers: platform.compositorPlacesLayers,
-                                passthroughLayer: platform.passthroughLayer, colorSpace: platform.colorSpace, layerFilter: platform.layerFilter, log: log)
+                                passthroughLayer: platform.passthroughLayer, emptyTopLayer: platform.emptyTopLayer, colorSpace: platform.colorSpace, layerFilter: platform.layerFilter, blendTest: platform.blendTest,
+                                skipEmptyProjection: platform.skipEmptyProjection, streamQuads: platform.streamQuads,
+                                quadDistance: platform.quadDistance, reuseFrames: platform.reuseFrames, log: log)
         if let offset = platform.gripOffset, !offset.isNone { display.input.gripOffsets = Side.allCases.map { offset.pose(for: $0) } }
         display.input.systemButton = platform.systemButton
+        display.keepControllerModelsIn = platform.keepControllerModelsIn
         display.input.headVelocityFromPoses = platform.headVelocityFromPoses
         display.input.controllerVelocityFromPoses = platform.controllerVelocityFromPoses
         panel.showsPointer = true
@@ -106,6 +123,12 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
 
         layer.update = { [panel, weak self] pointer in
             panel.pointer = pointer
+            self?.buttonGate.pointerOnPanel(pointer != nil)
+            // Scroll the panel using whichever controller thumbstick is deflected further.
+            panel.scroll = self?.display.input.hands().reduce(Float(0)) { most, hand in
+                if case .controller(let state)? = hand, abs(state.stickY) > abs(most) { return state.stickY }
+                return most
+            } ?? 0
             // Prompt the user when face tracking is inactive because system face calibration hasn't been run.
             let uncalibrated = self?.display.faceNeedsCalibration ?? false
             panel.hint = hint + (uncalibrated ? "\nFace tracking requires calibration in the headset's system settings." : "")
@@ -117,6 +140,17 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
             lock.lock()
             defer { lock.unlock() }
             return panelPinned || !link.hasPicture
+        }
+        // Dismiss the panel when an active stream is displaying video, or exit the app when idle.
+        panel.onClose = { [weak self] in
+            guard let self else { return }
+            if link.hasPicture {
+                lock.lock()
+                panelPinned = false
+                lock.unlock()
+            } else {
+                display.quit()
+            }
         }
         layer.onMenuHeld = { [weak self] in
             guard let self else { return }
@@ -154,6 +188,7 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
         model.stopStream = { [link] leaving in link.stop(leaving: leaving) }
 
         display.streamingSession = { [link] in link.session }
+        display.boostGPU = platform.boostGPU
         if display.graphics.supportsChromaKey, display.canShowRoom {
             panel.features.insert(.chromaKey)
             // Host chroma keying overrides the client's chroma key on frames that carry `FrameLayout.HostKey`.
@@ -166,6 +201,12 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
             display.depthFromPicture = { [model] in (model.settings.depthFromPicture, model.settings.showDepth) }
         } else {
             panel.features.remove(.depthFromPicture)
+        }
+        if display.canStepRefreshRate {
+            panel.features.insert(.rateSteps)
+            display.lowersRateWhenHot = { [model] in model.settings.lowerRateWhenHot }
+        } else {
+            panel.features.remove(.rateSteps)
         }
         display.onPaused = { [weak self] in
             guard let self else { return }
@@ -278,7 +319,7 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
         profile.wantsEncodingGamma = platform.encodingGamma
         // Advertise host chroma-key support whenever passthrough is available; SteamVR enables keying per application.
         profile.hostChromaKey = display.graphics.supportsHostChromaKey && display.canShowRoom
-        profile.playForDreamControllers = platform.playForDreamControllers
+        profile.ownControllerModels = platform.ownControllerModels
         profile.clientVersion = platform.device.clientVersion
         profile.eyeFrusta = profile.eyeFrusta.map { $0.scaled(horizontal: settings.fovScaleHorizontal, vertical: settings.fovScaleVertical) }
         var connector = HostConnector(platform.device)
@@ -286,7 +327,7 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
         connector.preferredInterfaces = platform.preferredInterfaces
         connector.log = { Log.note($0) }
         connector.askPin = { [model, link] in model.askPin { !link.isWanted } }
-        var inputs = StreamLink<Decoder>.Inputs(head: { [display] in display.input.head() }, hands: { [display] in display.input.hands() })
+        var inputs = StreamLink<Decoder>.Inputs(head: { [display] in display.input.head() }, hands: { [display, buttonGate] in buttonGate.passing(display.input.hands()) })
         inputs.haptic = { [display] in display.input.vibrate($0) }
         if display.input.tracksGaze {
             profile.tracksGaze = true

@@ -76,6 +76,9 @@ public final class XRInstance {
         "XR_FB_display_refresh_rate",
         "XR_FB_color_space",                 // declare content color primaries on wide-gamut displays
         "XR_FB_composition_layer_settings",  // ask the compositor to sharpen or supersample the stream's layers
+        "XR_EXT_uuid", "XR_EXT_render_model", "XR_EXT_interaction_render_model",   // OpenXR controller render models
+        "XR_FB_render_model", "XR_MSFT_controller_model",                           // vendor controller render models
+        "XR_KHR_android_surface_swapchain",  // Android Surface overlay swapchain (`HeadsetQuirks.emptyTopLayer`)
         "XR_FB_passthrough",                 // passthrough layer when alpha-blend mode is unavailable
         "XR_ANDROID_recommended_resolution", // dynamic eye resolution notifications on Android XR
         "XR_EXT_performance_settings",       // sustained clock requests and thermal throttling events
@@ -87,8 +90,12 @@ public final class XRInstance {
         "XR_FB_face_tracking2",              // Quest Pro camera face tracking and Quest 3 audio lip sync
     ]
 
-    /// - Parameter required: Instance extensions required by the graphics backend.
-    public init(applicationName: String, required: [String], process: XRProcess = XRProcess(),
+    /// - Parameters:
+    ///   - required: Instance extensions required by the graphics backend.
+    ///   - unlisted: Extensions to try enabling even when omitted from `xrEnumerateInstanceExtensionProperties`.
+    ///     If `xrCreateInstance` rejects them, initialization retries without them. Galaxy XR supports
+    ///     `XR_KHR_android_surface_swapchain` this way without listing it.
+    public init(applicationName: String, required: [String], unlisted: [String] = [], process: XRProcess = XRProcess(),
                 log: (String) -> Void) throws {
         let entry = try Loader.entryPoint(log: log)
         self.entry = entry
@@ -124,7 +131,6 @@ public final class XRInstance {
         let available = Set(offered.prefix(Int(count)).map { text(of: $0.extensionName) })
         for name in wanted where !available.contains(name) { throw XRFailure.unsupported(name) }
         wanted += XRInstance.optional.filter { available.contains($0) && !wanted.contains($0) }
-        extensions = Set(wanted)
         self.offered = available
 
         var info = XrInstanceCreateInfo()
@@ -134,30 +140,42 @@ public final class XRInstance {
         info.applicationInfo.applicationVersion = 1
         // Request OpenXR 1.0 for compatibility across all OpenXR 1.x runtimes.
         info.applicationInfo.apiVersion = ovrl_xr_version(1, 0, 0)
-        let names = wanted.map { strdup($0) }
-        defer { names.forEach { free($0) } }
-        let pointers = names.map { UnsafePointer<CChar>($0) }
-        info.enabledExtensionCount = UInt32(pointers.count)
         let create = try early("xrCreateInstance", PFN_xrCreateInstance.self)
         var made: XrInstance?
-        #if os(Android)
-        var android = XrInstanceCreateInfoAndroidKHR()
-        android.type = XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR
-        android.applicationVM = process.javaVM
-        android.applicationActivity = process.activity
-        try withUnsafePointer(to: &android) { android in
-            info.next = UnsafeRawPointer(android)
-            try pointers.withUnsafeBufferPointer {
-                info.enabledExtensionNames = $0.baseAddress
-                _ = try check(create(&info, &made), "xrCreateInstance")
+        func make(_ wanted: [String]) -> XrResult {
+            let names = wanted.map { strdup($0) }
+            defer { names.forEach { free($0) } }
+            let pointers = names.map { UnsafePointer<CChar>($0) }
+            info.enabledExtensionCount = UInt32(pointers.count)
+            #if os(Android)
+            var android = XrInstanceCreateInfoAndroidKHR()
+            android.type = XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR
+            android.applicationVM = process.javaVM
+            android.applicationActivity = process.activity
+            return withUnsafePointer(to: &android) { android in
+                info.next = UnsafeRawPointer(android)
+                return pointers.withUnsafeBufferPointer {
+                    info.enabledExtensionNames = $0.baseAddress
+                    return create(&info, &made)
+                }
             }
+            #else
+            return pointers.withUnsafeBufferPointer {
+                info.enabledExtensionNames = $0.baseAddress
+                return create(&info, &made)
+            }
+            #endif
         }
-        #else
-        try pointers.withUnsafeBufferPointer {
-            info.enabledExtensionNames = $0.baseAddress
-            _ = try check(create(&info, &made), "xrCreateInstance")
+        let unlisted = unlisted.filter { !wanted.contains($0) }
+        if !unlisted.isEmpty, make(wanted + unlisted).rawValue >= 0, made != nil {
+            wanted += unlisted
+            log("openxr: enabled \(unlisted.joined(separator: ", "))"
+                + (unlisted.allSatisfy(available.contains) ? "" : " (unlisted by runtime)"))
+        } else {
+            made = nil
+            try check(make(wanted), "xrCreateInstance")
         }
-        #endif
+        extensions = Set(wanted)
         guard let made else { throw XRFailure.call("xrCreateInstance", XR_ERROR_RUNTIME_FAILURE) }
         handle = made
         calls = try Calls { name in

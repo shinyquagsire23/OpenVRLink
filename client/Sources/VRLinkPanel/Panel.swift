@@ -30,6 +30,13 @@ public final class Panel {
     public var hint = ""
     /// Current pointer position in pixels from the top-left corner and button state, or `nil` when inactive.
     public var pointer: (x: Float, y: Float, pressed: Bool)?
+    /// Vertical thumbstick deflection in `-1...1` (positive up) used to scroll the active list under the
+    /// pointer, or at the center of the panel when no pointer ray hits it.
+    public var scroll: Float = 0
+    /// Action invoked when the top-right close button (`X`) is pressed; when `nil`, the close button is hidden.
+    public var onClose: (() -> Void)?
+    /// Scroll speed in wheel steps per second at full thumbstick deflection.
+    private static let scrollRate: Float = 4
     /// Whether to draw a cursor dot at `pointer` (enabled for ray pointers, disabled for direct touch).
     public var showsPointer = false
     /// Most recently rasterized RGBA image of the panel.
@@ -97,7 +104,16 @@ public final class Panel {
         let now = Uptime.nanoseconds
         let elapsed = Float(now &- lastUpdate) / 1e9
         lastUpdate = now
-        if let pointer { igPointer(pointer.x, pointer.y, pointer.pressed) } else { igPointer(-1, -1, false) }
+        // Apply a 0.25 dead zone and scale scroll speed linearly with thumbstick deflection.
+        let pushed = abs(scroll) < 0.25 ? 0 : (abs(scroll) - 0.25) / 0.75 * (scroll < 0 ? -1 : 1)
+        if let pointer {
+            igPointer(pointer.x, pointer.y, pointer.pressed)
+        } else if pushed != 0 {
+            igPointer(Float(width) / 2, Float(height) / 2, false)
+        } else {
+            igPointer(-1, -1, false)
+        }
+        if pushed != 0 { igScroll(pushed * Panel.scrollRate * min(0.25, elapsed)) }
         igNewFrame(Float(width), Float(height), min(0.25, elapsed))
         layout()
         if showsPointer, let pointer { igDot(pointer.x, pointer.y, (pointer.pressed ? 9 : 12) * unit) }
@@ -154,6 +170,11 @@ public final class Panel {
         if !caption.isEmpty {
             igSameLine(16 * unit)
             igTextDim(caption)
+        }
+        if let onClose {
+            igSameLine(0)
+            igCursorX(Float(width) - 100 * unit)
+            if igButton("X", 68 * unit, 56 * unit) { onClose() }
         }
         if igBeginTabBar("tabs") {
             if igBeginTabItem("Stream") {
@@ -321,16 +342,20 @@ public final class Panel {
             igPushID(id)
             /// Stores an override only when the value differs from the headset default.
             func set(_ value: String) { overrides[option.key] = value == usual ? nil : value }
-            let waiting = quirksInEffect?.value(of: option.key).map { $0 != now } ?? false
+            let waiting = !HeadsetQuirks.liveKeys.contains(option.key) && quirksInEffect?.value(of: option.key).map { $0 != now } ?? false
             let title = option.title + (waiting ? "  (restart the app to apply)" : now == usual ? "" : "  (changed)")
             switch option.kind {
             case .flag:
                 var on = now == "1"
                 if igCheckbox(title, &on) { set(on ? "1" : "0") }
             case .choice(let names):
+                // Render radio choices below the label, wrapping onto a new line when horizontal space runs out.
                 igText(title)
-                for name in names {
-                    igSameLine(16 * unit)
+                for (index, name) in names.enumerated() {
+                    if index > 0 {
+                        igSameLine(16 * unit)
+                        if igAvailableWidth() < igTextWidth(name) + 70 * unit { igDummy(0, 0) }
+                    }
                     if igRadio(name, now == name) { set(name) }
                 }
             case .number(let range, let step):
@@ -382,6 +407,7 @@ public final class Panel {
             if let footer = section.footer { igTextDim(footer) }
             igSpacing()
         }
+        if settings.differsFromDefaults, igButton("Reset settings to defaults", 0, 0) { settings = settings.resetToDefaults() }
         if settings != before { model.settings = settings }
         igEndChild()
     }

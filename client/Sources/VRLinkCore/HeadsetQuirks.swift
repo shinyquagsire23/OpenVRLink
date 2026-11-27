@@ -58,6 +58,31 @@ public struct HeadsetQuirks: Equatable {
     /// `supersample` or `supersample_quality` when downscaling, or `auto` to let the runtime choose.
     public var layerFilter = "none"
     public static let layerFilters = ["none", "sharpen", "sharpen_quality", "supersample", "supersample_quality", "auto"]
+    /// Overrides the environment blend mode and layer alpha flags to test Galaxy XR compositor downscaling
+    /// during passthrough. Setting `env` uses alpha-blend environment mode on opaque frames, `flag` sets the
+    /// source-alpha blend flag on opaque layers, and `both` turns on both overrides. Setting `no_env` keeps
+    /// opaque environment mode on transparent frames (hiding passthrough), and `no_flag` clears the
+    /// source-alpha blend flag on transparent layers.
+    public var blendTest = "none"
+    public static let blendTests = ["none", "env", "flag", "both", "no_env", "no_flag"]
+    /// Quirk option keys that apply immediately at runtime via `XRDisplay.layerChoices` without restarting the app.
+    public static let liveKeys: Set<String> = ["blend_test", "empty_top_layer", "skip_empty_projection", "stream_quads", "quad_distance", "reuse_frames"]
+    /// Omit the projection layer when no stream frame is available. On Galaxy XR, submitting a projection layer
+    /// while passthrough is visible causes the compositor to downscale all layers, including the UI panel.
+    public var skipEmptyProjection = false
+    /// Controls when stream views are submitted as per-eye quad layers instead of projection layers. Can be
+    /// `never`, `always`, or `room` (which uses quads only while passthrough is visible to avoid Galaxy XR's
+    /// projection-layer downscaling). Each quad is placed `quadDistance` meters in front of the eye.
+    public var streamQuads = "never"
+    /// When no new video frame has arrived on a display refresh, resubmit the previously rendered swapchain
+    /// images for the compositor to reproject instead of re-rendering. Because compositor reprojection is
+    /// rotation-only, `XRDisplay` still re-renders every refresh when stereo depth warping is active to avoid
+    /// translational judder, unless GPU draw time exceeds 60% of the refresh period.
+    public var reuseFrames = true
+    public static let streamQuadChoices = ["never", "room", "always"]
+    /// Distance in meters from the eye to the quad plane when `streamQuads` is active. Using 50 m minimizes
+    /// parallax error during translational head movement compared to `vrlink`'s ~2 m distance.
+    public var quadDistance: Float = 50
     /// Invert narrow-range expansion (16...235 to 0...255) applied by the decoder or GPU driver to full-range
     /// video, preventing crushed and tinted shadows (matching ALVR's range fix on standalone headsets).
     public var undoRangeStretch = false
@@ -82,6 +107,10 @@ public struct HeadsetQuirks: Equatable {
     public var eyeDetail: Float = 1.4
     /// Request sustained high CPU and GPU performance levels via `XR_EXT_performance_settings`.
     public var sustainedPerformance = true
+    /// Request `XR_PERF_SETTINGS_LEVEL_BOOST_EXT` instead of `SUSTAINED_HIGH` for the GPU. Useful for testing
+    /// headsets where GPU draw time approaches the refresh period, such as Quest Pro at 90 Hz, though runtimes
+    /// may cap how long boost stays active and it increases heat and battery drain.
+    public var boostGPU = false
     /// Start sessions with a reduced uplink packet rate (sending hand data once per video frame). On Galaxy XR,
     /// Wi-Fi begins rejecting outgoing packets once the Wi-Fi thermal sensor exceeds ~75 °C.
     public var leanUplink = false
@@ -92,6 +121,10 @@ public struct HeadsetQuirks: Equatable {
     /// Use an `XR_FB_passthrough` layer for passthrough even when `XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND` is
     /// advertised. Runtimes without alpha-blend mode use `XR_FB_passthrough` automatically.
     public var passthroughLayer = false
+    /// Submit a small transparent quad backed by an Android `Surface` swapchain (`XR_KHR_android_surface_swapchain`)
+    /// on top of all other layers. On Galaxy XR, the compositor downscales projection layers unless the frame
+    /// includes a `Surface`-backed layer; Angelo Pascuzzi's `xr-porting-hub` Steam Link patches use the same workaround.
+    public var emptyTopLayer = false
 
     /// Derive head or controller velocities from finite differences between two predicted poses instead of
     /// using the runtime's reported velocity vectors. Pico, Vive, and YVR runtimes report velocities in the
@@ -155,7 +188,11 @@ public struct HeadsetQuirks: Equatable {
         floatTargetIsEncoded = headset == .pico || headset == .galaxyXR
         // Galaxy XR upscales 1856 x 2160 swapchains to 3552 x 3840 panels with a soft default filter unless
         // sharpening is requested.
-        if headset == .galaxyXR { eyeDetail = 1.9; leanUplink = true; layerFilter = "sharpen_quality" }
+        // Quest Pro's foveal region is ~1152 px per side, so a 1280 px sharp swapchain avoids allocating unused memory.
+        if headset == .questPro { sharpLayerPixels = 1280 }
+        if headset == .galaxyXR { eyeDetail = 1.9; leanUplink = true; layerFilter = "sharpen_quality"; emptyTopLayer = true
+            skipEmptyProjection = true; streamQuads = "room"
+        }
         // Match ALVR's workarounds for YVR and Play For Dream (`use_custom_reprojection` and `passthrough_fb.rs`).
         if headset == .yvr || headset == .playForDream {
             compositorPlacesLayers = false
@@ -214,9 +251,11 @@ public struct HeadsetQuirks: Equatable {
         if let value = flag("decoder_low_latency") { decoderLowLatency = value }
         if let value = flag("wait_for_gpu") { waitForGPU = value }
         if let value = flag("sustained_performance") { sustainedPerformance = value }
+        if let value = flag("boost_gpu") { boostGPU = value }
         if let value = flag("lean_uplink") { leanUplink = value }
         if let value = flag("compositor_places_layers") { compositorPlacesLayers = value }
         if let value = flag("passthrough_layer") { passthroughLayer = value }
+        if let value = flag("empty_top_layer") { emptyTopLayer = value }
         if let value = flag("shader_color_conversion") { shaderColorConversion = value }
         if let value = flag("undo_range_stretch") { undoRangeStretch = value }
         if let value = flag("measure_colors") { measureColors = value }
@@ -224,6 +263,11 @@ public struct HeadsetQuirks: Equatable {
         if let value = flag("encoding_gamma") { encodingGamma = value }
         if let value = override("color_space"), HeadsetQuirks.colorSpaces.contains(value) { colorSpace = value }
         if let value = override("layer_filter"), HeadsetQuirks.layerFilters.contains(value) { layerFilter = value }
+        if let value = override("blend_test"), HeadsetQuirks.blendTests.contains(value) { blendTest = value }
+        if let value = flag("skip_empty_projection") { skipEmptyProjection = value }
+        if let value = flag("reuse_frames") { reuseFrames = value }
+        if let value = override("stream_quads"), HeadsetQuirks.streamQuadChoices.contains(value) { streamQuads = value }
+        if let value = override("quad_distance").flatMap({ Float($0) }), (0.5...100).contains(value) { quadDistance = value }
         if let value = flag("head_velocity_from_poses") { headVelocityFromPoses = value }
         if let value = flag("controller_velocity_from_poses") { controllerVelocityFromPoses = value }
         if let value = override("video_range") {
@@ -262,6 +306,11 @@ public struct HeadsetQuirks: Equatable {
         Option(key: "undo_range_stretch", title: "Undo narrow-range stretch on video colors", kind: .flag),
         Option(key: "color_space", title: "Display color space", kind: .choice(colorSpaces)),
         Option(key: "layer_filter", title: "Compositor layer filter", kind: .choice(layerFilters)),
+        Option(key: "skip_empty_projection", title: "Skip projection layer when not streaming", kind: .flag),
+        Option(key: "stream_quads", title: "Submit stream as quad layers", kind: .choice(streamQuadChoices)),
+        Option(key: "quad_distance", title: "Quad layer distance (m)", kind: .number(0.5...100, step: 0.5)),
+        Option(key: "reuse_frames", title: "Reproject unchanged frames in compositor", kind: .flag),
+        Option(key: "blend_test", title: "Blend test (sharpness)", kind: .choice(blendTests)),
         Option(key: "video_range", title: "Video range", kind: .choice(["auto", "narrow", "full"])),
         Option(key: "compositor_places_layers", title: "Use compositor layer placement", kind: .flag),
         Option(key: "sharp_layer", title: "Sharp layer size (0 for none)", kind: .number(0...4096, step: 256)),
@@ -269,11 +318,13 @@ public struct HeadsetQuirks: Equatable {
         Option(key: "head_velocity_from_poses", title: "Compute head velocity from poses", kind: .flag),
         Option(key: "controller_velocity_from_poses", title: "Compute controller velocity from poses", kind: .flag),
         Option(key: "passthrough_layer", title: "Use passthrough composition layer", kind: .flag),
+        Option(key: "empty_top_layer", title: "Add transparent Android Surface overlay", kind: .flag),
         Option(key: "float_target", title: "Render to 16-bit float swapchains", kind: .flag),
         Option(key: "float_encoded", title: "Float swapchains expect sRGB-encoded values", kind: .flag),
         Option(key: "wait_for_gpu", title: "Wait for GPU fence before releasing frames", kind: .flag),
         Option(key: "decoder_low_latency", title: "Low-latency decoding", kind: .flag),
         Option(key: "sustained_performance", title: "Request sustained high performance", kind: .flag),
+        Option(key: "boost_gpu", title: "Request boost GPU performance level (experimental)", kind: .flag),
         Option(key: "lean_uplink", title: "Reduce uplink packet rate", kind: .flag),
     ]
 
@@ -288,6 +339,11 @@ public struct HeadsetQuirks: Equatable {
         case "undo_range_stretch": return flag(undoRangeStretch)
         case "color_space": return colorSpace
         case "layer_filter": return layerFilter
+        case "blend_test": return blendTest
+        case "skip_empty_projection": return flag(skipEmptyProjection)
+        case "stream_quads": return streamQuads
+        case "reuse_frames": return flag(reuseFrames)
+        case "quad_distance": return String(format: "%.1f", quadDistance)
         case "video_range": return videoRange?.rawValue ?? "auto"
         case "compositor_places_layers": return flag(compositorPlacesLayers)
         case "sharp_layer": return String(sharpLayerPixels)
@@ -295,11 +351,13 @@ public struct HeadsetQuirks: Equatable {
         case "head_velocity_from_poses": return flag(headVelocityFromPoses)
         case "controller_velocity_from_poses": return flag(controllerVelocityFromPoses)
         case "passthrough_layer": return flag(passthroughLayer)
+        case "empty_top_layer": return flag(emptyTopLayer)
         case "float_target": return flag(floatTarget)
         case "float_encoded": return flag(floatTargetIsEncoded)
         case "wait_for_gpu": return flag(waitForGPU)
         case "decoder_low_latency": return flag(decoderLowLatency)
         case "sustained_performance": return flag(sustainedPerformance)
+        case "boost_gpu": return flag(boostGPU)
         case "lean_uplink": return flag(leanUplink)
         default: return nil
         }
@@ -321,6 +379,7 @@ public struct HeadsetQuirks: Equatable {
             + ", sustained performance \(sustainedPerformance ? "on" : "off")" + (leanUplink ? ", lean uplink" : "")
             + (headVelocityFromPoses ? ", head velocity from poses" : "") + (controllerVelocityFromPoses ? ", controller velocity from poses" : "")
             + (compositorPlacesLayers ? "" : ", layers drawn for the current view only") + (passthroughLayer ? ", passthrough layer" : "")
+            + (emptyTopLayer ? ", surface overlay quad" : "")
             + (sharpLayerPixels == 0 ? ", no sharp layer" : ", sharp layer \(sharpLayerPixels), eye detail \(eyeDetail)")
             + (gripOffset.isNone ? "" : String(format: ", grip offset %.3f,%.3f,%.3f m %.1f,%.1f,%.1f deg", gripOffset.x, gripOffset.y,
                                                gripOffset.z, gripOffset.pitch, gripOffset.yaw, gripOffset.roll))

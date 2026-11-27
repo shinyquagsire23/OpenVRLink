@@ -58,7 +58,10 @@ private enum Provider {
                 Server.settings = nil
             },
             interface_versions: { _ in UnsafePointer(versions) },
-            run_frame: { _ in work() },
+            run_frame: { _ in
+                work()
+                if Server.settings != nil { Link.work(now: Platform.milliseconds()) }
+            },
             should_block_standby: { _ in false },
             enter_standby: { _ in },
             leave_standby: { _ in }))
@@ -98,11 +101,11 @@ private enum Provider {
         let gammaOn = Server.bool(Server.gammaOnKey, default: true)
         let headsets = Server.headsetsKnown()
         let gamma = Server.float(Server.gammaValueKey, default: Server.defaultGamma)
-        // Set in default.vrsettings when openvrlink-companion installs the bundled controller models.
-        let models = Server.bool(Server.playForDreamModelsKey, default: false)
+        // Combine the controllerModels bitmask from default.vrsettings with any sets converted during this session.
+        let models = UInt32(truncatingIfNeeded: max(0, Server.int(Server.controllerModelsKey, default: 0))) | Link.converted()
         Platform.lock()
         Shared.host?.available = (gammaAvailable ? Handshake.gammaFeature : 0) | (headsets ? Handshake.headsetFeature : 0)
-            | (models ? Handshake.playForDreamModelsFeature : 0)
+        Shared.host?.models = models
         Shared.host?.enabled = gammaOn ? Handshake.gammaFeature : 0
         Shared.host?.gamma = gamma
         Platform.unlock()

@@ -22,6 +22,12 @@ public protocol StreamDecoder: AnyObject {
     /// Resets decoder state before starting a new streaming session.
     func reset()
     func decode(_ frame: EncodedFrame)
+    /// Releases hardware decoder resources when a stream ends and ignores incoming frames until `reset()`.
+    func close()
+}
+
+extension StreamDecoder {
+    public func close() {}
 }
 
 /// Manages a streaming connection from host handshake and pairing through active frame decoding,
@@ -239,6 +245,7 @@ public final class StreamLink<Decoder: StreamDecoder> {
         frames.clear()
         guard let session else { return }
         session.stop(leaving: leaving)
+        decoder.close()
         onStopped?()
     }
 }

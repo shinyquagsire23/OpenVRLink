@@ -39,6 +39,19 @@ let usage = """
           Update openvrlink-companion from GitHub releases, or pass --check to only
           check whether a newer version is available.
 
+      openvrlink-companion import-models galaxy-xr LEFT.gltf RIGHT.gltf
+          Convert Samsung Galaxy XR controller glTF files into SteamVR render
+          models and install them into driver_openvrlink. Expects each .gltf file
+          to sit in the same directory as its .bin buffer and PNG textures.
+
+      openvrlink-companion import-models pending
+          Convert controller model files uploaded to driver_openvrlink over the
+          data link. driver_openvrlink runs this automatically after an upload.
+
+      openvrlink-companion convert-model GLTF OUT [--side left|right] [--name NAME]
+          Convert a controller glTF file and its adjacent .bin buffer and textures
+          into a SteamVR render model directory at OUT/NAME.
+
       openvrlink-companion check FILE
           Report which patches apply to a driver_vrlink.dll or driver_vrlink.so binary.
 
@@ -50,6 +63,7 @@ let usage = """
 struct Options {
     var steamVR: URL?, models: URL?, driver: URL?, version: String?, snapshot: URL?, icon: URL?
     var ownTab: Bool?, checkOnly = false
+    var side: String?, name: String?
     var rest: [String] = []
 
     init(_ arguments: [String]) throws {
@@ -69,6 +83,8 @@ struct Options {
             case "--own-tab": ownTab = true
             case "--vrlink-tab": ownTab = false
             case "--check": checkOnly = true
+            case "--side": side = try value()
+            case "--name": name = try value()
             case _ where argument.hasPrefix("--"): throw Failure("unknown option \(argument)")
             default: rest.append(argument)
             }
@@ -185,6 +201,7 @@ func run(_ arguments: [String]) throws {
     Console.attach()
     #endif
     let options = try Options(Array(arguments.dropFirst()))
+    Install.companionProgram = Machine.executable
     switch (command, options.rest.count) {
     case ("version", 0), ("--version", 0): print(Machine.version)
     case ("status", 0): status(try makeSetup(options))
@@ -211,6 +228,37 @@ func run(_ arguments: [String]) throws {
     case ("update", 0):
         Updater.clearLeftovers(patiently: false)
         try update(checkOnly: options.checkOnly)
+    case ("import-models", 1) where options.rest[0] == "pending":
+        // Invoked by driver_openvrlink after downloading controller models over the data link.
+        let setup = try makeSetup(options)
+        for folder in HeadsetModel.convertPending(inDriver: setup.folder(of: .driver)) {
+            print("Controller model installed to \(Steam.nativePath(folder))")
+        }
+    case ("import-models", 3) where options.rest[0] == "galaxy-xr":
+        let setup = try makeSetup(options)
+        let driver = setup.folder(of: .driver)
+        guard setup.state(of: .driver).kind != .notInstalled, setup.state(of: .driver).kind != .unavailable else {
+            throw Failure("install the driver first (openvrlink-companion install driver)")
+        }
+        for folder in try HeadsetModel.installGalaxyXR(left: URL(fileURLWithPath: options.rest[1]), right: URL(fileURLWithPath: options.rest[2]), toDriver: driver) {
+            print("Controller model installed to \(Steam.nativePath(folder))")
+        }
+        print("Restart SteamVR for the changes to take effect.")
+    case ("convert-model", 2):
+        let source = URL(fileURLWithPath: options.rest[0])
+        let gltf = try Data(contentsOf: source)
+        var files: [String: Data] = [:]
+        for file in GLTFControllerModel.references(of: gltf) {
+            files[file] = try? Data(contentsOf: source.deletingLastPathComponent().appendingPathComponent(file))
+        }
+        let left = options.side.map { $0 == "left" } ?? source.lastPathComponent.lowercased().contains("left")
+        let name = options.name ?? "controller_\(left ? "left" : "right")"
+        let folder = URL(fileURLWithPath: options.rest[1]).appendingPathComponent(name)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        for file in try GLTFControllerModel.convert(gltf: gltf, files: files, side: left ? .left : .right, name: name) {
+            try file.data.write(to: folder.appendingPathComponent(file.path))
+            print("\(file.path): \(file.data.count) bytes")
+        }
     case ("check", 1): try check(URL(fileURLWithPath: options.rest[0]))
     case ("patch-shader", 2): try patchShader(from: URL(fileURLWithPath: options.rest[0]), to: URL(fileURLWithPath: options.rest[1]))
     #if os(Windows)

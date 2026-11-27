@@ -38,4 +38,13 @@ static inline uint16_t ovrl_xr_version_major(XrVersion version) { return (uint16
 static inline uint16_t ovrl_xr_version_minor(XrVersion version) { return (uint16_t)XR_VERSION_MINOR(version); }
 static inline uint32_t ovrl_xr_version_patch(XrVersion version) { return (uint32_t)XR_VERSION_PATCH(version); }
 
+#if defined(__ANDROID__)
+// Acquires and returns a retained `ANativeWindow` for the Java `Surface` from an Android Surface swapchain,
+// or NULL on failure. Releases `surface` if it is a JNI local reference.
+void *ovrl_xr_window(void *java_vm, jobject surface);
+// Posts a single transparent RGBA buffer of the given dimensions to the window. Returns 0 on success.
+int ovrl_xr_fill_window(void *window, int32_t width, int32_t height);
+void ovrl_xr_release_window(void *window);
+#endif
+
 #endif

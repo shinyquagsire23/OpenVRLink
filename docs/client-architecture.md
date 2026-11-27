@@ -744,6 +744,12 @@ MediaCodec do not report. Defaults follow ALVR's OpenXR client:
 | `decoderLowLatency` | on | Enables the Android 11 `low-latency` key and Qualcomm's vendor low-latency extension. |
 | `gripOffset` | per-headset (from ALVR) | Local transform `(x, y, z, pitch, yaw, roll)` applied to the left controller grip pose (and mirrored for the right) so non-Quest controllers align with the Quest Touch profile reported to the host. Computed by composing ALVR's per-headset offset with the inverse of ALVR's Quest offset (`get_controller_offset` in `alvr/client_openxr/src/interaction.rs`); on Galaxy XR this shifts the grip 5.5 cm back along +Z with +15 deg of pitch. |
 | `waitForGPU` | on | Waits on the frame's GPU fence before releasing swapchain images to the OpenXR runtime. |
+| `emptyTopLayer` | off (on for Galaxy XR) | Submits a 1 mm transparent quad 1 m ahead in view space on top of all other layers, backed by a 2 x 2 Android `Surface` swapchain (`XR_KHR_android_surface_swapchain`, which Galaxy XR enables even though it does not list the extension). On Galaxy XR, the compositor downscales projection layers unless the frame includes an Android `Surface` layer such as the system menu. Adding this quad keeps opaque streams sharp on Galaxy XR, though the compositor still downscales frames during passthrough. Angelo Pascuzzi's `xr-porting-hub` Steam Link patches use the same workaround. |
+| `skipEmptyProjection` | off (on for Galaxy XR) | Omits the projection layer when no video stream is active. On Galaxy XR, submitting a projection layer while passthrough is visible causes the compositor to downscale every layer, including the UI panel. Submitting only the panel's quad layer when idle keeps the UI sharp. |
+| `streamQuads` | `never` (`room` on Galaxy XR) | Submits video views as per-eye `XrCompositionLayerQuad` layers instead of projection layers. Can be set to `never`, `always`, or `room` (which uses quads only while passthrough is visible to avoid Galaxy XR's projection-layer downscaling). Each quad is placed where the view frustum intersects a plane `quadDistance` meters in front of the eye. |
+| `quadDistance` | 50 | Distance in meters from the eye to the quad plane used by `streamQuads`. Placing the quads at 50 m makes compositor reprojection behave nearly like a projection layer and avoids the translational judder seen on Galaxy XR at closer distances like `vrlink`'s ~2 m. |
+| `reuseFrames` | on | When no new video frame has arrived on a display refresh, resubmits the previously rendered swapchain images and poses for the compositor to reproject (disabled when `compositorPlacesLayers` is off). Because compositor reprojection is rotation-only, `XRDisplay` re-renders every refresh while stereo depth warping is active to avoid translational judder, falling back to frame reuse if GPU draw time exceeds 60% of the refresh period until it drops back below 40%. When off, `XRDisplay` re-renders every refresh. |
+| `blendTest` | `none` | Overrides the environment blend mode and layer alpha flags to test compositor downscaling during passthrough on Galaxy XR. Setting `env` uses alpha-blend environment mode on opaque frames, `flag` sets the source-alpha blend flag on opaque layers, and `both` turns on both overrides. Setting `no_env` keeps opaque environment mode on transparent frames, and `no_flag` clears the source-alpha blend flag on transparent layers. |
 | `sharpLayerPixels` | 2048 | Width and height in pixels of the secondary per-eye swapchain used for the high-density foveal layer (see [Sharp layer](#sharp-layer)); 0 disables the second layer. |
 | `eyeDetail` | 1.4 (1.9 on Galaxy XR) | Ratio of the display's center pixel density to the runtime's recommended eye swapchain size. Multiplied into the eye resolution reported to WiVRn hosts when the sharp layer is active so WiVRn enables foveation. |
 | `sustainedPerformance` | on | Requests sustained high CPU and GPU performance levels via `XR_EXT_performance_settings` when the OpenXR session starts. |
@@ -754,9 +760,12 @@ MediaCodec do not report. Defaults follow ALVR's OpenXR client:
 
 On Android, the in-headset panel's Quirks tab exposes most of these settings
 (`HeadsetQuirks.options`) initialized to the detected headset's defaults and
-persists user changes in `Settings.quirkOverrides`. At startup, OpenVRLink
-applies the headset defaults, then saved panel overrides, and finally any
-`debug.openvrlink.*` system properties.
+persists user changes in `Settings.quirkOverrides`. Changes to `emptyTopLayer`,
+`skipEmptyProjection`, `streamQuads`, `quadDistance`, `reuseFrames`, and
+`blendTest` take effect immediately; other quirks apply the next time an
+immersive session starts. At session startup, OpenVRLink applies the headset
+defaults, then saved panel overrides, and finally any `debug.openvrlink.*`
+system properties.
 
 You can override any of these without rebuilding by setting
 `debug.openvrlink.*` system properties before launching the app. Active values
