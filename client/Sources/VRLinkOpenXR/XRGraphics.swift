@@ -12,6 +12,9 @@ public struct XRSwapchain {
     /// Native pixel format enum value (such as `MTLPixelFormat` or `VkFormat`) selected by `XRGraphics.chooseFormat`.
     public var format: Int64
     public var width: Int, height: Int
+    /// True if the swapchain was created with `XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT`, allowing image views with
+    /// a different compatible format (such as UNORM views of an sRGB swapchain).
+    public var mutableFormat = false
 }
 
 /// Layer composition options from `HeadsetQuirks` that can be updated per frame from the panel.
@@ -21,6 +24,8 @@ public struct XRLayerChoices: Equatable {
     public var skipEmptyProjection = false
     public var streamQuads = "never", quadDistance: Float = 50
     public var reuseFrames = true
+    /// Keep rendering the sharp layer while the stream is transparent (during room view or chroma keying).
+    public var sharpWhenTransparent = true
 
     public init() {}
 }
@@ -57,6 +62,7 @@ public struct XREyeDraw {
 /// `Frame` textures.
 extension XRGraphics {
     public var supportsHostChromaKey: Bool { false }
+    public var wantsMutableFormat: Bool { false }
     public var lastDrawSteps: [(name: String, nanoseconds: UInt64)] { [] }
 }
 
@@ -72,6 +78,10 @@ public protocol XRGraphics: AnyObject {
 
     /// Invokes `body` with a pointer to the API-specific `XrGraphicsBinding*` struct for `xrCreateSession`.
     func withSessionBinding<Result>(_ body: (UnsafeRawPointer) throws -> Result) throws -> Result
+
+    /// Requests `XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT` when creating eye swapchains. Check
+    /// `XRSwapchain.mutableFormat` in `adopt` to see whether the runtime accepted the flag.
+    var wantsMutableFormat: Bool { get }
 
     /// Selects a supported swapchain pixel format from the runtime's ordered format list.
     func chooseFormat(among offered: [Int64]) -> Int64?

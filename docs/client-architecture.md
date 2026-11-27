@@ -733,6 +733,8 @@ MediaCodec do not report. Defaults follow ALVR's OpenXR client:
 |---|---|---|
 | `floatTarget` | off | Render to `R16G16B16A16_SFLOAT` swapchains when offered. Off by default because the video stream is 8-bit and 8-bit sRGB swapchains behave consistently across runtimes. |
 | `floatTargetIsEncoded` | on for Pico and Galaxy XR | Whether the compositor treats a float swapchain as sRGB-encoded rather than linear, which OpenXR leaves unspecified. |
+| `encodedTarget` | off (on for Quest headsets) | Renders to sRGB swapchains through 8-bit UNORM image views (`XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT`) so the fragment shader writes sRGB-encoded values directly instead of converting each pixel to linear light for the GPU to re-encode. Alpha blending then operates on sRGB-encoded values. Falls back to standard sRGB views if the runtime rejects mutable-format swapchains (`debug.openvrlink.encoded_target`). |
+| `sharpWhenTransparent` | on (off for Quest Pro) | Keeps rendering the sharp foveal layer while the stream is transparent during room view or chroma keying. Chroma keying adds per-pixel shader cost and passthrough adds compositor GPU overhead, which prevents Quest Pro from maintaining 90 Hz when both are enabled (`debug.openvrlink.sharp_when_transparent`). |
 | `videoRange` | as reported by decoder | Overrides narrow or full YCbCr range conversion for decoders that misreport color range. |
 | `measureColors` | on | Probes the video decode and Y'CbCr sampling path at startup with `ColorProbe` and applies an inverse 3x4 color matrix in `quad.frag` (see [Probing the video color pipeline](#probing-the-video-color-pipeline)). When disabled or when the probe matches no known behavior, the renderer falls back to `shaderColorConversion` and `undoRangeStretch`. |
 | `shaderColorConversion` | off | Configures the Vulkan sampler with `RGB_IDENTITY` and converts Y'CbCr to RGB (full-range BT.2020, non-constant luminance) in `quad.frag` instead of using the GPU driver's Y'CbCr conversion. |
@@ -743,7 +745,7 @@ MediaCodec do not report. Defaults follow ALVR's OpenXR client:
 | `decoderWidth`, `decoderHeight` | 2048 x 2048 | Initial decoder dimensions used when parameter sets are not parsed beforehand (currently AV1). `PictureSize` parses H.264 and HEVC dimensions from the SPS. |
 | `decoderLowLatency` | on | Enables the Android 11 `low-latency` key and Qualcomm's vendor low-latency extension. |
 | `gripOffset` | per-headset (from ALVR) | Local transform `(x, y, z, pitch, yaw, roll)` applied to the left controller grip pose (and mirrored for the right) so non-Quest controllers align with the Quest Touch profile reported to the host. Computed by composing ALVR's per-headset offset with the inverse of ALVR's Quest offset (`get_controller_offset` in `alvr/client_openxr/src/interaction.rs`); on Galaxy XR this shifts the grip 5.5 cm back along +Z with +15 deg of pitch. |
-| `waitForGPU` | on | Waits on the frame's GPU fence before releasing swapchain images to the OpenXR runtime. |
+| `waitForGPU` | on (off for Quest headsets and Galaxy XR) | Waits on the frame's GPU fence before releasing swapchain images to the OpenXR runtime. When disabled, the renderer triple-buffers per-frame Vulkan resources so the CPU can prepare the next frame while the GPU is still rendering the current one. On Quest Pro in 90 Hz room view, disabling this raised the frame rate from 65-75 fps to 89-90 fps while adding 3-4 ms of predicted latency (`debug.openvrlink.wait_for_gpu`). |
 | `emptyTopLayer` | off (on for Galaxy XR) | Submits a 1 mm transparent quad 1 m ahead in view space on top of all other layers, backed by a 2 x 2 Android `Surface` swapchain (`XR_KHR_android_surface_swapchain`, which Galaxy XR enables even though it does not list the extension). On Galaxy XR, the compositor downscales projection layers unless the frame includes an Android `Surface` layer such as the system menu. Adding this quad keeps opaque streams sharp on Galaxy XR, though the compositor still downscales frames during passthrough. Angelo Pascuzzi's `xr-porting-hub` Steam Link patches use the same workaround. |
 | `skipEmptyProjection` | off (on for Galaxy XR) | Omits the projection layer when no video stream is active. On Galaxy XR, submitting a projection layer while passthrough is visible causes the compositor to downscale every layer, including the UI panel. Submitting only the panel's quad layer when idle keeps the UI sharp. |
 | `streamQuads` | `never` (`room` on Galaxy XR) | Submits video views as per-eye `XrCompositionLayerQuad` layers instead of projection layers. Can be set to `never`, `always`, or `room` (which uses quads only while passthrough is visible to avoid Galaxy XR's projection-layer downscaling). Each quad is placed where the view frustum intersects a plane `quadDistance` meters in front of the eye. |
@@ -761,8 +763,8 @@ MediaCodec do not report. Defaults follow ALVR's OpenXR client:
 On Android, the in-headset panel's Quirks tab exposes most of these settings
 (`HeadsetQuirks.options`) initialized to the detected headset's defaults and
 persists user changes in `Settings.quirkOverrides`. Changes to `emptyTopLayer`,
-`skipEmptyProjection`, `streamQuads`, `quadDistance`, `reuseFrames`, and
-`blendTest` take effect immediately; other quirks apply the next time an
+`skipEmptyProjection`, `streamQuads`, `quadDistance`, `reuseFrames`,
+`sharpWhenTransparent`, and `blendTest` take effect immediately; other quirks apply the next time an
 immersive session starts. At session startup, OpenVRLink applies the headset
 defaults, then saved panel overrides, and finally any `debug.openvrlink.*`
 system properties.

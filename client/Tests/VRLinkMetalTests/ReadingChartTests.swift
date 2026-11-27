@@ -58,7 +58,8 @@ final class ReadingChartTests: XCTestCase {
     /// Draws the chart with `QuadRenderer` into a 256x128 BGRA target and returns its bytes.
     private func drawn(_ chart: DecodedFrame, colorFormat: MTLPixelFormat = .bgra8Unorm) throws -> [UInt8] {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        let renderer = try XCTUnwrap(QuadRenderer(device: device, colorFormat: colorFormat))
+        // Pass linearOutput: true for sRGB targets to match the visionOS compositor path.
+        let renderer = try XCTUnwrap(QuadRenderer(device: device, colorFormat: colorFormat, linearOutput: colorFormat == .bgra8Unorm_srgb))
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: colorFormat, width: 256, height: 128, mipmapped: false)
         descriptor.usage = [.renderTarget]
         let target = try XCTUnwrap(device.makeTexture(descriptor: descriptor))
@@ -90,8 +91,16 @@ final class ReadingChartTests: XCTestCase {
         for format in [MTLPixelFormat.bgra8Unorm, .bgra8Unorm_srgb] {
             let before = try drawn(plain, colorFormat: format), after = try drawn(brightened, colorFormat: format)
             // An sRGB render target re-encodes linear output to sRGB bytes, so both pixel formats produce matching byte values.
+            // Only compare pixels in flat regions away from sharp edges. On a linear target, bilinear texture
+            // filtering happens in sRGB space when encoding gamma is active and in linear light when it is not, so
+            // edge pixels interpolate slightly differently.
+            func flat(_ pixel: Int) -> Bool {
+                [-4, 4, -256 * 4, 256 * 4].allSatisfy { step in
+                    before.indices.contains(pixel + step + 1) && abs(Int(before[pixel + step + 1]) - Int(before[pixel + 1])) <= 24
+                }
+            }
             var checked = 0
-            for pixel in stride(from: 0, to: before.count, by: 4 * 97) where before[pixel + 1] > 24 {
+            for pixel in stride(from: 0, to: before.count, by: 4 * 97) where before[pixel + 1] > 24 && flat(pixel) {
                 let value = Double(before[pixel + 1]) / 255
                 XCTAssertEqual(Double(after[pixel + 1]) / 255, value * value, accuracy: 0.03, "\(format) at byte \(pixel)")
                 checked += 1

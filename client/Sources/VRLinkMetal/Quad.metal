@@ -37,103 +37,160 @@ vertex Fragment vertexMain(uint index [[vertex_id]], ushort eye [[amplification_
     return out;
 }
 
-// The atlas texture has a YCbCr pixel format whose sampler returns RGB,
-// so there is no color conversion here.
-// keyColor is in the same light as the sampled picture; keyRange is
-// the near and far blend distances.
-// hasAlpha: the frame has a picture of transparency (not zero), or is opaque.
-// gamma is FrameLayout.encodingGamma (1 means no gamma adjustment).
-// linearLight is non-zero when the atlas texture is sampled as linear light rather than sRGB.
-// keyColor.a is 2 for host chroma keying (hostKeyed): keyColor.rgb holds the key color (0 or 1 per channel)
-// and keyRange holds (noiseFloor, dimOpacity).
+// The atlas texture uses a hardware YCbCr pixel format whose sampler outputs RGB directly.
+// For client chroma keying, keyColor is in the render target's color space (linear or sRGB-encoded) and
+// keyRange holds the (near, far) HSV distance thresholds.
+// When keyColor.a == 2 (hostKeyed), keyColor.rgb holds the host key color (0 or 1 per channel) and
+// keyRange holds (noiseFloor, dimOpacity).
+// The hasAlpha, gamma, and linearLight fields are kept for layout compatibility; the shader reads the
+// function constants HAS_ALPHA, GAMMA, and TARGET_LINEAR instead.
 struct QuadStyle { float feather; float hasAlpha; float gamma; float linearLight; float4 fill; float4 keyColor; float2 keyRange; };
 
-float3 linearFromSRGB(float3 c) {
-    return mix(c / 12.92, pow(max((c + 0.055) / 1.055, 0.0), float3(2.4)), float3(c >= 0.04045));
+// Settings that stay constant across frames are specialized via function constants (QuadRenderer.pipeline) so the
+// Metal compiler can eliminate unused branches and fold constant math. Client chroma-key colors and thresholds are
+// still passed per draw in QuadStyle so users can adjust them live.
+// True when client HSV chroma keying is enabled.
+constant bool CHROMAKEY_ENABLED [[ function_constant(0) ]];
+// Host encoding gamma from FrameLayout.encodingGamma (1.0 means no adjustment).
+constant float GAMMA [[ function_constant(1) ]];
+// True when the atlas texture uses an sRGB pixel format and returns linear light on sample (used only when
+// encoding gamma and host chroma keying are both inactive).
+constant bool SAMPLED_LINEAR [[ function_constant(2) ]];
+// True when the render target expects linear-light RGB output.
+constant bool TARGET_LINEAR [[ function_constant(3) ]];
+// True when the frame includes a separate alpha texture plane.
+constant bool HAS_ALPHA [[ function_constant(4) ]];
+// True when SteamVR host chroma keying is active for this draw.
+constant bool HOST_KEY [[ function_constant(5) ]];
+// True when quad edges are feathered using style.feather.
+constant bool FEATHERED [[ function_constant(6) ]];
+
+// Color math uses half precision, which has enough precision for 8- and 10-bit video and runs faster on Apple GPUs.
+// Texture coordinates and texel positions stay in 32-bit float.
+half3 linearFromSRGB(half3 c) {
+    return mix(c / 12.92h, pow(max((c + 0.055h) / 1.055h, 0.0h), half3(2.4h)), half3(c >= 0.04045h));
 }
 
-float3 srgbFromLinear(float3 c) {
-    return mix(c * 12.92, 1.055 * pow(abs(c), float3(1.0 / 2.4)) - 0.055, float3(c >= 0.0031308));
+half3 srgbFromLinear(half3 c) {
+    return mix(c * 12.92h, 1.055h * pow(abs(c), half3(1.0h / 2.4h)) - 0.055h, half3(c >= 0.0031308h));
+}
+
+// Fast polynomial approximations of the sRGB transfer functions that avoid pow(). `linearNear` is accurate to
+// within 0.002, and `srgbNear` is within 0.01 (with the largest error in deep shadows). Host chroma-key edge
+// pixels perform around a dozen transfer conversions per pixel, making exact pow() calls the main bottleneck.
+// Opaque scene pixels bypass this path, so approximation error only affects blended key edges.
+half linearNear(half encoded) {
+    return encoded * (encoded * (encoded * 0.305306011h + 0.682171111h) + 0.012522878h);
+}
+
+half3 linearNear(half3 encoded) {
+    return encoded * (encoded * (encoded * 0.305306011h + 0.682171111h) + 0.012522878h);
+}
+
+half srgbNear(half c) {
+    half root = sqrt(c), fourth = sqrt(root), eighth = sqrt(fourth);
+    return max(0.585122381h * root + 0.783140355h * fourth - 0.368262736h * eighth, 0.0h);
+}
+
+half3 srgbNear(half3 c) {
+    half3 root = sqrt(c), fourth = sqrt(root), eighth = sqrt(fourth);
+    return max(0.585122381h * root + 0.783140355h * fourth - 0.368262736h * eighth, 0.0h);
+}
+
+// Inverts the host's v^(1/gamma) encoding used to preserve shadow detail, using fast paths for gamma 2.0 and 1.5
+// to avoid pow().
+half3 hostGammaUndone(half3 v) {
+    if (GAMMA == 2.0) {
+        return v * v;
+    }
+    if (GAMMA == 1.5) {
+        return v * sqrt(v);
+    }
+    return GAMMA > 1.0 ? pow(v, half3(GAMMA)) : v;
 }
 
 // Host chroma-key shader ported from libvrlink_scene.so (matching hostKeyed in VRLinkVulkan/Shaders/quad.frag).
 // Makes the host's key color transparent, despills blended edge pixels, and samples 2x2 chroma blocks to
-// distinguish edges against the key from similarly colored scene content.
+// distinguish edges against the key from similarly colored scene content. Host-keyed frames are always sampled as
+// sRGB-encoded values (SAMPLED_LINEAR is false) because keying operates in encoded space.
 
 // Key fractions at or above this threshold are treated as fully transparent.
-constant float hostKeyFull = 0.85;
+constant half hostKeyFull = 0.85h;
+
+// Converts sampled sRGB to BT.709 Y'CbCr.
+half3 hostKeyYCbCr(half3 rgb) {
+    half y = dot(rgb, half3(0.2126h, 0.7152h, 0.0722h));
+    return half3(y, (rgb.b - y) / 1.8556h + 128.0h / 255.0h, (rgb.r - y) / 1.5748h + 128.0h / 255.0h);
+}
+
+// Encoding gamma leaves primary and secondary key colors (0 or 1 per channel) unchanged.
+half3 hostKeyGamma(half3 rgb) {
+    return GAMMA > 1.0 ? hostGammaUndone(saturate(rgb)) : rgb;
+}
+
+// Explicitly sample mip level 0. Video textures are single-mip, and Metal disallows implicit-LOD sampling (which
+// computes screen-space derivatives across quad neighbors) inside divergent edge-processing branches.
+half3 hostKeySample(texture2d<float> picture, sampler pictureSampler, float2 st) {
+    return half3(picture.sample(pictureSampler, st, level(0)).rgb);
+}
 
 // Samples the texture and reconstructs BT.709 Y'CbCr alongside gamma-decoded sRGB.
-void hostKeyTap(texture2d<float> picture, sampler pictureSampler, float2 st, QuadStyle style,
-                thread float3 &yCbCr, thread float3 &rgbGamma) {
-    float3 rgb = picture.sample(pictureSampler, st).rgb;
-    if (style.linearLight != 0.0) {
-        rgb = srgbFromLinear(saturate(rgb));
-    }
-    float y = dot(rgb, float3(0.2126, 0.7152, 0.0722));
-    yCbCr = float3(y, (rgb.b - y) / 1.8556 + 128.0 / 255.0, (rgb.r - y) / 1.5748 + 128.0 / 255.0);
-    // Encoding gamma leaves primary and secondary key colors (0 or 1 per channel) unchanged.
-    rgbGamma = style.gamma > 1.0 ? pow(saturate(rgb), float3(style.gamma)) : rgb;
+void hostKeyTap(texture2d<float> picture, sampler pictureSampler, float2 st, thread half3 &yCbCr, thread half3 &rgbGamma) {
+    half3 rgb = hostKeySample(picture, pictureSampler, st);
+    yCbCr = hostKeyYCbCr(rgb);
+    rgbGamma = hostKeyGamma(rgb);
 }
 
-float hostKeyFraction(float3 cLinear, float3 kLinear) {
-    float3 onMask = step(0.5, kLinear);
-    float3 onRatio = mix(float3(1.0), cLinear / max(kLinear, 0.001), onMask);
-    float3 offValue = cLinear * (1.0 - onMask);
-    return saturate(min(onRatio.r, min(onRatio.g, onRatio.b)) - max(offValue.r, max(offValue.g, offValue.b)));
+half hostKeyShare(half2 cbCr, half2 keyCbCr) {
+    half2 key = keyCbCr - 0.5h;
+    return saturate(dot(cbCr - 0.5h, key) / max(dot(key, key), 0.001h));
 }
 
-float hostKeyShare(float2 cbCr, float2 keyCbCr) {
-    float2 key = keyCbCr - 0.5;
-    return saturate(dot(cbCr - 0.5, key) / max(dot(key, key), 0.001));
+half hostKeyShareAt(texture2d<float> picture, sampler pictureSampler, float2 st, half3 keyYCbCr) {
+    return hostKeyShare(hostKeyYCbCr(hostKeySample(picture, pictureSampler, st)).yz, keyYCbCr.yz);
 }
 
-float hostKeyShareAt(texture2d<float> picture, sampler pictureSampler, float2 st, QuadStyle style, float3 keyYCbCr) {
-    float3 yCbCr, rgbGamma;
-    hostKeyTap(picture, pictureSampler, st, style, yCbCr, rgbGamma);
-    return hostKeyShare(yCbCr.yz, keyYCbCr.yz);
+half hostKeyExcess(half3 cGamma, half3 kLinear, half noise) {
+    half3 onMask = step(0.5h, kLinear);
+    half3 onLevel = mix(half3(1.0h), cGamma, onMask);
+    half3 offLevel = cGamma * (1.0h - onMask);
+    half onGamma = min(onLevel.r, min(onLevel.g, onLevel.b));
+    half offLinear = linearNear(saturate(max(offLevel.r, max(offLevel.g, offLevel.b))));
+    return onGamma - srgbNear(min(offLinear + 0.5h * noise, 1.0h));
 }
 
-float hostKeyExcess(float3 cGamma, float3 kLinear, float noise) {
-    float3 onMask = step(0.5, kLinear);
-    float3 onLevel = mix(float3(1.0), cGamma, onMask);
-    float3 offLevel = cGamma * (1.0 - onMask);
-    float onGamma = min(onLevel.r, min(onLevel.g, onLevel.b));
-    float offLinear = linearFromSRGB(float3(max(offLevel.r, max(offLevel.g, offLevel.b)))).x;
-    return onGamma - srgbFromLinear(float3(min(offLinear + 0.5 * noise, 1.0))).x;
+// Returns premultiplied linear-light RGB and alpha. Sets `unchanged` when the pixel remains fully opaque with
+// zero key spill removed.
+half4 hostKeyUnmix(half3 cLinear, half3 kLinear, half keyFraction, half bleed, half cameraSide, half noise,
+                   thread bool &unchanged) {
+    half rampStart = min(1.5h * noise, hostKeyFull - 0.1h);
+    half rampOpacity = 1.0h - saturate((keyFraction - rampStart) / max(hostKeyFull - rampStart, 0.001h));
+    half a = mix(rampOpacity, 1.0h - keyFraction, cameraSide);
+    half allowance = keyFraction * (1.0h - smoothstep(noise, rampStart, keyFraction));
+    half contentKeyness = allowance * (1.0h - bleed) * (1.0h - cameraSide);
+    half removed = max(keyFraction - contentKeyness, 0.0h);
+    unchanged = a >= 1.0h && removed <= 0.0h;
+    half3 premulLinear = max(cLinear - kLinear * removed, 0.0h);
+    half3 s = saturate(premulLinear / mix(max(a, 0.001h), 1.0h, cameraSide));
+    return half4(s * a, a);
 }
 
-// Returns rgb premultiplied in linear light, and alpha.
-float4 hostKeyUnmix(float3 cLinear, float3 kLinear, float keyFraction, float bleed, float cameraSide, float noise) {
-    float rampStart = min(1.5 * noise, hostKeyFull - 0.1);
-    float rampOpacity = 1.0 - saturate((keyFraction - rampStart) / max(hostKeyFull - rampStart, 0.001));
-    float a = mix(rampOpacity, 1.0 - keyFraction, cameraSide);
-    float allowance = keyFraction * (1.0 - smoothstep(noise, rampStart, keyFraction));
-    float contentKeyness = allowance * (1.0 - bleed) * (1.0 - cameraSide);
-    float3 premulLinear = max(cLinear - kLinear * max(keyFraction - contentKeyness, 0.0), 0.0);
-    float3 s = saturate(premulLinear / mix(max(a, 0.001), 1.0, cameraSide));
-    return float4(s * a, a);
-}
-
-// Returns rgb premultiplied in linear light, and alpha.
-float4 hostKeyed(texture2d<float> picture, sampler pictureSampler, float2 st, QuadStyle style) {
-    float3 yCbCr, rgbGamma;
-    hostKeyTap(picture, pictureSampler, st, style, yCbCr, rgbGamma);
-
-    float3 k = style.keyColor.rgb;
-    float noise = style.keyRange.x;
-    float3 onMask = step(0.5, k);
-    float3 on = mix(float3(1.0), rgbGamma, onMask);
-    float3 off = rgbGamma * (1.0 - onMask);
-    float3 c = linearFromSRGB(saturate(rgbGamma));
-    if (min(on.r, min(on.g, on.b)) - max(off.r, max(off.g, off.b)) <= 1.5 / 255.0) {
-        return float4(c, 1.0);
-    }
-
-    float keyFraction = hostKeyFraction(c, k);
+// Despills and computes alpha for edge pixels that mix scene content with the key color, returning premultiplied
+// linear-light RGB and alpha. Scene pixels that happen to have a tint near the key color also enter this path,
+// and most set `unchanged` so the caller can output the original sampled color directly.
+half4 hostKeyEdge(texture2d<float> picture, sampler pictureSampler, float2 st, QuadStyle style, half3 raw, half3 encoded,
+                  half least, half most, thread bool &unchanged) {
+    unchanged = false;
+    half3 k = half3(style.keyColor.rgb);
+    half noise = half(style.keyRange.x);
+    // Estimate the linear-light key fraction as the minimum active key channel minus the maximum inactive channel.
+    // Because the sRGB transfer curve is monotonic, we can take min/max before linearizing.
+    half keyFraction = saturate(linearNear(saturate(least)) - linearNear(saturate(most)));
     if (keyFraction >= hostKeyFull) {
-        return float4(0.0);
+        return half4(0.0h);
     }
+    half3 c = linearNear(encoded);
+    half3 yCbCr = hostKeyYCbCr(raw);
 
     // Sample the current 2x2 chroma block and the neighboring block on the opposite side in X and Y.
     float2 size = float2(picture.get_width(), picture.get_height());
@@ -142,54 +199,62 @@ float4 hostKeyed(texture2d<float> picture, sampler pictureSampler, float2 st, Qu
     float2 lower = step(part, float2(0.5));
     float2 own = texel - 2.0 * part + 2.0 * (1.0 - lower);
     float2 far = texel - 2.0 * part + 2.0 * lower;
-    float keyY = dot(k, float3(0.2126, 0.7152, 0.0722));
-    float3 keyYCbCr = float3(keyY, (k.b - keyY) / 1.8556 + 128.0 / 255.0, (k.r - keyY) / 1.5748 + 128.0 / 255.0);
-    float3 ownYCbCr, ownGamma, farXYCbCr, farXGamma, farYYCbCr, farYGamma;
-    hostKeyTap(picture, pictureSampler, own / size, style, ownYCbCr, ownGamma);
-    hostKeyTap(picture, pictureSampler, float2(far.x, texel.y) / size, style, farXYCbCr, farXGamma);
-    hostKeyTap(picture, pictureSampler, float2(texel.x, far.y) / size, style, farYYCbCr, farYGamma);
-    float ownShare = hostKeyShare(ownYCbCr.yz, keyYCbCr.yz);
-    float farShare = max(hostKeyShare(farXYCbCr.yz, keyYCbCr.yz), hostKeyShare(farYYCbCr.yz, keyYCbCr.yz));
+    half3 keyYCbCr = hostKeyYCbCr(k);
+    half3 ownYCbCr, ownGamma, farXYCbCr, farXGamma, farYYCbCr, farYGamma;
+    hostKeyTap(picture, pictureSampler, own / size, ownYCbCr, ownGamma);
+    hostKeyTap(picture, pictureSampler, float2(far.x, texel.y) / size, farXYCbCr, farXGamma);
+    hostKeyTap(picture, pictureSampler, float2(texel.x, far.y) / size, farYYCbCr, farYGamma);
+    half ownShare = hostKeyShare(ownYCbCr.yz, keyYCbCr.yz);
+    half farShare = max(hostKeyShare(farXYCbCr.yz, keyYCbCr.yz), hostKeyShare(farYYCbCr.yz, keyYCbCr.yz));
 
-    float blockHoldsKey = saturate((ownShare - 0.15) / 0.1);
-    float cameraSide = blockHoldsKey * saturate((max(ownShare, farShare) - 0.75) / 0.25);
+    half blockHoldsKey = saturate((ownShare - 0.15h) / 0.1h);
+    half cameraSide = blockHoldsKey * saturate((max(ownShare, farShare) - 0.75h) / 0.25h);
 
-    float keyBeside = saturate((max(ownShare, farShare) - 0.7) / 0.2);
-    float keyTexel = keyBeside * (1.0 - smoothstep(0.03, 0.1, abs(yCbCr.x - keyYCbCr.x)));
+    half keyBeside = saturate((max(ownShare, farShare) - 0.7h) / 0.2h);
+    half keyTexel = keyBeside * (1.0h - smoothstep(0.03h, 0.1h, abs(yCbCr.x - keyYCbCr.x)));
 
-    float keyBeyondBlock = 0.0;
-    if (ownShare > 0.15) {
+    half keyBeyondBlock = 0.0h;
+    if (ownShare > 0.15h) {
         float2 beyond = 2.0 * own - far;
-        float beyondShare = max(hostKeyShareAt(picture, pictureSampler, float2(beyond.x, texel.y) / size, style, keyYCbCr),
-                                hostKeyShareAt(picture, pictureSampler, float2(texel.x, beyond.y) / size, style, keyYCbCr));
-        keyBeyondBlock = blockHoldsKey * saturate((beyondShare - 0.7) / 0.2);
+        half beyondShare = max(hostKeyShareAt(picture, pictureSampler, float2(beyond.x, texel.y) / size, keyYCbCr),
+                               hostKeyShareAt(picture, pictureSampler, float2(texel.x, beyond.y) / size, keyYCbCr));
+        keyBeyondBlock = blockHoldsKey * saturate((beyondShare - 0.7h) / 0.2h);
     }
 
-    float excess = max(hostKeyExcess(ownGamma, k, noise), max(hostKeyExcess(farXGamma, k, noise), hostKeyExcess(farYGamma, k, noise)));
-    float bleed = max(saturate((excess - 0.18) / 0.1), keyBeyondBlock);
+    half excess = max(hostKeyExcess(ownGamma, k, noise), max(hostKeyExcess(farXGamma, k, noise), hostKeyExcess(farYGamma, k, noise)));
+    half bleed = max(saturate((excess - 0.18h) / 0.1h), keyBeyondBlock);
 
-    return hostKeyUnmix(c, k, keyFraction, bleed, cameraSide, noise) * (1.0 - keyTexel);
+    half4 unmixed = hostKeyUnmix(c, k, keyFraction, bleed, cameraSide, noise, unchanged);
+    unchanged = unchanged && keyTexel <= 0.0h;
+    return unchanged ? half4(0.0h, 0.0h, 0.0h, 1.0h) : unmixed * (1.0h - keyTexel);
 }
 
-// Restores sRGB values that the host encoded as v^(1/gamma) to preserve dark detail.
-// If the atlas was sampled as linear light, convert to sRGB before applying pow(v, gamma)
-// and convert back to linear light afterward.
-float3 undoEncodingGamma(float3 color, float gamma, bool linearLight) {
-    float3 encoded = saturate(color);
-    if (linearLight) {
-        encoded = mix(encoded * 12.92, 1.055 * pow(encoded, float3(1.0 / 2.4)) - 0.055, float3(encoded > 0.0031308));
-    }
-    encoded = pow(encoded, float3(gamma));
-    if (linearLight) {
-        encoded = mix(encoded / 12.92, pow((encoded + 0.055) / 1.055, float3(2.4)), float3(encoded > 0.04045));
-    }
-    return encoded;
-}
+// Evaluates host chroma keying and returns premultiplied linear-light RGB and alpha. Most pixels are either
+// fully opaque scene content or pure key color and can be classified with a single texture sample: opaque scene
+// pixels set `solid = true` (with `encoded` holding the gamma-decoded sRGB color and `result.rgb` unused), and
+// pure key pixels return transparent black.
+half4 hostKeyed(texture2d<float> picture, sampler pictureSampler, float2 st, QuadStyle style,
+                thread bool &solid, thread half3 &encoded) {
+    half3 raw = hostKeySample(picture, pictureSampler, st);
+    half3 rgbGamma = hostKeyGamma(raw);
+    encoded = saturate(rgbGamma);
 
-// Whether there is chroma keying at all is fixed when the pipeline is
-// built, so that it costs nothing when off. Its color and distances
-// come with every draw, so they can be tuned while watching.
-constant bool CHROMAKEY_ENABLED [[ function_constant(0) ]];
+    half3 k = half3(style.keyColor.rgb);
+    half3 onMask = step(0.5h, k);
+    half3 on = mix(half3(1.0h), rgbGamma, onMask);
+    half3 off = rgbGamma * (1.0h - onMask);
+    half least = min(on.r, min(on.g, on.b)), most = max(off.r, max(off.g, off.b));
+    solid = least - most <= 1.5h / 255.0h;
+    // Pixels this close to the key color always exceed hostKeyFull (0.85): 0.96 and 0.25 linearize to 0.913 and
+    // 0.051, giving a linear difference of 0.862.
+    bool settled = solid || (least >= 0.96h && most <= 0.25h);
+    half4 result = half4(0.0h, 0.0h, 0.0h, solid ? 1.0h : 0.0h);
+    // Only run the multi-tap neighborhood pass on blended edge pixels, which is ~30x more expensive than the fast path.
+    if (!settled) {
+        result = hostKeyEdge(picture, pictureSampler, st, style, raw, encoded, least, most, solid);
+    }
+    return result;
+}
 
 // The two functions below and the keying itself are the ALVR visionOS
 // client's, unchanged.
@@ -256,35 +321,57 @@ fragment Blended fragmentMain(Fragment in [[stage_in]], texture2d<float> atlas [
         out.cover = float4(style.fill.a);
         return out;
     }
-    float2 uv = in.uv / in.ahead, alphaUV = in.alphaUV / in.ahead, tile = in.tile / in.ahead;
-    if (style.keyColor.a > 1.5) {
-        float4 hostKey = in.eye == 0 ? hostKeyed(atlas, atlasSampler, uv, style) : hostKeyed(otherEyeAtlas, atlasSampler, uv, style);
-        // Dim passthrough behind the scene by blending toward premultiplied black (raising alpha while keeping RGB unchanged).
-        float a = hostKey.a + style.keyRange.y * (1.0 - hostKey.a);
-        // Convert output RGB to match the render target's color encoding.
-        float3 shown = style.linearLight != 0.0 ? hostKey.rgb : srgbFromLinear(hostKey.rgb);
+    float2 uv = in.uv / in.ahead;
+    // Compute edge feathering so the foveal inset blends smoothly into the background quad.
+    half feather = 1.0h;
+    if (FEATHERED) {
+        float2 tile = in.tile / in.ahead;
         float toEdge = min(min(tile.x, 1.0 - tile.x), min(tile.y, 1.0 - tile.y));
-        float feather = style.feather > 0.0 ? saturate(toEdge / style.feather) : 1.0;
+        feather = half(saturate(toEdge / style.feather));
+    }
+    if (HOST_KEY) {
+        bool solid;
+        half3 encoded;
+        half4 hostKey = in.eye == 0 ? hostKeyed(atlas, atlasSampler, uv, style, solid, encoded)
+                                    : hostKeyed(otherEyeAtlas, atlasSampler, uv, style, solid, encoded);
+        // Dim passthrough behind the scene by blending toward premultiplied black (raising alpha while keeping RGB unchanged).
+        half a = hostKey.a + half(style.keyRange.y) * (1.0h - hostKey.a);
+        // Convert RGB to the render target's color space. Fully keyed pixels stay zero, opaque scene pixels convert
+        // directly from `encoded` (at most one exact sRGB-to-linear conversion), and only edge pixels use `srgbNear`.
+        half3 shown = half3(0.0h);
+        if (solid) {
+            shown = TARGET_LINEAR ? linearFromSRGB(encoded) : encoded;
+        } else if (hostKey.a > 0.0h) {
+            shown = TARGET_LINEAR ? hostKey.rgb : srgbNear(hostKey.rgb);
+        }
         // Dual-source blending cross-fades the feathered foveal quad with the underlying base tile,
         // preserving combined passthrough opacity without adjusting the base tile's alpha.
-        out.color = float4(shown, a) * feather;
+        out.color = float4(half4(shown, a) * feather);
         out.cover = float4(feather);
         return out;
     }
-    float3 sampled = in.eye == 0 ? atlas.sample(atlasSampler, uv).rgb : otherEyeAtlas.sample(atlasSampler, uv).rgb;
-    if (style.gamma > 1.0) {
-        sampled = undoEncodingGamma(sampled, style.gamma, style.linearLight != 0.0);
+    half3 color = half3(in.eye == 0 ? atlas.sample(atlasSampler, uv).rgb : otherEyeAtlas.sample(atlasSampler, uv).rgb);
+    // When the texture was sampled as sRGB-encoded values, undo any host encoding gamma and convert to linear
+    // light if required by the render target. When SAMPLED_LINEAR is true, the hardware sampler already linearized
+    // the color and no encoding gamma is active.
+    if (!SAMPLED_LINEAR) {
+        if (GAMMA > 1.0) {
+            color = hostGammaUndone(saturate(color));
+        }
+        if (TARGET_LINEAR) {
+            color = linearFromSRGB(color);
+        }
     }
-    half3 color = half3(sampled);
     half4 colorOut = half4(color.rgb, 1.0);
     // A host that sends transparency sends it as a picture of its own,
     // whose brightness is how opaque the colors are; the colors come
     // already multiplied by it. Where nothing is opaque nothing is
     // drawn, and no depth: the room shows.
-    float opacity = 1.0;
-    if (style.hasAlpha != 0.0) {
-        opacity = in.eye == 0 ? alpha.sample(atlasSampler, alphaUV).r : otherEyeAlpha.sample(atlasSampler, alphaUV).r;
-        if (opacity < 0.02) {
+    half opacity = 1.0h;
+    if (HAS_ALPHA) {
+        float2 alphaUV = in.alphaUV / in.ahead;
+        opacity = half(in.eye == 0 ? alpha.sample(atlasSampler, alphaUV).r : otherEyeAlpha.sample(atlasSampler, alphaUV).r);
+        if (opacity < 0.02h) {
             discard_fragment();
         }
     }
@@ -302,14 +389,10 @@ fragment Blended fragmentMain(Fragment in [[stage_in]], texture2d<float> atlas [
     // ALVR blends that color with "source alpha" for color and alpha
     // alike, which leaves (rgb * a, a * a) in an empty target. The same
     // is written here directly.
-    float4 keyed = float4(float3(colorOut.rgb) * float(colorOut.a), float(colorOut.a * colorOut.a) * opacity);
+    half4 keyed = half4(colorOut.rgb * colorOut.a, colorOut.a * colorOut.a * opacity);
 
-    // A feathered quad (the fovea) fades into the one behind it: it
-    // adds its own color times the feather and keeps the rest of what
-    // was there, whatever the key has done to either.
-    float toEdge = min(min(tile.x, 1.0 - tile.x), min(tile.y, 1.0 - tile.y));
-    float feather = style.feather > 0.0 ? saturate(toEdge / style.feather) : 1.0;
-    out.color = keyed * feather;
+    // Scale premultiplied color and dual-source coverage by the feather weight to cross-fade over the underlying quad.
+    out.color = float4(keyed * feather);
     out.cover = float4(feather * opacity);
     return out;
 }

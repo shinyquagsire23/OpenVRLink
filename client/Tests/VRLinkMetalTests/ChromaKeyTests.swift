@@ -32,8 +32,9 @@ final class ChromaKeyTests: XCTestCase {
     }
 
     /// Renders `frame` across an 8x8 render target cleared to red and returns the center BGRA pixel.
-    private func middlePixel(_ renderer: QuadRenderer, _ frame: DecodedFrame, device: MTLDevice) throws -> [UInt8] {
-        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: 8, height: 8, mipmapped: false)
+    private func middlePixel(_ renderer: QuadRenderer, _ frame: DecodedFrame, device: MTLDevice,
+                             format: MTLPixelFormat = .bgra8Unorm) throws -> [UInt8] {
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: 8, height: 8, mipmapped: false)
         descriptor.usage = [.renderTarget]
         let target = try XCTUnwrap(device.makeTexture(descriptor: descriptor))
         let pass = MTLRenderPassDescriptor()
@@ -88,7 +89,33 @@ final class ChromaKeyTests: XCTestCase {
         XCTAssertEqual(try middlePixel(renderer, marked(green), device: device), clear)
     }
 
-    func testTheKeyColourShowsTheBackgroundAndFollowsChangesWithoutARebuild() throws {
+    /// When rendering to a linear-light sRGB target (as on visionOS), `QuadRenderer` samples host-keyed and
+    /// gamma-encoded frames as sRGB-encoded values, linearizes them in the shader, and lets the sRGB attachment
+    /// re-encode them on write. The resulting bytes should match rendering directly to an 8-bit UNORM target.
+    func testLinearTargetMatchesUnormTargetWithHostKeyAndEncodingGamma() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let encoded = try XCTUnwrap(QuadRenderer(device: device, colorFormat: .bgra8Unorm))
+        let linear = try XCTUnwrap(QuadRenderer(device: device, colorFormat: .bgra8Unorm_srgb, linearOutput: true))
+        for gamma: Float in [1, 1.5, 1.8, 2] {
+            for key in [nil, FrameLayout.HostKey(color: 2, noiseFloor: 0.3), FrameLayout.HostKey(color: 2)] {
+                var layout = FrameLayout.empty
+                layout.encodingGamma = gamma
+                layout.hostKey = key
+                // Gray, blue, dark green (despilled and partially transparent under the default threshold), and pure key green.
+                for (luma, cb, cr) in [(128, 128, 128), (60, 220, 110), (91, 79, 70), (182, 30, 12), (30, 120, 140)] as [(UInt8, UInt8, UInt8)] {
+                    let frame = DecodedFrame(frameID: 0, images: try frame(luma: luma, cb: cb, cr: cr).images, layout: layout)
+                    let wanted = try middlePixel(encoded, frame, device: device)
+                    let shown = try middlePixel(linear, frame, device: device, format: .bgra8Unorm_srgb)
+                    for channel in 0..<4 {
+                        XCTAssertEqual(Int(shown[channel]), Int(wanted[channel]), accuracy: 3,
+                                       "gamma \(gamma), key \(key != nil), Y'CbCr \(luma) \(cb) \(cr): \(shown) against \(wanted)")
+                    }
+                }
+            }
+        }
+    }
+
+    func testTheKeyColorShowsTheBackgroundAndFollowsChangesWithoutARebuild() throws {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let renderer = try XCTUnwrap(QuadRenderer(device: device, colorFormat: .bgra8Unorm))
         let blue = try frame(luma: 60, cb: 220, cr: 110)
@@ -119,7 +146,7 @@ final class ChromaKeyTests: XCTestCase {
 
     /// Verifies that partial chroma-key transparency outputs premultiplied RGB and alpha
     /// as expected by the compositor for passthrough blending.
-    func testAColourBetweenTheTwoDistancesIsPartlySeenThrough() throws {
+    func testAColorBetweenTheTwoDistancesIsPartlySeenThrough() throws {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let renderer = try XCTUnwrap(QuadRenderer(device: device, colorFormat: .bgra8Unorm))
         let blue = try frame(luma: 60, cb: 220, cr: 110)

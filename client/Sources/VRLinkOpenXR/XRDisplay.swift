@@ -261,10 +261,13 @@ public final class XRDisplay<Graphics: XRGraphics> {
         try check(calls.enumerateSwapchainFormats(made, count, &count, &formats), "xrEnumerateSwapchainFormats")
         guard let format = graphics.chooseFormat(among: formats)
         else { throw XRFailure.unsupported("compatible swapchain pixel format (offered: \(formats))") }
+        // Request mutable format on all eye swapchains, or fall back to standard swapchains for all of them.
+        var mutable = graphics.wantsMutableFormat
+        let usage = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT
         for view in views {
             var info = XrSwapchainCreateInfo()
             info.type = XR_TYPE_SWAPCHAIN_CREATE_INFO
-            info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT
+            info.usageFlags = usage | (mutable ? XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT : 0)
             info.format = format
             info.sampleCount = 1
             info.width = view.recommendedImageRectWidth
@@ -273,9 +276,16 @@ public final class XRDisplay<Graphics: XRGraphics> {
             info.arraySize = 1
             info.mipCount = 1
             var swapchain: XrSwapchain?
-            try check(calls.createSwapchain(made, &info, &swapchain), "xrCreateSwapchain")
+            if mutable, swapchains.isEmpty, calls.createSwapchain(made, &info, &swapchain).rawValue < 0 {
+                log("openxr: runtime rejected XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT; falling back to standard swapchains")
+                mutable = false
+                info.usageFlags = usage
+                swapchain = nil
+            }
+            if swapchain == nil { try check(calls.createSwapchain(made, &info, &swapchain), "xrCreateSwapchain") }
             guard let swapchain else { throw XRFailure.call("xrCreateSwapchain", XR_ERROR_RUNTIME_FAILURE) }
-            swapchains.append(XRSwapchain(handle: swapchain, format: format, width: Int(info.width), height: Int(info.height)))
+            swapchains.append(XRSwapchain(handle: swapchain, format: format, width: Int(info.width), height: Int(info.height),
+                                          mutableFormat: mutable))
         }
         // The sharp layer's swapchains come after the eyes' so a draw's `eye` index picks either.
         let sharpSide = !compositorPlacesLayers ? 0 : min(sharpLayerPixels, Int(min(views[0].maxImageRectWidth, views[0].maxImageRectHeight)))
@@ -283,7 +293,7 @@ public final class XRDisplay<Graphics: XRGraphics> {
             for _ in views {
                 var info = XrSwapchainCreateInfo()
                 info.type = XR_TYPE_SWAPCHAIN_CREATE_INFO
-                info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT
+                info.usageFlags = usage | (mutable ? XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT : 0)
                 info.format = format
                 info.sampleCount = 1
                 info.width = UInt32(sharpSide)
@@ -297,7 +307,7 @@ public final class XRDisplay<Graphics: XRGraphics> {
                     swapchains.removeLast(swapchains.count - 2)
                     break
                 }
-                swapchains.append(XRSwapchain(handle: swapchain, format: format, width: sharpSide, height: sharpSide))
+                swapchains.append(XRSwapchain(handle: swapchain, format: format, width: sharpSide, height: sharpSide, mutableFormat: mutable))
             }
         }
         try graphics.adopt(swapchains, instance: instance)
@@ -769,7 +779,8 @@ public final class XRDisplay<Graphics: XRGraphics> {
             log("openxr: surface overlay quad \(choices.topLayer ? (topLayer == nil ? "unavailable" : "on") : "off"), "
                 + "empty projection layer \(choices.skipEmptyProjection ? "omitted" : "submitted"), stream quads \(choices.streamQuads) "
                 + "at \(choices.quadDistance) m, blend test \(choices.blendTest), "
-                + (choices.reuseFrames ? "reusing unchanged frames" : "re-rendering every refresh"))
+                + (choices.reuseFrames ? "reusing unchanged frames" : "re-rendering every refresh")
+                + (choices.sharpWhenTransparent ? "" : ", sharp layer disabled while transparent"))
         }
         let blendTest = choices.blendTest
         let alphaBlend = XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
@@ -819,7 +830,7 @@ public final class XRDisplay<Graphics: XRGraphics> {
         let eyeViews = Eye.allCases.map { EyeView(eye: Pose(views[$0.rawValue].pose), frustum: Frustum(views[$0.rawValue].fov)) }
         // Compute per-eye sharp-layer frusta (enabled for both eyes together or neither).
         var sharp: [Frustum] = []
-        if !reuse, hasSharpLayer, let frame {
+        if !reuse, hasSharpLayer, choices.sharpWhenTransparent || !transparent, let frame {
             sharp = Eye.allCases.compactMap { Composition.sharpFrustum(for: $0, layout: frame.layout, from: eyeViews[$0.rawValue]) }
             if sharp.count != 2 { sharp = [] }
         }

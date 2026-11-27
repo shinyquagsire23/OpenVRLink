@@ -35,6 +35,10 @@ public struct HeadsetQuirks: Equatable {
     /// Whether the compositor interprets a float swapchain as sRGB-encoded (`true`) or linear (`false`). OpenXR
     /// leaves this unspecified; Pico and Galaxy XR expect sRGB-encoded values.
     public var floatTargetIsEncoded = false
+    /// Render to sRGB swapchains through 8-bit UNORM image views (`XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT`) so the
+    /// fragment shader can write sRGB-encoded values directly instead of converting each pixel to linear light for
+    /// the GPU to re-encode. Alpha blending then operates on sRGB-encoded values.
+    public var encodedTarget = false
     /// Overrides the YCbCr range for decoders that misreport it, or `nil` to use the decoder's reported range.
     public var videoRange: VideoRange?
     /// Request host encoding gamma (`HostExtensions.Features.encodingGamma`), inverted in the client fragment shader.
@@ -66,7 +70,7 @@ public struct HeadsetQuirks: Equatable {
     public var blendTest = "none"
     public static let blendTests = ["none", "env", "flag", "both", "no_env", "no_flag"]
     /// Quirk option keys that apply immediately at runtime via `XRDisplay.layerChoices` without restarting the app.
-    public static let liveKeys: Set<String> = ["blend_test", "empty_top_layer", "skip_empty_projection", "stream_quads", "quad_distance", "reuse_frames"]
+    public static let liveKeys: Set<String> = ["blend_test", "empty_top_layer", "skip_empty_projection", "stream_quads", "quad_distance", "reuse_frames", "sharp_when_transparent"]
     /// Omit the projection layer when no stream frame is available. On Galaxy XR, submitting a projection layer
     /// while passthrough is visible causes the compositor to downscale all layers, including the UI panel.
     public var skipEmptyProjection = false
@@ -79,6 +83,10 @@ public struct HeadsetQuirks: Equatable {
     /// rotation-only, `XRDisplay` still re-renders every refresh when stereo depth warping is active to avoid
     /// translational judder, unless GPU draw time exceeds 60% of the refresh period.
     public var reuseFrames = true
+    /// Keep rendering the sharp foveal layer when the stream is transparent (during room view or chroma keying).
+    /// Chroma keying adds per-pixel shader work and passthrough adds compositor GPU overhead, so slower headsets
+    /// like Quest Pro drop frames when the sharp layer stays enabled.
+    public var sharpWhenTransparent = true
     public static let streamQuadChoices = ["never", "room", "always"]
     /// Distance in meters from the eye to the quad plane when `streamQuads` is active. Using 50 m minimizes
     /// parallax error during translational head movement compared to `vrlink`'s ~2 m distance.
@@ -94,7 +102,9 @@ public struct HeadsetQuirks: Equatable {
     public var decoderLowLatency = true
     /// Wait on the frame's GPU fence before releasing swapchain images to the OpenXR runtime. OpenXR does not
     /// specify whether `xrReleaseSwapchainImage` synchronizes with pending GPU work, so out-of-process
-    /// compositors could otherwise display an unfinished or stale swapchain image.
+    /// compositors could otherwise display an unfinished or stale swapchain image. Disabled on headsets whose
+    /// runtimes synchronize swapchain images internally, which lets the CPU prepare the next frame while the GPU
+    /// renders the current one at the cost of a few milliseconds of extra predicted latency.
     public var waitForGPU = true
     /// Target frame rate passed to the decoder (`operating-rate`), or 0 to leave it unset. Qualcomm decoders
     /// scale clocks from this hint and default to 30 fps without it; 32767 matches ALVR's maximum-rate setting.
@@ -186,10 +196,12 @@ public struct HeadsetQuirks: Equatable {
         self.headset = headset
         gripOffset = GripOffset.towardQuest(from: headset)
         floatTargetIsEncoded = headset == .pico || headset == .galaxyXR
+        encodedTarget = [.quest, .quest2, .quest3, .quest3S, .questPro].contains(headset)
+        waitForGPU = ![.quest, .quest2, .quest3, .quest3S, .questPro, .galaxyXR].contains(headset)
         // Galaxy XR upscales 1856 x 2160 swapchains to 3552 x 3840 panels with a soft default filter unless
         // sharpening is requested.
         // Quest Pro's foveal region is ~1152 px per side, so a 1280 px sharp swapchain avoids allocating unused memory.
-        if headset == .questPro { sharpLayerPixels = 1280 }
+        if headset == .questPro { sharpLayerPixels = 1280; sharpWhenTransparent = false }
         if headset == .galaxyXR { eyeDetail = 1.9; leanUplink = true; layerFilter = "sharpen_quality"; emptyTopLayer = true
             skipEmptyProjection = true; streamQuads = "room"
         }
@@ -248,6 +260,7 @@ public struct HeadsetQuirks: Equatable {
         }
         if let value = flag("float_target") { floatTarget = value }
         if let value = flag("float_encoded") { floatTargetIsEncoded = value }
+        if let value = flag("encoded_target") { encodedTarget = value }
         if let value = flag("decoder_low_latency") { decoderLowLatency = value }
         if let value = flag("wait_for_gpu") { waitForGPU = value }
         if let value = flag("sustained_performance") { sustainedPerformance = value }
@@ -266,6 +279,7 @@ public struct HeadsetQuirks: Equatable {
         if let value = override("blend_test"), HeadsetQuirks.blendTests.contains(value) { blendTest = value }
         if let value = flag("skip_empty_projection") { skipEmptyProjection = value }
         if let value = flag("reuse_frames") { reuseFrames = value }
+        if let value = flag("sharp_when_transparent") { sharpWhenTransparent = value }
         if let value = override("stream_quads"), HeadsetQuirks.streamQuadChoices.contains(value) { streamQuads = value }
         if let value = override("quad_distance").flatMap({ Float($0) }), (0.5...100).contains(value) { quadDistance = value }
         if let value = flag("head_velocity_from_poses") { headVelocityFromPoses = value }
@@ -310,6 +324,7 @@ public struct HeadsetQuirks: Equatable {
         Option(key: "stream_quads", title: "Submit stream as quad layers", kind: .choice(streamQuadChoices)),
         Option(key: "quad_distance", title: "Quad layer distance (m)", kind: .number(0.5...100, step: 0.5)),
         Option(key: "reuse_frames", title: "Reproject unchanged frames in compositor", kind: .flag),
+        Option(key: "sharp_when_transparent", title: "Keep sharp layer during passthrough", kind: .flag),
         Option(key: "blend_test", title: "Blend test (sharpness)", kind: .choice(blendTests)),
         Option(key: "video_range", title: "Video range", kind: .choice(["auto", "narrow", "full"])),
         Option(key: "compositor_places_layers", title: "Use compositor layer placement", kind: .flag),
@@ -321,6 +336,7 @@ public struct HeadsetQuirks: Equatable {
         Option(key: "empty_top_layer", title: "Add transparent Android Surface overlay", kind: .flag),
         Option(key: "float_target", title: "Render to 16-bit float swapchains", kind: .flag),
         Option(key: "float_encoded", title: "Float swapchains expect sRGB-encoded values", kind: .flag),
+        Option(key: "encoded_target", title: "Write sRGB-encoded values directly to sRGB swapchains", kind: .flag),
         Option(key: "wait_for_gpu", title: "Wait for GPU fence before releasing frames", kind: .flag),
         Option(key: "decoder_low_latency", title: "Low-latency decoding", kind: .flag),
         Option(key: "sustained_performance", title: "Request sustained high performance", kind: .flag),
@@ -343,6 +359,7 @@ public struct HeadsetQuirks: Equatable {
         case "skip_empty_projection": return flag(skipEmptyProjection)
         case "stream_quads": return streamQuads
         case "reuse_frames": return flag(reuseFrames)
+        case "sharp_when_transparent": return flag(sharpWhenTransparent)
         case "quad_distance": return String(format: "%.1f", quadDistance)
         case "video_range": return videoRange?.rawValue ?? "auto"
         case "compositor_places_layers": return flag(compositorPlacesLayers)
@@ -354,6 +371,7 @@ public struct HeadsetQuirks: Equatable {
         case "empty_top_layer": return flag(emptyTopLayer)
         case "float_target": return flag(floatTarget)
         case "float_encoded": return flag(floatTargetIsEncoded)
+        case "encoded_target": return flag(encodedTarget)
         case "wait_for_gpu": return flag(waitForGPU)
         case "decoder_low_latency": return flag(decoderLowLatency)
         case "sustained_performance": return flag(sustainedPerformance)

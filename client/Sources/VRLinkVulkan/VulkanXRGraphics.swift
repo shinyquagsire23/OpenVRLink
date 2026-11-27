@@ -38,16 +38,43 @@ public final class VulkanXRGraphics: XRGraphics {
     private var queue: VkQueue?
     private var family: UInt32 = 0
     private var pool: VkCommandPool?
+    /// Command buffer for the frame slot currently being recorded.
     private var commands: VkCommandBuffer?
-    private var fence: VkFence?
-    private var submitted = false
+
+    /// Per-frame Vulkan resources kept alive until the GPU finishes executing that frame's command buffer.
+    /// Rotating through `slotCount` slots lets the CPU record and submit a new frame while earlier frames are
+    /// still executing on the GPU, waiting on a slot's fence only when that slot is reused.
+    private struct Slot {
+        var commands: VkCommandBuffer?
+        var fence: VkFence?
+        var submitted = false
+        var vertices = Buffer(), indices = Buffer()
+        /// Retains the decoded frame so its `AHardwareBuffer`s are not recycled while the GPU is sampling them.
+        var frame: HardwareFrame?
+        /// Imported Vulkan images evicted during this frame, destroyed the next time this slot is reused.
+        var retired: [Imported] = []
+        /// Tracks the background task measuring GPU execution time on `fence` when `HeadsetQuirks.waitForGPU` is disabled.
+        let watched = DispatchGroup()
+    }
+    private var slots: [Slot] = [], slot = 0
+    private static let slotCount = 3
+    private static let gpuWatch = DispatchQueue(label: "openvrlink.gpu.watch", qos: .userInitiated, attributes: .concurrent)
+    private let gpuTimeLock = NSLock()
+    private var gpuTime: UInt64 = 0
+    /// Index of the frame slot whose command buffer recorded the pending `shrinkDrawn` or `probeDrawn` readback.
+    private var readbackSlot: Int?
 
     private var renderPass: VkRenderPass?
     private var targetFormat = VK_FORMAT_UNDEFINED
     private var linearTarget = false
     /// Per-eye Vulkan image views and framebuffers for the OpenXR swapchains.
     private var targets: [[Target]] = []
-    public private(set) var lastGPUWait: UInt64 = 0
+    /// Duration in nanoseconds from queue submission to fence completion for the most recently finished GPU frame.
+    public var lastGPUWait: UInt64 {
+        gpuTimeLock.lock()
+        defer { gpuTimeLock.unlock() }
+        return gpuTime
+    }
     public private(set) var lastDrawSteps: [(name: String, nanoseconds: UInt64)] = []
     private var sizes: [VkExtent2D] = []
 
@@ -66,12 +93,47 @@ public final class VulkanXRGraphics: XRGraphics {
         var sampler: VkSampler?
         var setLayout: VkDescriptorSetLayout?
         var layout: VkPipelineLayout?
-        var pipeline: VkPipeline?
-        /// Chroma-keyed graphics pipeline using dual-source blending, when supported.
-        var keyedPipeline: VkPipeline?
-        var descriptors: VkDescriptorPool?
+        /// Per-slot descriptor pools, reset each time the corresponding slot is reused.
+        var pools: [VkDescriptorPool?] = []
     }
     private var sampling: Sampling?
+
+    /// Specialization key for selecting a `quad.frag` SPIR-V variant and its specialization constants. A pipeline
+    /// is compiled and cached for each combination used by the stream.
+    private struct PipelineKind: Hashable {
+        enum Variant { case plain, keyed, host }
+        var variant = Variant.plain
+        var gamma: Float = 1
+        var hasAlpha = false, probe = false, feathered = false
+        /// True when the render target is cleared to transparent and alpha-blended by the compositor.
+        var composited = false
+        /// True when the quad is rendered into its own dedicated layer, so the compositor blends its feathered edge.
+        var alone = false
+    }
+    /// Cached graphics pipelines for the current `sampling`, compiled on demand.
+    private var pipelines: [PipelineKind: VkPipeline?] = [:]
+
+    private func pipeline(_ kind: PipelineKind, for sampling: Sampling) throws -> VkPipeline? {
+        if let made = pipelines[kind] { return made }
+        let began = Uptime.nanoseconds
+        let made = try makePipeline(layout: sampling.layout, kind: kind)
+        pipelines[kind] = made
+        log(String(format: "vulkan: built %@ pipeline (gamma %.2f%@%@%@%@%@) in %.1f ms", "\(kind.variant)", kind.gamma,
+                   kind.hasAlpha ? ", alpha plane" : "", kind.probe ? ", probe" : "", kind.feathered ? ", feathered" : "", kind.composited ? ", composited" : "", kind.alone ? ", alone" : "",
+                   Double(Uptime.nanoseconds &- began) / 1e6))
+        // Host chroma-key pipelines are much slower to compile, so prewarm them alongside the initial stream
+        // pipelines instead of stalling rendering when room view is first enabled.
+        if kind.variant == .plain, !kind.probe, !kind.hasAlpha {
+            var host = kind
+            host.variant = .host
+            host.composited = true
+            _ = try? pipeline(host, for: sampling)
+            // Also prewarm the non-dedicated fovea variant used when `sharpWhenTransparent` disables the sharp layer in room view.
+            host.alone = false
+            _ = try? pipeline(host, for: sampling)
+        }
+        return made
+    }
 
     /// Cached `VkImage`, device memory, and `VkImageView` for an imported `AHardwareBuffer`.
     private struct Imported {
@@ -84,10 +146,7 @@ public final class VulkanXRGraphics: XRGraphics {
     }
     /// Imported Vulkan images keyed by `AHardwareBuffer_getId` across the decoder's buffer pool.
     private var imports: [UInt64: Imported] = [:]
-    private var retired: [Imported] = []
     private var frameCount = 0
-    /// Retains the frame currently in flight on the GPU so its `AHardwareBuffer`s are not recycled prematurely.
-    private var drawing: HardwareFrame?
     /// Initial decoded frames of each stream read back to log average sampled brightness alongside `encodingGamma`.
     private var streamRead = 0, streamLast: UInt16?
     private var streamReadings: [(gamma: Float, mean: Float)] = []
@@ -202,10 +261,15 @@ public final class VulkanXRGraphics: XRGraphics {
         allocate.commandPool = pool
         allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY
         allocate.commandBufferCount = 1
-        try Vulkan.check(vkAllocateCommandBuffers(device, &allocate, &commands), "vkAllocateCommandBuffers")
         var fenceInfo = VkFenceCreateInfo()
         fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
-        try Vulkan.check(vkCreateFence(device, &fenceInfo, nil, &fence), "vkCreateFence")
+        for _ in 0..<VulkanXRGraphics.slotCount {
+            var made = Slot()
+            try Vulkan.check(vkAllocateCommandBuffers(device, &allocate, &made.commands), "vkAllocateCommandBuffers")
+            try Vulkan.check(vkCreateFence(device, &fenceInfo, nil, &made.fence), "vkCreateFence")
+            slots.append(made)
+        }
+        commands = slots[0].commands
     }
 
     public func withSessionBinding<Result>(_ body: (UnsafeRawPointer) throws -> Result) throws -> Result {
@@ -222,6 +286,8 @@ public final class VulkanXRGraphics: XRGraphics {
     /// Preferred swapchain formats, prioritizing sRGB attachments for hardware linear-to-sRGB encoding.
     private static let formats = [VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM]
 
+    public var wantsMutableFormat: Bool { quirks.encodedTarget }
+
     public func chooseFormat(among offered: [Int64]) -> Int64? {
         let wanted = (quirks.floatTarget ? [VK_FORMAT_R16G16B16A16_SFLOAT] : []) + VulkanXRGraphics.formats
         return wanted.map { Int64($0.rawValue) }.first { offered.contains($0) }
@@ -231,7 +297,14 @@ public final class VulkanXRGraphics: XRGraphics {
 
     public func adopt(_ swapchains: [XRSwapchain], instance xr: XRInstance) throws {
         guard let first = swapchains.first else { return }
-        let format = VkFormat(rawValue: UInt32(first.format))
+        var format = VkFormat(rawValue: UInt32(first.format))
+        // When an sRGB swapchain supports mutable formats, create 8-bit UNORM image views so the fragment shader
+        // can write sRGB-encoded values directly without converting to linear light and back.
+        let unormFormats = [VK_FORMAT_R8G8B8A8_SRGB.rawValue: VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB.rawValue: VK_FORMAT_B8G8R8A8_UNORM]
+        if swapchains.allSatisfy(\.mutableFormat), let unorm = unormFormats[format.rawValue] {
+            log("vulkan: rendering swapchain format \(format.rawValue) through UNORM image views (\(unorm.rawValue))")
+            format = unorm
+        }
         targetFormat = format
         // sRGB attachments encode linear output automatically on write. Float swapchain encoding is left
         // unspecified by OpenXR and varies across headsets (`HeadsetQuirks.floatTargetIsEncoded`).
@@ -411,11 +484,13 @@ public final class VulkanXRGraphics: XRGraphics {
         poolInfo.poolSizeCount = 1
         try withUnsafePointer(to: &sizes) {
             poolInfo.pPoolSizes = $0
-            try Vulkan.check(vkCreateDescriptorPool(device, &poolInfo, nil, &made.descriptors), "vkCreateDescriptorPool")
+            for _ in slots {
+                var pool: VkDescriptorPool?
+                try Vulkan.check(vkCreateDescriptorPool(device, &poolInfo, nil, &pool), "vkCreateDescriptorPool")
+                made.pools.append(pool)
+            }
         }
 
-        made.pipeline = try makePipeline(layout: made.layout, keyed: false)
-        if supportsChromaKey { made.keyedPipeline = try makePipeline(layout: made.layout, keyed: true) }
         log(String(format: "vulkan: sampling decoded pictures of format %d (external %llx), %@ chroma", format.format.rawValue,
                    format.externalFormat, linear ? "linear" : "nearest"))
         return made
@@ -436,11 +511,14 @@ public final class VulkanXRGraphics: XRGraphics {
         return module
     }
 
-    /// Creates the quad graphics pipeline, using the dual-source chroma-key fragment shader when `keyed` is true.
-    private func makePipeline(layout: VkPipelineLayout?, keyed: Bool) throws -> VkPipeline? {
+    /// Compiles a quad graphics pipeline for the `quad.frag` variant and specialization constants in `kind`,
+    /// enabling dual-source blending for client chroma keying.
+    private func makePipeline(layout: VkPipelineLayout?, kind: PipelineKind) throws -> VkPipeline? {
+        let keyed = kind.variant == .keyed
+        let words = kind.variant == .host ? QuadShaders.hostFragment : keyed ? QuadShaders.keyedFragment : QuadShaders.fragment
         let arena = Arena()
         defer { arena.free() }
-        let vertex = try shader(QuadShaders.vertex), fragment = try shader(keyed ? QuadShaders.keyedFragment : QuadShaders.fragment)
+        let vertex = try shader(QuadShaders.vertex), fragment = try shader(words)
         defer {
             vkDestroyShaderModule(device, vertex, nil)
             vkDestroyShaderModule(device, fragment, nil)
@@ -453,6 +531,18 @@ public final class VulkanXRGraphics: XRGraphics {
             stages[index].module = stage.1
             stages[index].pName = UnsafePointer(entry)
         }
+        // Specialization constants 0...6 (4 bytes each): GAMMA, LINEAR_TARGET, HAS_ALPHA, PROBE, FEATHERED,
+        // COMPOSITED, and ALONE.
+        let flags = [linearTarget, kind.hasAlpha, kind.probe, kind.feathered, kind.composited, kind.alone].map { UInt32($0 ? 1 : 0) }
+        let constants = arena.keep([kind.gamma.bitPattern] + flags)
+        var specialization = VkSpecializationInfo()
+        specialization.mapEntryCount = 7
+        specialization.pMapEntries = UnsafePointer(arena.keep((0..<7).map {
+            VkSpecializationMapEntry(constantID: UInt32($0), offset: UInt32($0 * 4), size: 4)
+        }))
+        specialization.dataSize = 7 * 4
+        specialization.pData = UnsafeRawPointer(constants)
+        stages[1].pSpecializationInfo = UnsafePointer(arena.keep(specialization))
 
         // Vertex layout matching QuadMesh: clip position (4), color UV (2), alpha UV (2), quad UV (2), ahead (1).
         let float = UInt32(MemoryLayout<Float>.size)
@@ -534,9 +624,9 @@ public final class VulkanXRGraphics: XRGraphics {
     }
 
     private func destroy(_ sampling: Sampling) {
-        vkDestroyPipeline(device, sampling.pipeline, nil)
-        if let keyed = sampling.keyedPipeline { vkDestroyPipeline(device, keyed, nil) }
-        vkDestroyDescriptorPool(device, sampling.descriptors, nil)
+        pipelines.values.forEach { vkDestroyPipeline(device, $0, nil) }
+        pipelines = [:]
+        sampling.pools.forEach { vkDestroyDescriptorPool(device, $0, nil) }
         vkDestroyPipelineLayout(device, sampling.layout, nil)
         vkDestroyDescriptorSetLayout(device, sampling.setLayout, nil)
         vkDestroySampler(device, sampling.sampler, nil)
@@ -825,7 +915,7 @@ public final class VulkanXRGraphics: XRGraphics {
         shrinkLock.lock()
         let asked = probeAsked
         // The target and its readback buffer are shared with the stereo downsample: wait for one in flight.
-        let free = shrinkDrawn == nil
+        let free = shrinkDrawn == nil && probeDrawn == nil
         if free { probeAsked = nil }
         shrinkLock.unlock()
         guard let asked, free else { return false }
@@ -873,7 +963,7 @@ public final class VulkanXRGraphics: XRGraphics {
                 pass.pClearValues = $0
                 vkCmdBeginRenderPass(commands, &pass, VK_SUBPASS_CONTENTS_INLINE)
             }
-            vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, sampling.pipeline)
+            vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, try pipeline(PipelineKind(probe: true), for: sampling))
             var vertexHandle = shrinkVertices.handle
             var offset = VkDeviceSize(0)
             vkCmdBindVertexBuffers(commands, 0, 1, &vertexHandle, &offset)
@@ -904,6 +994,7 @@ public final class VulkanXRGraphics: XRGraphics {
             region.imageExtent = VkExtent3D(width: size.width, height: size.height, depth: 1)
             vkCmdCopyImageToBuffer(commands, shrinkTarget.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, shrinkPixels.handle, 1, &region)
             probeDrawn = (asked.frame, sampling.externalFormat, asked.done)
+            readbackSlot = slot
             return true
         } catch {
             log("vulkan: could not read back color probe frame: \(error)")
@@ -914,8 +1005,9 @@ public final class VulkanXRGraphics: XRGraphics {
 
     /// Extracts the 16 patch colors from the completed `recordProbe` readback buffer.
     private func finishProbe() {
-        guard let drawn = probeDrawn else { return }
+        guard let drawn = probeDrawn, readbackDone() else { return }
         probeDrawn = nil
+        readbackSlot = nil
         guard let mapped = shrinkPixels.mapped else {
             drawn.done(nil)
             return
@@ -1057,6 +1149,9 @@ public final class VulkanXRGraphics: XRGraphics {
     /// Records an offscreen pass that renders both eyes of `shrinkAsked` side by side into `shrinkTarget` and
     /// copies the pixels into `shrinkPixels` for CPU readback on the next frame (`finishShrink`).
     private func recordShrink(_ sets: inout [Int: VkDescriptorSet?]) {
+        // `shrinkTarget` and `shrinkPixels` can only hold one in-flight readback at a time, so defer any new
+        // downsample request until the previous downsample or color probe finishes.
+        guard shrinkDrawn == nil, probeDrawn == nil else { return }
         shrinkLock.lock()
         let asked = shrinkAsked
         shrinkAsked = nil
@@ -1137,7 +1232,7 @@ public final class VulkanXRGraphics: XRGraphics {
                 pass.pClearValues = $0
                 vkCmdBeginRenderPass(commands, &pass, VK_SUBPASS_CONTENTS_INLINE)
             }
-            vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, sampling.pipeline)
+            vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, try? pipeline(PipelineKind(), for: sampling))
             var vertexHandle = shrinkVertices.handle
             var offset = VkDeviceSize(0)
             vkCmdBindVertexBuffers(commands, 0, 1, &vertexHandle, &offset)
@@ -1175,6 +1270,7 @@ public final class VulkanXRGraphics: XRGraphics {
             region.imageExtent = VkExtent3D(width: size.width, height: size.height, depth: 1)
             vkCmdCopyImageToBuffer(commands, shrinkTarget.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, shrinkPixels.handle, 1, &region)
             shrinkDrawn = (asked.frame, plan, asked.done)
+            readbackSlot = slot
         } catch {
             if !shrinkComplained {
                 shrinkComplained = true
@@ -1190,8 +1286,9 @@ public final class VulkanXRGraphics: XRGraphics {
     /// Converts the completed `shrinkPixels` readback buffer into a `StereoPair` of Rec. 709 luma images and
     /// invokes its completion handler.
     private func finishShrink() {
-        guard let drawn = shrinkDrawn else { return }
+        guard let drawn = shrinkDrawn, readbackDone() else { return }
         shrinkDrawn = nil
+        readbackSlot = nil
         guard let mapped = shrinkPixels.mapped else {
             drawn.done(nil)
             return
@@ -1354,20 +1451,35 @@ public final class VulkanXRGraphics: XRGraphics {
             mark = now
         }
         defer { lastDrawSteps = steps }
-        // Wait for the previous frame's command buffer to complete before reusing vertex buffers or releasing frames.
-        if submitted {
-            var waiting = fence
-            vkWaitForFences(device, 1, &waiting, 1, UInt64.max)
-            vkResetFences(device, 1, &waiting)
-            submitted = false
-        }
-        retired.forEach(destroy)
-        retired = []
-        stepDone("draw: previous frame fence")
+        // Advance to the oldest frame slot. Its GPU work has usually finished already, but wait on its fence if
+        // needed before reusing its command and vertex buffers.
+        slot = (slot + 1) % slots.count
+        var waiting = slots[slot].fence
+        if slots[slot].submitted { vkWaitForFences(device, 1, &waiting, 1, UInt64.max) }
+        stepDone("draw: oldest frame fence")
+        // Process any readback recorded in this slot before resetting its fence.
         finishShrink()
         finishProbe()
         stepDone("draw: depth readback")
-        drawing = frame
+        if slots[slot].submitted {
+            slots[slot].watched.wait()
+            vkResetFences(device, 1, &waiting)
+            slots[slot].submitted = false
+        }
+        slots[slot].retired.forEach(destroy)
+        slots[slot].retired = []
+        // Release decoded frames from any completed slots so their hardware buffers return to MediaCodec promptly.
+        for index in slots.indices where slots[index].submitted && vkGetFenceStatus(device, slots[index].fence) == VK_SUCCESS {
+            slots[index].frame = nil
+        }
+        slots[slot].frame = frame
+        commands = slots[slot].commands
+        vertexBuffer = slots[slot].vertices
+        indexBuffer = slots[slot].indices
+        defer {
+            slots[slot].vertices = vertexBuffer
+            slots[slot].indices = indexBuffer
+        }
         // Ramp passthrough dimming toward the target opacity for this frame.
         let now = Uptime.nanoseconds, seconds = dimMoved == 0 ? 0 : min(0.25, Float(now &- dimMoved) / 1e9)
         dimMoved = now
@@ -1395,7 +1507,7 @@ public final class VulkanXRGraphics: XRGraphics {
         }
         if imports.count > VulkanXRGraphics.importsKept {
             for (id, imported) in imports where frameCount - imported.lastUsed > VulkanXRGraphics.importsKept {
-                retired.append(imported)
+                slots[slot].retired.append(imported)
                 imports[id] = nil
             }
         }
@@ -1406,7 +1518,7 @@ public final class VulkanXRGraphics: XRGraphics {
         let floats = meshes.reduce(0) { $0 + $1.vertices.count }, indexCount = meshes.reduce(0) { $0 + $1.indices.count }
         try reserve(&vertexBuffer, bytes: floats * MemoryLayout<Float>.size, usage: VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)
         try reserve(&indexBuffer, bytes: indexCount * MemoryLayout<UInt16>.size, usage: VK_BUFFER_USAGE_INDEX_BUFFER_BIT)
-        if let sampling { vkResetDescriptorPool(device, sampling.descriptors, 0) }
+        if let sampling { vkResetDescriptorPool(device, sampling.pools[slot], 0) }
         var sets: [Int: VkDescriptorSet?] = [:]
         if !recordProbe(&sets) { recordShrink(&sets) }
         stepDone("draw: depth downsample")
@@ -1437,8 +1549,12 @@ public final class VulkanXRGraphics: XRGraphics {
             var scissor = VkRect2D(offset: VkOffset2D(x: 0, y: 0), extent: size)
             vkCmdSetViewport(commands, 0, 1, &viewport)
             vkCmdSetScissor(commands, 0, 1, &scissor)
-            let keying = sampling.keyedPipeline == nil || frame?.layout.hostKey != nil ? nil : chromaKey
-            vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, keying == nil ? sampling.pipeline : sampling.keyedPipeline)
+            let keying = !supportsChromaKey || frame?.layout.hostKey != nil ? nil : chromaKey
+            var kind = PipelineKind(), bound: PipelineKind?
+            kind.variant = frame?.layout.hostKey != nil ? .host : keying == nil ? .plain : .keyed
+            kind.alone = eye.clear
+            kind.gamma = frame?.layout.encodingGamma ?? 1
+            kind.composited = transparent || eye.clear
             var vertexHandle = vertexBuffer.handle
             var offset = VkDeviceSize(vertexBase * MemoryLayout<Float>.size)
             vkCmdBindVertexBuffers(commands, 0, 1, &vertexHandle, &offset)
@@ -1462,6 +1578,12 @@ public final class VulkanXRGraphics: XRGraphics {
                 let key = draw.picture << 8 | (draw.alphaPicture ?? 0xFF)
                 if sets[key] == nil { sets[key] = try descriptors(sampling, color: color, alpha: alpha ?? color) }
                 var set = sets[key] ?? nil
+                kind.hasAlpha = alpha != nil && !filled
+                kind.feathered = draw.feather > 0 && !filled
+                if kind != bound {
+                    vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, try pipeline(kind, for: sampling))
+                    bound = kind
+                }
                 vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, sampling.layout, 0, 1, &set, 0, nil)
                 var style = QuadStyle(feather: draw.feather, hasAlpha: alpha != nil && !filled ? 1 : 0, gamma: frame?.layout.encodingGamma ?? 1,
                                       linearTarget: linearTarget ? 1 : 0, fill: draw.fill ?? [0, 0, 0, 0], key: keying,
@@ -1483,18 +1605,38 @@ public final class VulkanXRGraphics: XRGraphics {
         try withUnsafePointer(to: &commands) {
             submit.pCommandBuffers = $0
             stepDone("draw: eye passes")
-            try Vulkan.check(vkQueueSubmit(queue, 1, &submit, fence), "vkQueueSubmit")
+            try Vulkan.check(vkQueueSubmit(queue, 1, &submit, slots[slot].fence), "vkQueueSubmit")
         }
         stepDone("draw: queue submit")
-        submitted = true
-        lastGPUWait = 0
+        slots[slot].submitted = true
+        let fence = slots[slot].fence, began = Uptime.nanoseconds
+        func waitForFence() {
+            var waiting = fence
+            vkWaitForFences(device, 1, &waiting, 1, UInt64.max)
+            gpuTimeLock.lock()
+            gpuTime = Uptime.nanoseconds &- began
+            gpuTimeLock.unlock()
+        }
         if quirks.waitForGPU {
             // Wait for rendering to finish before the caller releases the swapchain images to the OpenXR runtime.
-            var waiting = fence
-            let began = Uptime.nanoseconds
-            vkWaitForFences(device, 1, &waiting, 1, UInt64.max)
-            lastGPUWait = Uptime.nanoseconds - began
+            waitForFence()
+        } else {
+            // Release swapchain images without blocking on the GPU fence when the runtime synchronizes them
+            // internally. Still measure GPU execution time on a background queue for frame-pacing logs and the
+            // `reuseFrames` GPU-load threshold.
+            let watched = slots[slot].watched
+            watched.enter()
+            VulkanXRGraphics.gpuWatch.async {
+                waitForFence()
+                watched.leave()
+            }
         }
+    }
+
+    /// Returns true once the GPU has finished executing the command buffer for the pending readback.
+    private func readbackDone() -> Bool {
+        guard let at = readbackSlot else { return true }
+        return vkGetFenceStatus(device, slots[at].fence) == VK_SUCCESS
     }
 
     private func descriptors(_ sampling: Sampling, color: VkImageView, alpha: VkImageView) throws -> VkDescriptorSet? {
@@ -1502,7 +1644,7 @@ public final class VulkanXRGraphics: XRGraphics {
         var layout = sampling.setLayout
         var allocate = VkDescriptorSetAllocateInfo()
         allocate.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
-        allocate.descriptorPool = sampling.descriptors
+        allocate.descriptorPool = sampling.pools[slot]
         allocate.descriptorSetCount = 1
         try withUnsafePointer(to: &layout) {
             allocate.pSetLayouts = $0

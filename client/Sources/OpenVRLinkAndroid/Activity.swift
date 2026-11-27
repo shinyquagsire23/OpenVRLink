@@ -495,6 +495,7 @@ final class App: @unchecked Sendable {
                     now.streamQuads = quirks.streamQuads
                     now.quadDistance = quirks.quadDistance
                     now.reuseFrames = quirks.reuseFrames
+                    now.sharpWhenTransparent = quirks.sharpWhenTransparent
                 }
                 return now
             }

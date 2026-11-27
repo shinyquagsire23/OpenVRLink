@@ -15,7 +15,18 @@ import VRLinkVideoToolbox
 /// vertices and issues draw calls into the caller's render pass (a window on
 /// macOS or a compositor drawable on visionOS).
 public final class QuadRenderer {
-    private var pipeline: MTLRenderPipelineState
+    /// Specialization key for `Quad.metal`'s `fragmentMain` function constants. `QuadRenderer` compiles and caches
+    /// a pipeline for each combination used by the stream so unused shader branches are eliminated at compile time.
+    private struct PipelineKind: Hashable {
+        /// True when client HSV chroma keying is enabled.
+        var keyed = false
+        var gamma: Float = 1
+        /// True when the decoded texture uses an sRGB pixel format, causing the hardware sampler to return linear light.
+        var sampledLinear = false
+        var hasAlpha = false, hostKey = false, feathered = false
+    }
+    /// Cached render pipelines keyed by function-constant configuration, compiled on demand.
+    private var pipelines: [PipelineKind: MTLRenderPipelineState] = [:]
     private let device: MTLDevice
     private let library: MTLLibrary
     private let colorFormat: MTLPixelFormat, depthFormat: MTLPixelFormat
@@ -73,9 +84,10 @@ public final class QuadRenderer {
                 return nil
             }
             library = try device.makeLibrary(source: String(contentsOf: url, encoding: .utf8), options: nil)
-            pipeline = try QuadRenderer.makePipeline(device: device, library: library, colorFormat: colorFormat,
-                                                     depthFormat: depthFormat, eyeCount: eyeCount,
-                                                     keyed: false)
+            let plain = PipelineKind()
+            pipelines[plain] = try QuadRenderer.makePipeline(device: device, library: library, colorFormat: colorFormat,
+                                                             depthFormat: depthFormat, eyeCount: eyeCount,
+                                                             kind: plain, linearOutput: linearOutput)
         } catch {
             Log.note("renderer: \(error)")
             return nil
@@ -92,27 +104,51 @@ public final class QuadRenderer {
     }
 
     /// Optional chroma-key settings for making a target color transparent.
-    /// Toggling chroma keying on or off rebuilds the render pipeline, whereas
+    /// Toggling chroma keying on or off switches to another render pipeline, whereas
     /// updating the key color or thresholds takes effect on the next frame at no cost.
-    public var chromaKey: ChromaKey? {
-        didSet {
-            guard (chromaKey == nil) != (oldValue == nil) else { return }
-            do {
-                pipeline = try QuadRenderer.makePipeline(device: device, library: library, colorFormat: colorFormat,
-                                                         depthFormat: depthFormat, eyeCount: eyeCount,
-                                                         keyed: chromaKey != nil)
-            } catch {
-                Log.note("renderer: \(error)")
+    public var chromaKey: ChromaKey?
+
+    /// Returns the cached render pipeline for `kind`, compiling it if needed.
+    private func pipeline(_ kind: PipelineKind) -> MTLRenderPipelineState? {
+        if let made = pipelines[kind] { return made }
+        do {
+            let began = Uptime.nanoseconds
+            let made = try QuadRenderer.makePipeline(device: device, library: library, colorFormat: colorFormat,
+                                                     depthFormat: depthFormat, eyeCount: eyeCount,
+                                                     kind: kind, linearOutput: linearOutput)
+            pipelines[kind] = made
+            Log.note(String(format: "renderer: built pipeline (gamma %.2f%@%@%@%@%@) in %.1f ms", kind.gamma,
+                            kind.keyed ? ", chroma key" : "", kind.hostKey ? ", host key" : "",
+                            kind.sampledLinear ? ", sampled as linear light" : "", kind.hasAlpha ? ", alpha plane" : "",
+                            kind.feathered ? ", feathered" : "", Double(Uptime.nanoseconds &- began) / 1e6))
+            // Prewarm the corresponding host chroma-key pipeline alongside the initial stream pipelines so
+            // enabling room view does not stall rendering.
+            if !kind.hostKey, !kind.hasAlpha {
+                var host = kind
+                host.hostKey = true
+                host.keyed = false
+                host.sampledLinear = false
+                _ = pipeline(host)
             }
+            return made
+        } catch {
+            Log.note("renderer: \(error)")
+            return nil
         }
     }
 
     private static func makePipeline(device: MTLDevice, library: MTLLibrary, colorFormat: MTLPixelFormat,
                                      depthFormat: MTLPixelFormat, eyeCount: Int,
-                                     keyed: Bool) throws -> MTLRenderPipelineState {
-        var enabled = keyed
+                                     kind: PipelineKind, linearOutput: Bool) throws -> MTLRenderPipelineState {
+        // Populate function constants 0...6 matching Quad.metal.
         let constants = MTLFunctionConstantValues()
-        constants.setConstantValue(&enabled, type: .bool, index: 0)
+        var gamma = kind.gamma
+        constants.setConstantValue(&gamma, type: .float, index: 1)
+        for (index, flag) in [(0, kind.keyed), (2, kind.sampledLinear), (3, linearOutput), (4, kind.hasAlpha), (5, kind.hostKey),
+                              (6, kind.feathered)] {
+            var value = flag
+            constants.setConstantValue(&value, type: .bool, index: index)
+        }
 
         let descriptor = MTLRenderPipelineDescriptor()
         descriptor.maxVertexAmplificationCount = eyeCount
@@ -154,7 +190,10 @@ public final class QuadRenderer {
         }
     }
 
-    private func texture(for image: CVPixelBuffer) -> CVMetalTexture? {
+    /// Wraps a decoded pixel buffer in a Metal texture. When `linear` is true, this selects the sRGB variant of
+    /// the YCbCr format so the hardware sampler converts to linear light automatically; otherwise the sampler
+    /// returns raw sRGB-encoded values.
+    private func texture(for image: CVPixelBuffer, linear: Bool) -> CVMetalTexture? {
         let pixelFormat = CVPixelBufferGetPixelFormatType(image)
         if pixelFormat != reportedFormat {
             reportedFormat = pixelFormat
@@ -166,7 +205,7 @@ public final class QuadRenderer {
             return nil
         }
         // Each of these formats has an sRGB variant at rawValue + 20 that returns linear light.
-        if linearOutput, let linear = MTLPixelFormat(rawValue: format.rawValue + 20) { format = linear }
+        if linear, let variant = MTLPixelFormat(rawValue: format.rawValue + 20) { format = variant }
         var texture: CVMetalTexture?
         let status = CVMetalTextureCacheCreateTextureFromImage(
             nil, textureCache, image, nil, format,
@@ -209,19 +248,23 @@ public final class QuadRenderer {
     public func draw(eyes: [(quads: [Quad], view: EyeView)], of frame: DecodedFrame?, near: Float, far: Float,
                      with encoder: MTLRenderCommandEncoder, commands: MTLCommandBuffer) {
         guard !eyes.isEmpty, eyes.count <= 2 else { return }
-        let cvTextures = (frame?.images ?? []).map { texture(for: $0) }
+        let encodingGamma = frame?.layout.encodingGamma ?? 1
+        let hostKey = frame?.layout.hostKey
+        // Only let the hardware sampler linearize the texture when the shader does not need the sRGB-encoded
+        // values first. Host encoding gamma and host chroma keying both operate in sRGB space, so for those
+        // frames we sample sRGB-encoded values and convert to linear light once in the fragment shader rather
+        // than round-tripping between linear and sRGB.
+        let sampledLinear = linearOutput && encodingGamma <= 1 && hostKey == nil
+        let cvTextures = (frame?.images ?? []).map { texture(for: $0, linear: sampledLinear) }
         let pictures = cvTextures.map { $0.flatMap(CVMetalTextureGetTexture) }
         func picture(_ index: Int) -> MTLTexture? { pictures.indices.contains(index) ? pictures[index] : nil }
-        encoder.setRenderPipelineState(pipeline)
         if let depthState { encoder.setDepthStencilState(depthState) }
         encoder.setFragmentSamplerState(sampler, index: 0)
         // Match the chroma-key color space to the sampled texture values:
         // linear light when linearOutput is enabled, or encoded sRGB values otherwise.
         let keyColor = (linearOutput ? chromaKey?.linearColor : chromaKey?.color) ?? [0, 0, 0]
-        let encodingGamma = frame?.layout.encodingGamma ?? 1
         // Host chroma keying overrides the client's chroma key for this frame. Dimming ramps up to `dimmedBy`
         // over 50 ms and fades out over 100 ms, matching `vrlink`.
-        let hostKey = frame?.layout.hostKey
         let now = Uptime.nanoseconds, seconds = dimMoved == 0 ? 0 : min(0.25, Float(now &- dimMoved) / 1e9)
         dimMoved = now
         let wanted: Float = hostKey?.dim == true ? QuadRenderer.dimmedBy : 0
@@ -243,6 +286,7 @@ public final class QuadRenderer {
             var first: Int, columns: Int, rows: Int
             var style: [Float]
             var shown: [MTLTexture?], alphas: [MTLTexture?]
+            var kind: PipelineKind
         }
         var vertices: [Float] = [], draws: [Draw] = []
         for index in 0..<(eyes.map { $0.quads.count }.max() ?? 0) {
@@ -305,15 +349,25 @@ public final class QuadRenderer {
                               style: [style.feather, hasAlpha ? 1 : 0, encodingGamma, linearOutput ? 1 : 0]
                                   + (style.fill ?? [0, 0, 0, 0])
                                   + (style.fill == nil ? keying : keyColor + [0, chromaKey?.near ?? 0, chromaKey?.far ?? 1, 0, 0]),
-                              shown: shown, alphas: alphas))
+                              shown: shown, alphas: alphas,
+                              kind: PipelineKind(keyed: chromaKey != nil && hostKey == nil, gamma: encodingGamma,
+                                                 sampledLinear: sampledLinear, hasAlpha: hasAlpha,
+                                                 hostKey: hostKey != nil && style.fill == nil,
+                                                 feathered: style.fill == nil && style.feather > 0)))
         }
         guard !vertices.isEmpty,
               let buffer = device.makeBuffer(bytes: vertices, length: vertices.count * MemoryLayout<Float>.size,
                                              options: .storageModeShared)
         else { return }
         encoder.setVertexBuffer(buffer, offset: 0, index: 0)
+        var bound: PipelineKind?
         for draw in draws {
             guard let triangles = triangles(columns: draw.columns, rows: draw.rows) else { continue }
+            if draw.kind != bound {
+                guard let pipeline = pipeline(draw.kind) else { continue }
+                encoder.setRenderPipelineState(pipeline)
+                bound = draw.kind
+            }
             encoder.setFragmentTexture(draw.shown[0] ?? placeholder, index: 0)
             encoder.setFragmentTexture(draw.shown[1] ?? placeholder, index: 1)
             encoder.setFragmentTexture(draw.alphas[0] ?? placeholder, index: 2)
