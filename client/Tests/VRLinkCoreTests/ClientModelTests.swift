@@ -240,7 +240,10 @@ final class ClientModelTests: XCTestCase {
     func testSettingsFormShowsWhatThePlatformHas() {
         XCTAssertEqual(SettingsForm.sections(for: []).map(\.title), ["Field of view"])
         let android = SettingsForm.sections(for: [.microphone, .chromaKey])
-        XCTAssertEqual(android.map(\.title), ["Audio", "Chroma key", "Field of view"])
+        XCTAssertEqual(android.map(\.title), ["Sent to the host", "Chroma key", "Field of view"])
+        XCTAssertEqual(SettingsForm.sections(for: [.microphone, .faceTracking, .eyeTracking])[0].items.map(\.title),
+                       ["Send my microphone", "Send my face tracking", "Send my eye tracking"])
+        XCTAssertTrue(Settings().faceTracking && Settings().eyeTracking)
         XCTAssertEqual(android[1].items.count, 5)
         let everything = SettingsForm.sections(for: [.microphone, .handsOverlay, .systemOverlays, .controllersAndHands, .gazePinch,
                                                       .chromaKey, .window, .senseControllers])

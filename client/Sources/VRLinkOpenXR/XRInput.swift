@@ -162,6 +162,12 @@ public final class XRInput {
     /// Whether eye gaze tracking is available on this session (on Android XR, requires `EYE_TRACKING_FINE`
     /// granted before instance creation).
     public var tracksGaze: Bool { gazeAction != nil }
+    /// Whether to sample eye gaze during `update(at:in:)`. When false, `gaze()` returns `nil`. Thread-safe.
+    public var samplesGaze: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return gazeWanted }
+        set { lock.lock(); gazeWanted = newValue; lock.unlock() }
+    }
+    private var gazeWanted = true
 
     private let lock = NSLock()
     private var latestHead: TrackedPose?
@@ -542,7 +548,7 @@ public final class XRInput {
         }
         // Sample eye gaze in head space and project a fixation point along the gaze ray.
         var gaze: Vec3?
-        if let gazeAction, let headSpace {
+        if let gazeAction, let headSpace, samplesGaze {
             var which = XrActionStateGetInfo()
             which.type = XR_TYPE_ACTION_STATE_GET_INFO
             which.action = gazeAction

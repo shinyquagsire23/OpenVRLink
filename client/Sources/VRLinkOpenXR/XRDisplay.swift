@@ -122,10 +122,12 @@ public final class XRDisplay<Graphics: XRGraphics> {
     private let tracking: TrackingThread
     /// Whether face tracking is active for this session.
     public var tracksFace: Bool { face != nil }
-    /// Latest face expression weights, or `nil` when face tracking is unavailable or untracked. Thread-safe.
-    public func faceExpressions() -> FaceExpressions? { face?.expressions() }
+    /// Latest face expression weights, or `nil` when face tracking is unavailable, disabled, or untracked. Thread-safe.
+    public func faceExpressions() -> FaceExpressions? { tracking.samplesFace ? face?.expressions() : nil }
+    /// Returns whether face and eye tracking should be sampled each frame; when `nil`, both are sampled.
+    public var sendsFaceAndEyes: (() -> (face: Bool, eyes: Bool))?
     /// Whether face tracking is supported by the runtime but awaiting system face calibration. Thread-safe.
-    public var faceNeedsCalibration: Bool { face?.needsCalibration ?? false }
+    public var faceNeedsCalibration: Bool { tracking.samplesFace && (face?.needsCalibration ?? false) }
     private lazy var depth = StereoDepthEstimator<Graphics.Frame>(measure: graphics.measure) { [graphics] in
         graphics.shrink($0, width: $1, done: $2)
     }
@@ -723,6 +725,10 @@ public final class XRDisplay<Graphics: XRGraphics> {
 
         // Poll controllers, hands, eye gaze, and face on TrackingThread (~10 ms via IPC on Android XR) so input
         // queries do not stall the render loop.
+        if let wanted = sendsFaceAndEyes?() {
+            tracking.samplesFace = wanted.face
+            input.samplesGaze = wanted.eyes
+        }
         if let space { tracking.sample(at: time, in: space) }
         if let changes = spaceChangesAt, time >= changes {
             spaceChangesAt = nil
@@ -1210,6 +1216,12 @@ final class TrackingThread: @unchecked Sendable {
     private let wake = DispatchSemaphore(value: 0)
     private var wanted: (time: XrTime, space: XrSpace)?
     private var started = false, stopped = false
+    private var faceWanted = true
+    /// Whether to poll the face tracker on each update. When false, cached expression weights are no longer updated.
+    var samplesFace: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return faceWanted }
+        set { lock.lock(); faceWanted = newValue; lock.unlock() }
+    }
 
     init(input: XRInput, face: (any FaceSource)?) {
         self.input = input
@@ -1239,13 +1251,13 @@ final class TrackingThread: @unchecked Sendable {
             lock.lock()
             let next = wanted
             wanted = nil
-            let leave = stopped
+            let leave = stopped, readFace = faceWanted
             lock.unlock()
             if leave { return }
             guard let next else { continue }
             busy.lock()
             input.update(at: next.time, in: next.space)
-            face?.update(at: next.time)
+            if readFace { face?.update(at: next.time) }
             busy.unlock()
         }
     }

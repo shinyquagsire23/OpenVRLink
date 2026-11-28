@@ -22,6 +22,14 @@ public struct Settings: Codable, Equatable {
     public var gazePinchRays = false
     /// Send the microphone to the host.
     public var microphone = false
+    /// Send facial expressions to the host on headsets that support face tracking. Turning this off stops
+    /// sampling immediately; turning it on takes effect on the next connection if face tracking was not
+    /// advertised when the session started.
+    public var faceTracking = true
+    /// Send eye gaze to the host on headsets that support eye tracking. Turning this off stops sampling
+    /// immediately; turning it on takes effect on the next connection if eye tracking was not advertised
+    /// when the session started.
+    public var eyeTracking = true
     /// Experimental: advertise PlayStation VR2 Sense controller render models
     /// to SteamVR (`DeviceProfile.senseControllerModels`); requires the PS VR2
     /// driver on the host.
@@ -103,6 +111,8 @@ public struct Settings: Codable, Equatable {
         read(.clackSwitchesToHands, into: &clackSwitchesToHands)
         read(.gazePinchRays, into: &gazePinchRays)
         read(.microphone, into: &microphone)
+        read(.faceTracking, into: &faceTracking)
+        read(.eyeTracking, into: &eyeTracking)
         read(.senseControllerModels, into: &senseControllerModels)
         read(.chromaKey, into: &chromaKey)
         read(.chromaKeyColor, into: &chromaKeyColor)

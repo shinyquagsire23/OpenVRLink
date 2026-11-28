@@ -722,6 +722,13 @@ system permission dialog and then re-checks the permission state.
   `XR_EXT_eye_gaze_interaction` and `XR_FB_face_tracking2`.
 - `android.permission.RECORD_AUDIO` is requested when a stream starts with
   "Send my microphone" enabled.
+- "Send my face tracking" and "Send my eye tracking" (`Settings.faceTracking`
+  and `Settings.eyeTracking`, both enabled by default) are shown alongside the
+  microphone toggle when the OpenXR runtime provides the corresponding tracker.
+  Disabling either toggle stops sampling immediately via
+  `XRDisplay.sendsFaceAndEyes`. Because tracking capabilities are advertised in
+  `DeviceProfile` when connecting, enabling a toggle that was off when the
+  session started takes effect on the next connection.
 
 #### Headset quirks
 

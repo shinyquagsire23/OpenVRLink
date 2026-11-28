@@ -189,6 +189,10 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
 
         display.streamingSession = { [link] in link.session }
         display.boostGPU = platform.boostGPU
+        // Only expose face and eye tracking toggles when the runtime supports them.
+        if display.tracksFace { panel.features.insert(.faceTracking) }
+        if display.input.tracksGaze { panel.features.insert(.eyeTracking) }
+        display.sendsFaceAndEyes = { [model] in (model.settings.faceTracking, model.settings.eyeTracking) }
         if display.graphics.supportsChromaKey, display.canShowRoom {
             panel.features.insert(.chromaKey)
             // Host chroma keying overrides the client's chroma key on frames that carry `FrameLayout.HostKey`.
@@ -329,12 +333,15 @@ public final class XRClient<Graphics: XRGraphics, Decoder: StreamDecoder> where 
         connector.askPin = { [model, link] in model.askPin { !link.isWanted } }
         var inputs = StreamLink<Decoder>.Inputs(head: { [display] in display.input.head() }, hands: { [display, buttonGate] in buttonGate.passing(display.input.hands()) })
         inputs.haptic = { [display] in display.input.vibrate($0) }
-        if display.input.tracksGaze {
+        // Advertise eye and face tracking in `DeviceProfile` only if they are enabled when the session starts.
+        // Live changes during the session are applied per frame through `XRDisplay.sendsFaceAndEyes`.
+        let eyes = display.input.tracksGaze && settings.eyeTracking, face = display.tracksFace && settings.faceTracking
+        if eyes {
             profile.tracksGaze = true
             inputs.gaze = { [display] in display.input.gaze() }
         }
-        if display.tracksFace { inputs.face = { [display] in display.faceExpressions() } }
-        profile.tracksEyesOrFace = display.input.tracksGaze || display.tracksFace
+        if face { inputs.face = { [display] in display.faceExpressions() } }
+        profile.tracksEyesOrFace = eyes || face
         inputs.refreshRateRequested = { [display] in display.requestRefreshRate($0) }
         inputs.power = platform.power
         link.start(target.kind, address: target.address, port: target.port, profile: profile, connector: connector, inputs: inputs)

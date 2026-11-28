@@ -30,6 +30,10 @@ public enum SettingsForm {
         public static let depthFromPicture = Features(rawValue: 1 << 8)
         /// Supports dynamic thermal refresh-rate stepping across multiple display refresh rates.
         public static let rateSteps = Features(rawValue: 1 << 9)
+        /// Supports facial expression tracking.
+        public static let faceTracking = Features(rawValue: 1 << 10)
+        /// Supports eye gaze tracking.
+        public static let eyeTracking = Features(rawValue: 1 << 11)
     }
 
     public enum Control {
@@ -52,8 +56,10 @@ public enum SettingsForm {
     }
 
     private static let everything: [Section] = [
-        Section(title: "Audio", items: [
+        Section(title: "Sent to the host", items: [
             Item(title: "Send my microphone", control: .toggle(\.microphone), needs: .microphone),
+            Item(title: "Send my face tracking", control: .toggle(\.faceTracking), needs: .faceTracking),
+            Item(title: "Send my eye tracking", control: .toggle(\.eyeTracking), needs: .eyeTracking),
         ]),
         Section(title: "Hands and controllers", items: [
             Item(title: "Show my hands over the picture", control: .toggle(\.showHandsOverlaid), needs: .handsOverlay),
